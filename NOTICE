@@ -1,0 +1,6 @@
+MJ Sol'Ex
+
+SER layout and solar scan reconstruction are based on Astro4j and JSol'Ex
+(https://github.com/melix/astro4j), revision 7ffdaf5c.
+Copyright 2023 the original author or authors.
+Astro4j is distributed under the Apache License, Version 2.0.
