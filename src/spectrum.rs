@@ -14,7 +14,7 @@ pub struct Spectrum {
     illuminated: (usize, usize),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Trace {
     coefficients: [f64; 3],
     width: usize,

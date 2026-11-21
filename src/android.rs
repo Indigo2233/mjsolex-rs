@@ -703,6 +703,9 @@ impl Mobile {
     fn set_trace(&mut self, result: Result<Trace, Error>) {
         match result {
             Ok(trace) => {
+                if self.trace.is_some_and(|previous| previous != trace) {
+                    self.wavelength = 0.;
+                }
                 self.trace = Some(trace);
                 self.profile = self
                     .scan
