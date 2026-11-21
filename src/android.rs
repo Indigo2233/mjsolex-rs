@@ -16,12 +16,18 @@ use rustix::io::Errno;
 use winit::platform::android::activity::AndroidApp;
 
 use crate::android_document::DocumentFile;
-use crate::ser::cache_frames;
-use crate::{DiskGeometry, Error, Header, Reconstruction, SerReader, Spectrum, Trace, reconstruct};
+use crate::ser::cache_recording;
+use crate::{
+    ByteOrder, DiskGeometry, Error, FitsMetadata, Header, LineProfile, Observation, Reconstruction,
+    SerReader, Spectrum, Trace, reconstruct_with_stride,
+};
+
+mod ui;
 
 const OPEN_SER: i32 = 10;
 const SAVE_PNG: i32 = 11;
 const SAVE_FITS: i32 = 12;
+const OPEN_SHARED: i32 = 13;
 const BACKGROUND: Color32 = Color32::from_rgb(17, 21, 27);
 const CARD: Color32 = Color32::from_rgb(28, 35, 44);
 const TEXT: Color32 = Color32::from_rgb(240, 243, 247);
@@ -48,6 +54,7 @@ impl Events {
 
 enum Event {
     Document(i32, Result<Document, String>),
+    SharedAvailable,
     Progress(f32),
     Finished(Result<Work, Error>),
 }
@@ -57,8 +64,7 @@ enum Work {
     Reconstructed {
         image: Arc<Reconstruction>,
         preview: ColorImage,
-        shift: f64,
-        corrected: bool,
+        metadata: Box<FitsMetadata>,
         warning: Option<String>,
     },
     Exported(String),
@@ -68,6 +74,8 @@ struct Imported {
     file: DocumentFile,
     name: String,
     header: Header,
+    observation: Observation,
+    byte_order: Option<ByteOrder>,
     spectrum: Spectrum,
     preview: ColorImage,
     trace: Result<Trace, Error>,
@@ -77,6 +85,8 @@ struct Scan {
     file: DocumentFile,
     name: String,
     header: Header,
+    observation: Observation,
+    byte_order: Option<ByteOrder>,
     spectrum: Spectrum,
     texture: TextureHandle,
 }
@@ -84,8 +94,14 @@ struct Scan {
 struct Output {
     image: Arc<Reconstruction>,
     texture: TextureHandle,
-    shift: f64,
-    corrected: bool,
+    metadata: FitsMetadata,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Scan,
+    Spectrum,
+    Result,
 }
 
 struct Job {
@@ -102,13 +118,18 @@ struct Mobile {
     events: Events,
     receiver: mpsc::Receiver<Event>,
     picker: Option<i32>,
+    shared_available: bool,
     job: Option<Job>,
     scan: Option<Scan>,
     trace: Option<Trace>,
+    profile: Option<LineProfile>,
     shift: f64,
+    wavelength: f64,
+    dispersion: f64,
+    stride: u32,
     correct_disk: bool,
     output: Option<Output>,
-    view_output: bool,
+    page: Page,
     note: Option<(String, bool)>,
 }
 
@@ -182,12 +203,9 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onDocument(
     name: JString<'_>,
     error: JString<'_>,
 ) -> jboolean {
-    let Some((owner, events)) = PICKER.lock().ok().and_then(|route| route.clone()) else {
+    let Some(events) = activity_events(&env, &activity) else {
         return JNI_FALSE;
     };
-    if !matches!(env.is_same_object(&activity, owner.as_obj()), Ok(true)) {
-        return JNI_FALSE;
-    }
     let document: jni::errors::Result<Result<Document, String>> = if !error.is_null() {
         env.get_string(&error).map(|message| Err(message.into()))
     } else if descriptor.is_null() {
@@ -199,9 +217,13 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onDocument(
             env.get_string(&name).map(Into::into)
         };
         name.map(|name| {
-            DocumentFile::from_android(&mut env, descriptor, request != OPEN_SER)
-                .map(|file| Some((file, name)))
-                .map_err(|error| error.to_string())
+            DocumentFile::from_android(
+                &mut env,
+                descriptor,
+                !matches!(request, OPEN_SER | OPEN_SHARED),
+            )
+            .map(|file| Some((file, name)))
+            .map_err(|error| error.to_string())
         })
     };
     let document =
@@ -212,6 +234,21 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onDocument(
     let adopted = matches!(document, Ok(Some(_)));
     events.post(Event::Document(request, document));
     if adopted { JNI_TRUE } else { JNI_FALSE }
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_org_mjsolex_mobile_MainActivity_onShareAvailable(
+    env: JNIEnv<'_>,
+    activity: JObject<'_>,
+) {
+    if let Some(events) = activity_events(&env, &activity) {
+        events.post(Event::SharedAvailable);
+    }
+}
+
+fn activity_events(env: &JNIEnv<'_>, activity: &JObject<'_>) -> Option<Events> {
+    let (owner, events) = PICKER.lock().ok().and_then(|route| route.clone())?;
+    matches!(env.is_same_object(activity, owner.as_obj()), Ok(true)).then_some(events)
 }
 
 impl Mobile {
@@ -228,8 +265,8 @@ impl Mobile {
             style.visuals.panel_fill = BACKGROUND;
             style.visuals.override_text_color = Some(TEXT);
             style.visuals.selection.bg_fill = Color32::from_rgb(65, 77, 91);
-            style.spacing.item_spacing = vec2(9., 10.);
-            style.spacing.interact_size.y = 46.;
+            style.spacing.item_spacing = vec2(8., 8.);
+            style.spacing.interact_size.y = 42.;
         });
         context.set_theme(egui::Theme::Dark);
         Self {
@@ -239,13 +276,18 @@ impl Mobile {
             events,
             receiver,
             picker: None,
+            shared_available: true,
             job: None,
             scan: None,
             trace: None,
+            profile: None,
             shift: 0.,
+            wavelength: 0.,
+            dispersion: 0.,
+            stride: 1,
             correct_disk: false,
             output: None,
-            view_output: false,
+            page: Page::Scan,
             note: None,
         }
     }
@@ -267,7 +309,19 @@ impl Mobile {
                         .and_then(|s| s.to_str())
                         .unwrap_or("scan");
                     let ext = if request == SAVE_FITS { "fits" } else { "png" };
-                    let name = env.new_string(format!("{stem}-reconstruction.{ext}"))?;
+                    let details = self.output.as_ref().map(|output| &output.metadata);
+                    let geometry = if details.is_some_and(|m| m.geometry.is_some()) {
+                        "-disk"
+                    } else {
+                        ""
+                    };
+                    let shift = details
+                        .and_then(|m| m.offset_pixels)
+                        .filter(|shift| *shift != 0.)
+                        .map(|shift| format!("-{shift:+.2}px"))
+                        .unwrap_or_default();
+                    let name =
+                        env.new_string(format!("{stem}-reconstruction{shift}{geometry}.{ext}"))?;
                     env.call_method(
                         activity,
                         "createImage",
@@ -289,6 +343,39 @@ impl Mobile {
             }
             Err(err) => {
                 self.note = Some((format!("Cannot open file picker: {err}"), true));
+            }
+        }
+    }
+
+    fn activity_flag(&self, method: &str) -> jni::errors::Result<bool> {
+        let mut env = self.vm.attach_current_thread()?;
+        let result: jni::errors::Result<bool> = env.with_local_frame(4, |env| {
+            env.call_method(self.activity.as_obj(), method, "()Z", &[])?
+                .z()
+        });
+        if matches!(&result, Err(jni::errors::Error::JavaException)) {
+            let _ = env.exception_clear();
+        }
+        result
+    }
+
+    fn busy(&self) -> bool {
+        self.picker.is_some() || self.job.is_some()
+    }
+
+    fn read_shared(&mut self) {
+        if self.busy() || !std::mem::take(&mut self.shared_available) {
+            return;
+        }
+        match self.activity_flag("openSharedSer") {
+            Ok(true) => {
+                self.picker = Some(OPEN_SHARED);
+                self.page = Page::Scan;
+                self.note = None;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                self.note = Some((format!("Cannot read the shared recording: {error}"), true))
             }
         }
     }
@@ -322,7 +409,7 @@ impl Mobile {
         }
     }
 
-    fn import(&mut self, mut file: DocumentFile, name: String) {
+    fn import(&mut self, mut file: DocumentFile, name: String, byte_order: Option<ByteOrder>) {
         let cache = self.cache.clone();
         self.start_job("Reading spectrum", true, move |events, cancel| {
             if let Err(error) = file.file.seek(SeekFrom::Start(0)) {
@@ -333,8 +420,9 @@ impl Mobile {
                 file.check_error()?;
                 file = DocumentFile::cached(cached);
             }
-            let mut reader = SerReader::open(&file.file)?;
+            let mut reader = SerReader::open_with_byte_order(&file.file, byte_order)?;
             let header = reader.header();
+            let observation = reader.observation().clone();
             let spectrum = Spectrum::average(&mut reader, report(events, cancel))?;
             let trace = spectrum.fit_line(None);
             let preview = preview(header.width, header.height, |i| spectrum.pixels()[i] as u16);
@@ -343,11 +431,24 @@ impl Mobile {
                 file,
                 name,
                 header,
+                observation,
+                byte_order,
                 spectrum,
                 preview,
                 trace,
             })))
         });
+    }
+
+    fn reload_byte_order(&mut self, order: Option<ByteOrder>) {
+        let Some(scan) = &self.scan else { return };
+        if order == scan.byte_order {
+            return;
+        }
+        match scan.file.try_clone() {
+            Ok(file) => self.import(file, scan.name.clone(), order),
+            Err(error) => self.note = Some((error.to_string(), true)),
+        }
     }
 
     fn reconstruct(&mut self) {
@@ -361,34 +462,60 @@ impl Mobile {
                 return;
             }
         };
-        let shift = self.shift;
+        let order = scan.byte_order;
+        let header = scan.header;
         let correct_disk = self.correct_disk;
+        let mut metadata = FitsMetadata {
+            observation: scan.observation.clone(),
+            source_name: Some(scan.name.clone()),
+            source_header: Some(header),
+            offset_pixels: Some(self.shift),
+            frame_step: Some(self.stride),
+            line_center_angstrom: (self.wavelength > 0.).then_some(self.wavelength),
+            dispersion_angstrom: (self.dispersion != 0.).then_some(self.dispersion),
+            fwhm_pixels: self.profile.as_ref().and_then(|p| p.fit).map(|f| f.fwhm),
+            geometry: None,
+        };
+        let shift = self.shift;
+        let stride = self.stride;
         self.start_job("Reconstructing scan", true, move |events, cancel| {
-            let mut reader = SerReader::open(&file.file)?;
+            let mut reader = SerReader::open_with_byte_order(&file.file, order)?;
+            if reader.header() != header {
+                return Err(Error::InvalidSer(
+                    "recording changed; open the finished file again",
+                ));
+            }
+            metadata.observation = reader.observation().clone();
             let mut progress = report(events, cancel);
-            let fraction = if correct_disk { 0.85 } else { 1. };
-            let raw = reconstruct(&mut reader, trace, shift, |p| progress(p * fraction))?;
-            let (image, corrected, warning) = if correct_disk {
-                match DiskGeometry::fit(&raw)
-                    .and_then(|geometry| geometry.correct(&raw, |p| progress(fraction + p * 0.15)))
-                {
-                    Ok(image) => (image, true, None),
+            let fraction = if correct_disk { 0.85 } else { 0.98 };
+            let raw = reconstruct_with_stride(&mut reader, trace, shift, stride, |p| {
+                progress(p * fraction)
+            })?;
+            drop(reader);
+            let (image, warning) = if correct_disk {
+                match DiskGeometry::fit(&raw).and_then(|geometry| {
+                    geometry
+                        .correct(&raw, |p| progress(fraction + p * 0.13))
+                        .map(|image| (image, geometry))
+                }) {
+                    Ok((image, geometry)) => {
+                        metadata.geometry = Some(geometry);
+                        (image, None)
+                    }
                     Err(Error::Cancelled) => return Err(Error::Cancelled),
-                    Err(error) => (
-                        raw,
-                        false,
-                        Some(format!("Disk correction skipped. {error}")),
-                    ),
+                    Err(error) => (raw, Some(format!("Disk correction skipped. {error}"))),
                 }
             } else {
-                (raw, false, None)
+                (raw, None)
             };
             let preview = preview(image.width(), image.height(), |i| image.pixels()[i]);
+            if !progress(1.) {
+                return Err(Error::Cancelled);
+            }
             Ok(Work::Reconstructed {
                 image: Arc::new(image),
                 preview,
-                shift,
-                corrected,
+                metadata: Box::new(metadata),
                 warning,
             })
         });
@@ -397,6 +524,7 @@ impl Mobile {
     fn export(&mut self, request: i32, mut file: DocumentFile, name: String) {
         let Some(output) = &self.output else { return };
         let image = output.image.clone();
+        let metadata = output.metadata.clone();
         let fits = request == SAVE_FITS;
         self.start_job(
             if fits { "Saving FITS" } else { "Saving PNG" },
@@ -405,7 +533,7 @@ impl Mobile {
                 let result = (|| -> Result<(), Error> {
                     let mut writer = BufWriter::new(&mut file.file);
                     if fits {
-                        image.write_fits(&mut writer)?;
+                        image.write_fits_with_metadata(&mut writer, &metadata)?;
                     } else {
                         image.write_png(&mut writer)?;
                     }
@@ -423,10 +551,13 @@ impl Mobile {
     fn receive(&mut self, ctx: &Context) {
         while let Ok(event) = self.receiver.try_recv() {
             match event {
+                Event::SharedAvailable => self.shared_available = true,
                 Event::Document(request, result) if self.picker == Some(request) => {
                     self.picker = None;
                     match result {
-                        Ok(Some((file, name))) if request == OPEN_SER => self.import(file, name),
+                        Ok(Some((file, name))) if matches!(request, OPEN_SER | OPEN_SHARED) => {
+                            self.import(file, name, None)
+                        }
                         Ok(Some((file, name))) => self.export(request, file, name),
                         Ok(None) => {}
                         Err(error) => self.note = Some((error, true)),
@@ -445,6 +576,8 @@ impl Mobile {
                                 file,
                                 name,
                                 header,
+                                observation,
+                                byte_order,
                                 spectrum,
                                 preview,
                                 trace,
@@ -453,6 +586,8 @@ impl Mobile {
                                 file,
                                 name,
                                 header,
+                                observation,
+                                byte_order,
                                 spectrum,
                                 texture: ctx.load_texture(
                                     "spectrum",
@@ -461,16 +596,19 @@ impl Mobile {
                                 ),
                             });
                             self.trace = None;
+                            self.profile = None;
                             self.set_trace(trace);
                             self.shift = 0.;
+                            self.wavelength = 0.;
+                            self.dispersion = 0.;
+                            self.stride = header.minimum_stride();
                             self.output = None;
-                            self.view_output = false;
+                            self.page = Page::Spectrum;
                         }
                         Ok(Work::Reconstructed {
                             image,
                             preview,
-                            shift,
-                            corrected,
+                            metadata,
                             warning,
                         }) => {
                             let texture =
@@ -478,10 +616,9 @@ impl Mobile {
                             self.output = Some(Output {
                                 image,
                                 texture,
-                                shift,
-                                corrected,
+                                metadata: *metadata,
                             });
-                            self.view_output = true;
+                            self.page = Page::Result;
                             self.note = warning.map(|warning| (warning, true));
                         }
                         Ok(Work::Exported(name)) => {
@@ -496,224 +633,21 @@ impl Mobile {
                 Event::Document(..) => {}
             }
         }
+        self.read_shared();
     }
 
     fn set_trace(&mut self, result: Result<Trace, Error>) {
         match result {
             Ok(trace) => {
                 self.trace = Some(trace);
+                self.profile = self
+                    .scan
+                    .as_ref()
+                    .map(|scan| scan.spectrum.line_profile(trace));
                 self.note = None;
             }
             Err(error) => self.note = Some((error.to_string(), true)),
         }
-    }
-
-    fn content(&mut self, ui: &mut Ui) {
-        let busy = self.picker.is_some() || self.job.is_some();
-        ui.label(RichText::new("MJ Sol’Ex").size(36.).strong());
-        ui.label(
-            RichText::new("Solar scan reconstruction")
-                .size(15.)
-                .color(MUTED),
-        );
-        ui.add_space(8.);
-        card(ui, |ui| {
-            if let Some(scan) = &self.scan {
-                ui.add(egui::Label::new(RichText::new(&scan.name).strong()).wrap());
-                let h = scan.header;
-                ui.label(
-                    RichText::new(format!(
-                        "{} × {} px  ·  {} frames  ·  {}-bit",
-                        h.width, h.height, h.frames, h.depth
-                    ))
-                    .color(MUTED),
-                );
-            } else {
-                ui.label(RichText::new("Start with a monochrome SER recording from Sol’Ex or another solar spectroheliograph.").color(MUTED));
-            }
-            if action(
-                ui,
-                if self.scan.is_some() {
-                    "Open another SER"
-                } else {
-                    "Open SER recording"
-                },
-                !busy,
-                self.scan.is_none(),
-            ) {
-                self.pick(OPEN_SER);
-            }
-        });
-        if let Some(job) = &self.job {
-            card(ui, |ui| {
-                ui.label(RichText::new(job.label).strong());
-                if let Some(progress) = job.progress {
-                    ui.add(
-                        egui::ProgressBar::new(progress)
-                            .show_percentage()
-                            .fill(AMBER),
-                    );
-                } else {
-                    ui.spinner();
-                }
-                if job.cancellable
-                    && action(ui, "Cancel", !job.cancel.load(Ordering::Relaxed), false)
-                {
-                    job.cancel.store(true, Ordering::Relaxed);
-                }
-            });
-        }
-        if let Some((note, error)) = &self.note {
-            ui.label(RichText::new(note).color(if *error { Color32::LIGHT_RED } else { AMBER }));
-        }
-        if self.output.is_some() {
-            ui.horizontal(|ui| {
-                if ui.selectable_label(!self.view_output, "Spectrum").clicked() {
-                    self.view_output = false;
-                }
-                if ui
-                    .selectable_label(self.view_output, "Reconstruction")
-                    .clicked()
-                {
-                    self.view_output = true;
-                }
-            });
-        }
-        if self.view_output {
-            self.show_output(ui, busy);
-        } else if self.scan.is_some() {
-            self.show_spectrum(ui, busy);
-        }
-    }
-
-    fn show_spectrum(&mut self, ui: &mut Ui, busy: bool) {
-        let Some(scan) = &self.scan else { return };
-        let header = scan.header;
-        let mut trace = None;
-        card(ui, |ui| {
-            ui.label(RichText::new("Average spectrum").size(18.).strong());
-            let response = picture(
-                ui,
-                &scan.texture,
-                header.width,
-                header.height,
-                112. ..=200.,
-                Sense::click(),
-            );
-            let rect = response.rect;
-            if let Some(line) = self.trace {
-                let painter = ui.painter().with_clip_rect(rect);
-                for x in 0..64 {
-                    let pos = |step| {
-                        let col = step * (header.width - 1) / 64;
-                        pos2(
-                            rect.left() + rect.width() * (col as f32 + 0.5) / header.width as f32,
-                            rect.top()
-                                + rect.height() * ((line.row(col) + self.shift) as f32 + 0.5)
-                                    / header.height as f32,
-                        )
-                    };
-                    painter.line_segment([pos(x), pos(x + 1)], Stroke::new(1.5, AMBER));
-                }
-            }
-            if !busy
-                && response.clicked()
-                && let Some(pos) = response.interact_pointer_pos()
-            {
-                let x = ((pos.x - rect.left()) / rect.width() * header.width as f32) as usize;
-                let y = ((pos.y - rect.top()) / rect.height() * header.height as f32) as usize;
-                trace = Some(
-                    scan.spectrum
-                        .fit_line(Some((x.min(header.width - 1), y.min(header.height - 1)))),
-                );
-            }
-            ui.label(RichText::new("Tap a dark line to change the fit.").color(MUTED));
-            if action(ui, "Auto-fit line", !busy, false) {
-                trace = Some(scan.spectrum.fit_line(None));
-            }
-        });
-        if let Some(trace) = trace {
-            self.set_trace(trace);
-        }
-        card(ui, |ui| {
-            ui.label(RichText::new(format!("Spectral offset  {:+.2} px", self.shift)).strong());
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(!busy, egui::Button::new("−").min_size(vec2(52., 46.)))
-                    .clicked()
-                {
-                    self.shift = (self.shift - 0.25).max(-1024.);
-                }
-                if ui
-                    .add_enabled(!busy, egui::Button::new("+").min_size(vec2(52., 46.)))
-                    .clicked()
-                {
-                    self.shift = (self.shift + 0.25).min(1024.);
-                }
-                if ui
-                    .add_enabled(!busy && self.shift != 0., egui::Button::new("Reset"))
-                    .clicked()
-                {
-                    self.shift = 0.;
-                }
-            });
-            ui.add_enabled(
-                !busy,
-                egui::Checkbox::new(&mut self.correct_disk, "Correct full-disk geometry"),
-            );
-            if action(ui, "Reconstruct scan", !busy && self.trace.is_some(), true) {
-                self.reconstruct();
-            }
-        });
-    }
-
-    fn show_output(&mut self, ui: &mut Ui, busy: bool) {
-        let Some(output) = &self.output else { return };
-        let request = card(ui, |ui| {
-            let title = if output.corrected {
-                "Geometry-corrected scan"
-            } else {
-                "Reconstructed scan"
-            };
-            ui.label(RichText::new(title).size(18.).strong());
-            let (w, h) = (output.image.width(), output.image.height());
-            ui.label(
-                RichText::new(format!("{w} × {h} px  ·  {:+.2} px offset", output.shift))
-                    .color(MUTED),
-            );
-            let png = action(ui, "Save 16-bit PNG", !busy, true);
-            let fits = action(ui, "Save FITS", !busy, false);
-            picture(ui, &output.texture, w, h, 0. ..=360., Sense::hover());
-            ui.label(RichText::new("Preview contrast is stretched.").color(MUTED));
-            if png {
-                Some(SAVE_PNG)
-            } else if fits {
-                Some(SAVE_FITS)
-            } else {
-                None
-            }
-        });
-        if let Some(request) = request {
-            self.pick(request);
-        }
-    }
-}
-
-impl eframe::App for Mobile {
-    fn ui(&mut self, ui: &mut Ui, _: &mut eframe::Frame) {
-        self.receive(ui.ctx());
-        egui::Frame::new().fill(BACKGROUND).show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let padding = ((ui.available_width() - 590.) / 2.).max(17.);
-                    egui::Frame::new()
-                        .inner_margin(egui::Margin::symmetric(padding as i8, 17))
-                        .show(ui, |ui| {
-                            self.content(ui);
-                        });
-                });
-        });
     }
 }
 
@@ -748,7 +682,7 @@ fn cache_document(input: &mut File, cache: &Path, cancel: &AtomicBool) -> Result
     let volume = rustix::fs::fstatvfs(&file).map_err(io::Error::from)?;
     // Keep space for processing output and other applications on the shared volume.
     let limit = volume.f_bavail.saturating_mul(volume.f_frsize) / 2;
-    let result = cache_frames(PipeReader { input, cancel }, &mut file, limit);
+    let result = cache_recording(PipeReader { input, cancel }, &mut file, limit);
     if cancel.load(Ordering::Relaxed) {
         return Err(Error::Cancelled);
     }

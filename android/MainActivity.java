@@ -7,6 +7,8 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
 import android.provider.OpenableColumns;
+import android.widget.Toast;
+import java.util.Locale;
 
 public final class MainActivity extends NativeActivity {
     static {
@@ -16,15 +18,77 @@ public final class MainActivity extends NativeActivity {
     private static final int OPEN_SER = 10;
     private static final int SAVE_PNG = 11;
     private static final int SAVE_FITS = 12;
+    private static final int OPEN_SHARED_SER = 13;
+    private Uri pendingShared;
 
     private native boolean onDocument(
         int request, ParcelFileDescriptor document, String name, String error);
+    private native void onShareAvailable();
 
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         getWindow().setStatusBarColor(0xff11151b);
         getWindow().setNavigationBarColor(0xff11151b);
+        if (state == null) {
+            acceptShare(getIntent());
+        }
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        acceptShare(intent);
+    }
+
+    private void acceptShare(Intent intent) {
+        if (intent == null || !Intent.ACTION_SEND.equals(intent.getAction())) {
+            return;
+        }
+        try {
+            Uri uri = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            if (uri == null && intent.getClipData() != null && intent.getClipData().getItemCount() == 1) {
+                uri = intent.getClipData().getItemAt(0).getUri();
+            }
+            if (uri != null && "content".equals(uri.getScheme())) {
+                synchronized (this) {
+                    pendingShared = uri;
+                }
+                onShareAvailable();
+            }
+        } catch (RuntimeException error) {
+            Toast.makeText(this, "The shared attachment could not be opened.", Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    // Called from the render thread only when no picker or processing job is active.
+    public boolean openSharedSer() {
+        final Uri uri;
+        synchronized (this) {
+            uri = pendingShared;
+            pendingShared = null;
+        }
+        if (uri == null) {
+            return false;
+        }
+        new Thread(() -> openDocument(OPEN_SHARED_SER, uri), "solex-shared-document").start();
+        return true;
+    }
+
+    public boolean openIndigo() {
+        Intent intent = getPackageManager().getLaunchIntentForPackage("com.indigo.mobileobservatory");
+        if (intent == null) {
+            return false;
+        }
+        runOnUiThread(() -> {
+            try {
+                startActivity(intent);
+            } catch (RuntimeException error) {
+                Toast.makeText(this, "Cannot open Indigo Observatory.", Toast.LENGTH_SHORT).show();
+            }
+        });
+        return true;
     }
 
     public void pickSer() {
@@ -67,12 +131,17 @@ public final class MainActivity extends NativeActivity {
     private void openDocument(int request, Uri uri) {
         ParcelFileDescriptor document = null;
         try {
-            document = getContentResolver().openFileDescriptor(uri, request == OPEN_SER ? "r" : "wt");
+            String name = displayName(uri, request);
+            if (request == OPEN_SHARED_SER && !name.toLowerCase(Locale.ROOT).endsWith(".ser")) {
+                onDocument(request, null, null, "Share one original SER recording.");
+                return;
+            }
+            document = getContentResolver().openFileDescriptor(uri, isInput(request) ? "r" : "wt");
             if (document == null) {
                 onDocument(request, null, null, "The file provider did not open the document.");
                 return;
             }
-            if (onDocument(request, document, displayName(uri, request), null)) {
+            if (onDocument(request, document, name, null)) {
                 // Native code owns the descriptor and its provider status channel.
                 document = null;
             }
@@ -82,7 +151,7 @@ public final class MainActivity extends NativeActivity {
         } finally {
             if (document != null) {
                 try {
-                    if (request == OPEN_SER) {
+                    if (isInput(request)) {
                         document.close();
                     } else {
                         document.closeWithError("MJ Sol'Ex did not accept this export");
@@ -94,6 +163,10 @@ public final class MainActivity extends NativeActivity {
         }
     }
 
+    private boolean isInput(int request) {
+        return request == OPEN_SER || request == OPEN_SHARED_SER;
+    }
+
     private String displayName(Uri uri, int request) {
         try (Cursor cursor = getContentResolver().query(uri,
                  new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
@@ -103,7 +176,10 @@ public final class MainActivity extends NativeActivity {
         } catch (RuntimeException ignored) {
             // Some providers can open a file without exposing its name.
         }
-        if (request == OPEN_SER) {
+        if (request == OPEN_SHARED_SER && uri.getLastPathSegment() != null) {
+            return uri.getLastPathSegment();
+        }
+        if (isInput(request)) {
             return "scan.ser";
         }
         return request == SAVE_FITS ? "reconstruction.fits" : "reconstruction.png";

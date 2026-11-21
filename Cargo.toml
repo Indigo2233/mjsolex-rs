@@ -1,6 +1,6 @@
 [package]
 name = "mjsolex"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.95"
 license = "Apache-2.0"
@@ -12,6 +12,7 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 png = "0.18"
 thiserror = "2"
+time = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { version = "0.37", default-features = false, features = ["android-native-activity", "default_fonts", "glow"] }

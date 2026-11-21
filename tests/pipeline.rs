@@ -1,7 +1,10 @@
 use std::cell::Cell;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
-use mjsolex::{Error, SerReader, Spectrum, Trace, reconstruct};
+use mjsolex::{
+    ByteOrder, ColorMode, Error, FitsMetadata, SerReader, Spectrum, Trace, reconstruct,
+    reconstruct_with_stride,
+};
 
 fn ser_header(
     signature: &[u8; 14],
@@ -34,10 +37,10 @@ fn rejects_bad_headers_and_truncated_frames() {
     let mut truncated = mono(3, 2, 8, 2);
     truncated.extend([0; 11]);
     let mut color = mono(3, 2, 8, 1);
-    color[18] = 8;
+    color[18] = 16;
     assert!(matches!(
         SerReader::open(Cursor::new(color)),
-        Err(Error::Color(8))
+        Err(Error::Color(16))
     ));
 
     for invalid in [
@@ -81,6 +84,110 @@ fn decodes_mono_depths_and_both_byte_orders() {
         Spectrum::average(&mut reader, |_| true).unwrap().pixels(),
         &[8192., 65280.]
     );
+}
+
+#[test]
+fn recognizes_indigo_byte_order_and_exports_timed_observation_metadata() {
+    const UNIX: u64 = 621_355_968_000_000_000;
+    let mut bytes = ser_header(b"LUCAM-RECORDER", 2, 1, 16, 3, 0);
+    bytes[42..59].copy_from_slice(b"MobileObservatory");
+    bytes[82..91].copy_from_slice(b"ASI 174MM");
+    bytes[122..130].copy_from_slice(b"H-alpha ");
+    bytes[170..178].copy_from_slice(&UNIX.to_le_bytes());
+    for sample in [258u16, 770, 1285, 8, 905, 15] {
+        bytes.extend(sample.to_le_bytes());
+    }
+    for seconds in [1, 2, 3] {
+        bytes.extend((UNIX + seconds * 10_000_000).to_le_bytes());
+    }
+    let mut overridden =
+        SerReader::open_with_byte_order(Cursor::new(&bytes), Some(ByteOrder::Big)).unwrap();
+    let other = reconstruct(&mut overridden, Trace::constant(2, 0.), 0., |_| true).unwrap();
+    assert_eq!(other.pixels()[0], 513);
+
+    let mut reader = SerReader::open(Cursor::new(&bytes)).unwrap();
+    let header = reader.header();
+    let obs = reader.observation().clone();
+    assert_eq!(header.byte_order(), ByteOrder::Little);
+    assert_eq!(
+        obs.start_utc.as_deref(),
+        Some("1970-01-01T00:00:01.0000000")
+    );
+    assert_eq!(obs.end_utc.as_deref(), Some("1970-01-01T00:00:03.0000000"));
+    assert_eq!(obs.observer, None);
+    assert_eq!(obs.filter.as_deref(), Some("H-alpha"));
+    let image =
+        reconstruct_with_stride(&mut reader, Trace::constant(2, 0.), 0., 2, |_| true).unwrap();
+    assert_eq!(image.pixels(), &[258, 770, 905, 15]);
+    let metadata = FitsMetadata {
+        observation: obs,
+        source_header: Some(header),
+        source_name: Some("Sun's recording.ser".to_owned()),
+        frame_step: Some(2),
+        offset_pixels: Some(0.25),
+        line_center_angstrom: Some(6562.8),
+        dispersion_angstrom: Some(-0.04),
+        fwhm_pixels: Some(4.0),
+        ..FitsMetadata::default()
+    };
+    let mut fits = Vec::new();
+    image
+        .write_fits_with_metadata(&mut fits, &metadata)
+        .unwrap();
+    let text = str::from_utf8(&fits[..2880]).unwrap();
+    assert!(text.contains("DATE-OBS= '1970-01-01T00:00:01.0000000'"));
+    assert!(text.contains("DATE-END= '1970-01-01T00:00:03.0000000'"));
+    assert!(text.contains("TIMESYS = 'UTC'"));
+    assert!(text.contains("FILTER  = 'H-alpha'"));
+    assert!(text.contains("RECORDER= 'Indigo Observatory'"));
+    assert!(text.contains("SERFILE = 'Sun''s recording.ser'"));
+    assert!(text.contains("SCNSTEP =                    2"));
+    assert!(text.contains("6.562790000000E3"));
+    assert!(text.contains("1.600000000000E-1"));
+}
+
+#[test]
+fn decodes_bayer_green_and_rgb_luminance() {
+    for (identifier, color) in [(100, ColorMode::Rgb), (101, ColorMode::Bgr)] {
+        let mut bytes = ser_header(b"LUCAM-RECORDER", 1, 1, 8, 1, 0);
+        bytes[18] = identifier;
+        bytes.extend(if color == ColorMode::Rgb {
+            [50, 100, 25]
+        } else {
+            [25, 100, 50]
+        });
+        let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+        let image = reconstruct(&mut reader, Trace::constant(1, 0.), 0., |_| true).unwrap();
+        assert_eq!(image.pixels(), &[21492]);
+    }
+
+    // A narrow reconstruction starts at an odd source row. Verify that cropped
+    // reads still use the original Bayer phase.
+    for (identifier, even_row_green) in [(8, false), (9, true), (10, true), (11, false)] {
+        let width = 64;
+        let height = 128;
+        let mut bytes = ser_header(b"JSOLEX-TRIMMED", width, height, 8, 1, 0);
+        bytes[18] = identifier;
+        for y in 0..height {
+            for x in 0..width {
+                let green = x % 2 == 0;
+                bytes.push(if green == ((y % 2 == 0) == even_row_green) {
+                    40 + (y % 50) as u8
+                } else {
+                    240
+                });
+            }
+        }
+        let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+        let image = reconstruct(
+            &mut reader,
+            Trace::constant(width as usize, 63.),
+            0.,
+            |_| true,
+        )
+        .unwrap();
+        assert!(image.pixels().iter().all(|&value| value == 53 * 256));
+    }
 }
 
 fn curved_scan() -> Vec<u8> {

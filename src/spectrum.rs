@@ -1,9 +1,10 @@
 use std::io::{Read, Seek};
 
 use crate::regression::weighted_fit;
-use crate::{Error, Header, SerReader};
+use crate::{Error, Header, LineProfile, SerReader};
 
 const AVERAGE_FRAMES: u32 = 64;
+const AVERAGE_READ_BUDGET: usize = 256 * 1024 * 1024;
 const TRACK_RADIUS: usize = 4;
 const CONTINUUM_RADIUS: usize = 8;
 
@@ -54,8 +55,13 @@ impl Spectrum {
         mut progress: impl FnMut(f32) -> bool,
     ) -> Result<Self, Error> {
         let header = reader.header();
-        let mut pixels = vec![0.; header.pixel_count()];
-        let count = header.frames.min(AVERAGE_FRAMES);
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(header.pixel_count())?;
+        pixels.resize(header.pixel_count(), 0.);
+        let count = header
+            .frames
+            .min(AVERAGE_FRAMES)
+            .min((AVERAGE_READ_BUDGET / header.frame_bytes()).max(2) as u32);
         for i in 0..count {
             if !progress(i as f32 / count as f32) {
                 return Err(Error::Cancelled);
@@ -91,6 +97,40 @@ impl Spectrum {
 
     pub fn pixels(&self) -> &[f32] {
         &self.pixels
+    }
+
+    pub fn line_profile(&self, trace: Trace) -> LineProfile {
+        if trace.width() != self.header.width {
+            return LineProfile::new(Vec::new());
+        }
+        let (left, right) = self.illuminated;
+        let margin = (right - left) / 4;
+        let width = self.header.width;
+        let height = self.header.height;
+        let columns = left + margin..=right - margin;
+        let count = (columns.end() - columns.start() + 1) as u32;
+        let radius = height.min(32) as i32;
+        let samples = (-radius..=radius)
+            .filter_map(|offset| {
+                let (mut sum, mut actual) = (0., 0_u32);
+                for x in columns.clone() {
+                    let position = trace.row(x) + f64::from(offset);
+                    if !(0. ..=(height - 1) as f64).contains(&position) {
+                        continue;
+                    }
+                    let lo = position.floor() as usize;
+                    let hi = (lo + 1).min(height - 1);
+                    let fraction = position - lo as f64;
+                    let first = f64::from(self.pixels[lo * width + x]);
+                    let next = f64::from(self.pixels[hi * width + x]);
+                    sum += first + fraction * (next - first);
+                    actual += 1;
+                }
+                (actual > 0 && actual * 4 >= count * 3)
+                    .then(|| [f64::from(offset), sum / f64::from(actual)])
+            })
+            .collect();
+        LineProfile::new(samples)
     }
 
     pub fn fit_line(&self, seed: Option<(usize, usize)>) -> Result<Trace, Error> {

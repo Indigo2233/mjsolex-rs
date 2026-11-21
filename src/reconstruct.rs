@@ -1,8 +1,16 @@
 use std::io::{Read, Seek, Write};
 
-use crate::{Error, SerReader, Trace};
+use crate::{Error, Header, SerReader, Trace};
 
 pub(crate) const MAX_PIXELS: usize = 32 * 1024 * 1024;
+
+impl Header {
+    /// Smallest interval that keeps a reconstruction within the pixel budget.
+    pub fn minimum_stride(self) -> u32 {
+        let rows = (MAX_PIXELS / self.width.max(1)).max(1) as u32;
+        self.frames.div_ceil(rows).max(1)
+    }
+}
 
 pub struct Reconstruction {
     pub(crate) width: usize,
@@ -59,11 +67,25 @@ pub fn reconstruct<R: Read + Seek>(
     reader: &mut SerReader<R>,
     trace: Trace,
     shift: f64,
+    progress: impl FnMut(f32) -> bool,
+) -> Result<Reconstruction, Error> {
+    reconstruct_with_stride(reader, trace, shift, 1, progress)
+}
+
+pub fn reconstruct_with_stride<R: Read + Seek>(
+    reader: &mut SerReader<R>,
+    trace: Trace,
+    shift: f64,
+    stride: u32,
     mut progress: impl FnMut(f32) -> bool,
 ) -> Result<Reconstruction, Error> {
     let header = reader.header();
     let width = header.width;
-    let height = header.frames as usize;
+    if stride == 0 {
+        return Err(Error::InvalidStride);
+    }
+    let frames = header.frames.div_ceil(stride);
+    let height = frames as usize;
     if width
         .checked_mul(height)
         .is_none_or(|size| size > MAX_PIXELS)
@@ -144,16 +166,17 @@ pub fn reconstruct<R: Read + Seek>(
         0..header.height
     };
 
-    let mut pixels = Vec::with_capacity(width * height);
-    for i in 0..header.frames {
-        if !progress(i as f32 / header.frames as f32) {
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(width * height)?;
+    for i in 0..frames {
+        if !progress(i as f32 / frames as f32) {
             return Err(Error::Cancelled);
         }
-        let frame = reader.frame_rows(i, rows.clone())?;
+        let frame = reader.frame_rows(i * stride, rows.clone())?;
         for column in &columns {
             let sample = column.taps[..column.count]
                 .iter()
-                .map(|tap| tap.weight * f64::from(header.sample(frame, tap.index)))
+                .map(|tap| tap.weight * f64::from(header.sample(frame, tap.index, rows.start)))
                 .sum::<f64>();
             pixels.push(sample.round() as u16);
         }

@@ -114,7 +114,8 @@ impl DiskGeometry {
         {
             return Err(Error::OutputTooLarge);
         }
-        let mut pixels = Vec::with_capacity(width * height);
+        let mut pixels = Vec::new();
+        pixels.try_reserve_exact(width * height)?;
         for row in 0..height {
             if !progress(row as f32 / height as f32) {
                 return Err(Error::Cancelled);
