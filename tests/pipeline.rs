@@ -1,4 +1,5 @@
-use std::io::Cursor;
+use std::cell::Cell;
+use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use mjsolex::{Error, SerReader, Spectrum, Trace, reconstruct};
 
@@ -123,6 +124,100 @@ fn fits_curved_absorption_line_and_reconstructs_with_offset() {
         }
         assert!(center.pixels()[64 * 11] > center.pixels()[0] + 4800);
     }
+}
+
+#[test]
+fn detects_a_low_signal_absorption_line() {
+    let mut bytes = mono(24, 19, 16, 2);
+    for _ in 0..2 {
+        for y in -9i32..=9 {
+            for _ in 0..24 {
+                let value = 220 + y.unsigned_abs().pow(2) as u16 / 5;
+                bytes.extend(value.to_le_bytes());
+            }
+        }
+    }
+    let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+    let spectrum = Spectrum::average(&mut reader, |_| true).unwrap();
+    let trace = spectrum.fit_line(None).unwrap();
+    assert!((trace.row(12) - 9.).abs() < 1.6);
+}
+
+#[test]
+fn narrow_trace_reads_only_the_relevant_rows_and_preserves_endianness() {
+    struct Counted<'a>(Cursor<Vec<u8>>, &'a Cell<usize>);
+    impl Read for Counted<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.0.read(buffer)?;
+            self.1.set(self.1.get() + n);
+            Ok(n)
+        }
+    }
+    impl Seek for Counted<'_> {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.0.seek(position)
+        }
+    }
+
+    let mut bytes = ser_header(b"LUCAM-RECORDER", 32, 256, 12, 6, 0);
+    for frame in 0..6 {
+        for y in 0..256 {
+            for x in 0..32 {
+                let value = frame * 384 + x * 3 + y * 4;
+                bytes.extend(u16::to_be_bytes(value));
+            }
+        }
+    }
+
+    let read = Cell::new(0);
+    let mut reader = SerReader::open(Counted(Cursor::new(bytes), &read)).unwrap();
+    let image = reconstruct(&mut reader, Trace::constant(32, 120.25), 0., |_| true).unwrap();
+    assert_eq!(read.get(), 178 + 6 * 4 * 32 * 2);
+    for (index, &pixel) in image.pixels().iter().enumerate() {
+        assert_eq!(
+            usize::from(pixel),
+            (index / 32 * 384 + index % 32 * 3 + 481) * 16
+        );
+    }
+}
+
+#[test]
+fn reconstructs_one_spectral_row_without_interpolation() {
+    for signature in [b"LUCAM-RECORDER", b"JSOLEX-TRIMMED"] {
+        let mut bytes = ser_header(signature, 3, 1, 16, 2, 1);
+        let pixels = [1_u16, 100, 65535, 90, 21, 0];
+        for pixel in pixels {
+            bytes.extend(pixel.to_le_bytes());
+        }
+        let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+        let spectrum = Spectrum::average(&mut reader, |_| true).unwrap();
+        let trace = spectrum.fit_line(None).unwrap();
+        let image = reconstruct(&mut reader, trace, 0., |_| true).unwrap();
+        assert_eq!((image.width(), image.height()), (3, 2));
+        assert_eq!(image.pixels(), &pixels);
+        assert!(matches!(
+            reconstruct(&mut reader, trace, 0.25, |_| true),
+            Err(Error::InvalidTrace)
+        ));
+    }
+}
+
+#[test]
+fn fits_preserves_unsigned_samples_and_pads_fits_blocks() {
+    let mut bytes = ser_header(b"JSOLEX-TRIMMED", 3, 2, 16, 1, 1);
+    for value in [0u16, 32768, 65535, 900, 900, 900] {
+        bytes.extend(value.to_le_bytes());
+    }
+    let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+    let image = reconstruct(&mut reader, Trace::constant(3, 0.), 0., |_| true).unwrap();
+    let mut fits = Vec::new();
+    image.write_fits(&mut fits).unwrap();
+    assert_eq!(fits.len(), 5760);
+    let metadata = std::str::from_utf8(&fits[..2880]).unwrap();
+    assert!(metadata.contains("NAXIS1  =                    3"));
+    assert!(metadata.contains("BZERO   =                32768"));
+    assert_eq!(&fits[2880..2886], &[0x80, 0, 0, 0, 0x7f, 0xff]);
+    assert!(fits[2886..].iter().all(|byte| *byte == 0));
 }
 
 #[test]

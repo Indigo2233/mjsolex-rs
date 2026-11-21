@@ -1,5 +1,6 @@
 use std::io::{Read, Seek};
 
+use crate::regression::weighted_fit;
 use crate::{Error, Header, SerReader};
 
 const AVERAGE_FRAMES: u32 = 64;
@@ -62,9 +63,7 @@ impl Spectrum {
             let index = (u64::from(i) * u64::from(header.frames - 1)
                 / u64::from((count - 1).max(1))) as u32;
             let frame = reader.frame(index)?;
-            for (pixel, sum) in pixels.iter_mut().enumerate() {
-                *sum += f32::from(header.sample(frame, pixel));
-            }
+            header.accumulate(frame, &mut pixels);
         }
         if !progress(1.) {
             return Err(Error::Cancelled);
@@ -101,6 +100,9 @@ impl Spectrum {
             && (x >= width || y >= height)
         {
             return Err(Error::InvalidTrace);
+        }
+        if height == 1 {
+            return Ok(Trace::constant(width, 0.));
         }
         if height < 3 {
             return seed
@@ -180,7 +182,7 @@ impl Spectrum {
             .fold(0., f64::max);
         let continuum = lower.min(upper);
         let depth = continuum - center;
-        if depth < (continuum * 0.015).max(32.) {
+        if depth < (continuum * 0.015).max(1.) {
             return None;
         }
         let delta = (before - after) / (2. * (before + after - 2. * center));
@@ -193,39 +195,12 @@ impl Spectrum {
 }
 
 fn fit(samples: &[Sample], width: usize) -> Option<Trace> {
-    let mut matrix = [[0.; 4]; 3];
-    for sample in samples {
+    let coefficients = weighted_fit(samples.iter().map(|sample| {
         let x = normalized(sample.x, width);
-        let terms = [1., x, x * x, sample.y];
-        for (row, basis) in matrix.iter_mut().zip(terms) {
-            for (entry, term) in row.iter_mut().zip(terms) {
-                *entry += basis * term * sample.depth;
-            }
-        }
-    }
-    for column in 0..3 {
-        let pivot = (column..3)
-            .max_by(|&a, &b| matrix[a][column].abs().total_cmp(&matrix[b][column].abs()))?;
-        matrix.swap(column, pivot);
-        let divisor = matrix[column][column];
-        if divisor.abs() < 1e-8 {
-            return None;
-        }
-        for value in &mut matrix[column][column..] {
-            *value /= divisor;
-        }
-        let pivot_row = matrix[column];
-        for (index, row) in matrix.iter_mut().enumerate() {
-            if index != column {
-                let factor = row[column];
-                for (value, pivot) in row[column..].iter_mut().zip(&pivot_row[column..]) {
-                    *value -= factor * pivot;
-                }
-            }
-        }
-    }
+        ([1., x, x * x], sample.y, sample.depth)
+    }))?;
     Some(Trace {
-        coefficients: matrix.map(|row| row[3]),
+        coefficients,
         width,
     })
 }

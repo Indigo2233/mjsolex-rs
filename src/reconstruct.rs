@@ -2,12 +2,12 @@ use std::io::{Read, Seek, Write};
 
 use crate::{Error, SerReader, Trace};
 
-const MAX_PIXELS: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_PIXELS: usize = 32 * 1024 * 1024;
 
 pub struct Reconstruction {
-    width: usize,
-    height: usize,
-    pixels: Vec<u16>,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) pixels: Vec<u16>,
 }
 
 impl Reconstruction {
@@ -74,13 +74,15 @@ pub fn reconstruct<R: Read + Seek>(
         return Err(Error::InvalidTrace);
     }
 
-    let offsets: &[f64] = if header.trimmed {
+    let offsets: &[f64] = if header.trimmed || header.height == 1 {
         &[0.]
     } else {
         &[-1., -0.5, 0., 0.5, 1.]
     };
     let weights: Vec<_> = offsets.iter().map(|dy| (-0.5 * dy * dy).exp()).collect();
     let mut columns = Vec::with_capacity(width);
+    let mut first_row = header.height;
+    let mut last_row = 0;
     for x in 0..width {
         let center = trace.row(x) + shift;
         let mut column = Column {
@@ -91,13 +93,19 @@ pub fn reconstruct<R: Read + Seek>(
         for (&offset, &weight) in offsets.iter().zip(&weights) {
             let y = center + offset;
             let low = y.floor();
-            if !(0. ..(header.height - 1) as f64).contains(&low) {
+            let high = if header.height == 1 && y == 0. {
+                0
+            } else if (0. ..(header.height - 1) as f64).contains(&low) {
+                low as usize + 1
+            } else {
                 continue;
-            }
+            };
             let fraction = y - low;
+            first_row = first_row.min(low as usize);
+            last_row = last_row.max(high);
             for (row, weight) in [
                 (low as usize, (1. - fraction) * weight),
-                (low as usize + 1, fraction * weight),
+                (high, fraction * weight),
             ] {
                 let index = row * width + x;
                 if let Some(tap) = column.taps[..column.count]
@@ -117,16 +125,31 @@ pub fn reconstruct<R: Read + Seek>(
         }
         columns.push(column);
     }
-    if columns.iter().all(|column| column.count == 0) {
+    if first_row == header.height {
         return Err(Error::InvalidTrace);
     }
+    let band_height = last_row - first_row + 1;
+    // Keep sequential reads when skipping a small number of bytes per frame.
+    let use_band = band_height <= header.height / 2
+        && (header.height - band_height) * header.row_bytes() >= 4096;
+    let rows = if use_band {
+        let start = first_row * width;
+        for column in &mut columns {
+            for tap in &mut column.taps[..column.count] {
+                tap.index -= start;
+            }
+        }
+        first_row..last_row + 1
+    } else {
+        0..header.height
+    };
 
     let mut pixels = Vec::with_capacity(width * height);
     for i in 0..header.frames {
         if !progress(i as f32 / header.frames as f32) {
             return Err(Error::Cancelled);
         }
-        let frame = reader.frame(i)?;
+        let frame = reader.frame_rows(i, rows.clone())?;
         for column in &columns {
             let sample = column.taps[..column.count]
                 .iter()

@@ -1,6 +1,5 @@
 use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::fd::BorrowedFd;
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
@@ -10,20 +9,26 @@ use eframe::egui::{
     TextureOptions, Ui, Vec2, pos2, vec2,
 };
 use jni::objects::{GlobalRef, JObject, JString, JValue};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean};
 use jni::{JNIEnv, JavaVM};
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::io::Errno;
 use winit::platform::android::activity::AndroidApp;
 
-use crate::{Error, Header, Reconstruction, SerReader, Spectrum, Trace, reconstruct};
+use crate::android_document::DocumentFile;
+use crate::ser::cache_frames;
+use crate::{DiskGeometry, Error, Header, Reconstruction, SerReader, Spectrum, Trace, reconstruct};
 
 const OPEN_SER: i32 = 10;
 const SAVE_PNG: i32 = 11;
+const SAVE_FITS: i32 = 12;
 const BACKGROUND: Color32 = Color32::from_rgb(17, 21, 27);
 const CARD: Color32 = Color32::from_rgb(28, 35, 44);
 const TEXT: Color32 = Color32::from_rgb(240, 243, 247);
 const MUTED: Color32 = Color32::from_rgb(171, 185, 199);
 const AMBER: Color32 = Color32::from_rgb(255, 190, 99);
 
-type Document = Option<(File, String)>;
+type Document = Option<(DocumentFile, String)>;
 
 static PICKER: Mutex<Option<(GlobalRef, Events)>> = Mutex::new(None);
 
@@ -49,12 +54,18 @@ enum Event {
 
 enum Work {
     Imported(Box<Imported>),
-    Reconstructed(Arc<Reconstruction>, ColorImage, f64),
+    Reconstructed {
+        image: Arc<Reconstruction>,
+        preview: ColorImage,
+        shift: f64,
+        corrected: bool,
+        warning: Option<String>,
+    },
     Exported(String),
 }
 
 struct Imported {
-    file: File,
+    file: DocumentFile,
     name: String,
     header: Header,
     spectrum: Spectrum,
@@ -63,7 +74,7 @@ struct Imported {
 }
 
 struct Scan {
-    file: File,
+    file: DocumentFile,
     name: String,
     header: Header,
     spectrum: Spectrum,
@@ -74,6 +85,7 @@ struct Output {
     image: Arc<Reconstruction>,
     texture: TextureHandle,
     shift: f64,
+    corrected: bool,
 }
 
 struct Job {
@@ -94,6 +106,7 @@ struct Mobile {
     scan: Option<Scan>,
     trace: Option<Trace>,
     shift: f64,
+    correct_disk: bool,
     output: Option<Output>,
     view_output: bool,
     note: Option<(String, bool)>,
@@ -105,18 +118,22 @@ fn android_main(app: AndroidApp) {
     let vm = unsafe { JavaVM::from_raw(app.vm_as_ptr().cast()) };
     let result = vm.and_then(|vm| {
         let mut env = vm.attach_current_thread()?;
-        // SAFETY: android-activity supplies a global reference to the live Activity.
-        let activity = unsafe { JObject::from_raw(app.activity_as_ptr().cast()) };
-        let activity = env.new_global_ref(activity)?;
-        let cache = env
-            .call_method(activity.as_obj(), "getCacheDir", "()Ljava/io/File;", &[])?
-            .l()?;
-        let cache = env
-            .call_method(cache, "getAbsolutePath", "()Ljava/lang/String;", &[])?
-            .l()?;
-        let cache: String = env.get_string(&JString::from(cache))?.into();
+        let result = env.with_local_frame(8, |env| {
+            let activity = own_activity(env, &app)?;
+            let cache = env
+                .call_method(activity.as_obj(), "getCacheDir", "()Ljava/io/File;", &[])?
+                .l()?;
+            let cache = env
+                .call_method(cache, "getAbsolutePath", "()Ljava/lang/String;", &[])?
+                .l()?;
+            let cache: String = env.get_string(&JString::from(cache))?.into();
+            Ok::<_, jni::errors::Error>((activity, PathBuf::from(cache)))
+        });
+        if matches!(&result, Err(jni::errors::Error::JavaException)) {
+            let _ = env.exception_clear();
+        }
         drop(env);
-        Ok((vm, activity, PathBuf::from(cache)))
+        result.map(|(activity, cache)| (vm, activity, cache))
     });
     let Ok((vm, activity, cache)) = result else {
         eprintln!("MJ Sol'Ex could not initialize the Android file picker: {result:?}");
@@ -136,43 +153,65 @@ fn android_main(app: AndroidApp) {
     }
 }
 
+fn own_activity(env: &JNIEnv<'_>, app: &AndroidApp) -> jni::errors::Result<GlobalRef> {
+    let raw = env.get_raw();
+    // SAFETY: env is valid on this thread. android-activity retains this unowned
+    // global reference while app is alive. NewLocalRef returns a distinct local
+    // reference in our JNI frame, which JObject::from_raw can wrap.
+    let local = unsafe {
+        let new_local_ref = (**raw)
+            .NewLocalRef
+            .ok_or(jni::errors::Error::JNIEnvMethodNotFound("NewLocalRef"))?;
+        JObject::from_raw(new_local_ref(raw, app.activity_as_ptr().cast()))
+    };
+    if local.is_null() {
+        if env.exception_check()? {
+            return Err(jni::errors::Error::JavaException);
+        }
+        return Err(jni::errors::Error::NullPtr("activity local reference"));
+    }
+    env.new_global_ref(local)
+}
+
 #[unsafe(no_mangle)]
 extern "system" fn Java_org_mjsolex_mobile_MainActivity_onDocument(
     mut env: JNIEnv<'_>,
     activity: JObject<'_>,
     request: i32,
-    fd: i32,
+    descriptor: JObject<'_>,
     name: JString<'_>,
     error: JString<'_>,
-) {
-    let Ok(route) = PICKER.lock() else { return };
-    let Some((owner, events)) = route.as_ref() else {
-        return;
+) -> jboolean {
+    let Some((owner, events)) = PICKER.lock().ok().and_then(|route| route.clone()) else {
+        return JNI_FALSE;
     };
     if !matches!(env.is_same_object(&activity, owner.as_obj()), Ok(true)) {
-        return;
+        return JNI_FALSE;
     }
-    let document = if !error.is_null() {
-        let message = env
-            .get_string(&error)
-            .map(Into::into)
-            .unwrap_or_else(|_| "Cannot access the Android document.".into());
-        Err(message)
-    } else if fd < 0 {
-        Ok(None)
+    let document: jni::errors::Result<Result<Document, String>> = if !error.is_null() {
+        env.get_string(&error).map(|message| Err(message.into()))
+    } else if descriptor.is_null() {
+        Ok(Ok(None))
     } else {
-        let name = env
-            .get_string(&name)
-            .map(Into::into)
-            .unwrap_or_else(|_| "scan".into());
-        // SAFETY: the Java call holds the ParcelFileDescriptor open until we return.
-        let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        borrowed
-            .try_clone_to_owned()
-            .map(|owned| Some((File::from(owned), name)))
-            .map_err(|err| err.to_string())
+        let name = if name.is_null() {
+            Ok("scan".into())
+        } else {
+            env.get_string(&name).map(Into::into)
+        };
+        name.map(|name| {
+            DocumentFile::from_android(&mut env, descriptor, request != OPEN_SER)
+                .map(|file| Some((file, name)))
+                .map_err(|error| error.to_string())
+        })
     };
+    let document =
+        document.unwrap_or_else(|error| Err(format!("Cannot access Android document: {error}")));
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+    let adopted = matches!(document, Ok(Some(_)));
     events.post(Event::Document(request, document));
+    if adopted { JNI_TRUE } else { JNI_FALSE }
 }
 
 impl Mobile {
@@ -204,6 +243,7 @@ impl Mobile {
             scan: None,
             trace: None,
             shift: 0.,
+            correct_disk: false,
             output: None,
             view_output: false,
             note: None,
@@ -211,40 +251,43 @@ impl Mobile {
     }
 
     fn pick(&mut self, request: i32) {
-        let result = (|| {
-            let mut env = self.vm.attach_current_thread()?;
-            let activity = self.activity.as_obj();
-            if request == OPEN_SER {
-                env.call_method(activity, "pickSer", "()V", &[])?;
-            } else {
-                let name = self
-                    .scan
-                    .as_ref()
-                    .map(|scan| scan.name.as_str())
-                    .unwrap_or("scan");
-                let stem = Path::new(name)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("scan");
-                let name = env.new_string(format!("{stem}-reconstruction.png"))?;
-                env.call_method(
-                    activity,
-                    "createPng",
-                    "(Ljava/lang/String;)V",
-                    &[JValue::Object(&name)],
-                )?;
+        let result = self.vm.attach_current_thread().and_then(|mut env| {
+            let result = env.with_local_frame(8, |env| {
+                let activity = self.activity.as_obj();
+                if request == OPEN_SER {
+                    env.call_method(activity, "pickSer", "()V", &[])?;
+                } else {
+                    let name = self
+                        .scan
+                        .as_ref()
+                        .map(|scan| scan.name.as_str())
+                        .unwrap_or("scan");
+                    let stem = Path::new(name)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("scan");
+                    let ext = if request == SAVE_FITS { "fits" } else { "png" };
+                    let name = env.new_string(format!("{stem}-reconstruction.{ext}"))?;
+                    env.call_method(
+                        activity,
+                        "createImage",
+                        "(ILjava/lang/String;)V",
+                        &[JValue::Int(request), JValue::Object(&name)],
+                    )?;
+                }
+                Ok::<_, jni::errors::Error>(())
+            });
+            if matches!(&result, Err(jni::errors::Error::JavaException)) {
+                let _ = env.exception_clear();
             }
-            Ok::<_, jni::errors::Error>(())
-        })();
+            result
+        });
         match result {
             Ok(()) => {
                 self.picker = Some(request);
                 self.note = None;
             }
             Err(err) => {
-                if let Ok(env) = self.vm.get_env() {
-                    let _ = env.exception_clear();
-                }
                 self.note = Some((format!("Cannot open file picker: {err}"), true));
             }
         }
@@ -279,17 +322,18 @@ impl Mobile {
         }
     }
 
-    fn import(&mut self, mut file: File, name: String) {
+    fn import(&mut self, mut file: DocumentFile, name: String) {
         let cache = self.cache.clone();
         self.start_job("Reading spectrum", true, move |events, cancel| {
-            if let Err(error) = file.seek(SeekFrom::Start(0)) {
-                if error.raw_os_error() != Some(29) {
-                    // ESPIPE on Android
+            if let Err(error) = file.file.seek(SeekFrom::Start(0)) {
+                if error.raw_os_error() != Some(Errno::SPIPE.raw_os_error()) {
                     return Err(error.into());
                 }
-                file = cache_document(file, &cache, cancel)?;
+                let cached = cache_document(&mut file.file, &cache, cancel)?;
+                file.check_error()?;
+                file = DocumentFile::cached(cached);
             }
-            let mut reader = SerReader::open(&file)?;
+            let mut reader = SerReader::open(&file.file)?;
             let header = reader.header();
             let spectrum = Spectrum::average(&mut reader, report(events, cancel))?;
             let trace = spectrum.fit_line(None);
@@ -318,28 +362,62 @@ impl Mobile {
             }
         };
         let shift = self.shift;
+        let correct_disk = self.correct_disk;
         self.start_job("Reconstructing scan", true, move |events, cancel| {
-            let mut reader = SerReader::open(file)?;
-            let image = Arc::new(reconstruct(
-                &mut reader,
-                trace,
+            let mut reader = SerReader::open(&file.file)?;
+            let mut progress = report(events, cancel);
+            let fraction = if correct_disk { 0.85 } else { 1. };
+            let raw = reconstruct(&mut reader, trace, shift, |p| progress(p * fraction))?;
+            let (image, corrected, warning) = if correct_disk {
+                match DiskGeometry::fit(&raw)
+                    .and_then(|geometry| geometry.correct(&raw, |p| progress(fraction + p * 0.15)))
+                {
+                    Ok(image) => (image, true, None),
+                    Err(Error::Cancelled) => return Err(Error::Cancelled),
+                    Err(error) => (
+                        raw,
+                        false,
+                        Some(format!("Disk correction skipped. {error}")),
+                    ),
+                }
+            } else {
+                (raw, false, None)
+            };
+            let preview = preview(image.width(), image.height(), |i| image.pixels()[i]);
+            Ok(Work::Reconstructed {
+                image: Arc::new(image),
+                preview,
                 shift,
-                report(events, cancel),
-            )?);
-            let thumbnail = preview(image.width(), image.height(), |i| image.pixels()[i]);
-            Ok(Work::Reconstructed(image, thumbnail, shift))
+                corrected,
+                warning,
+            })
         });
     }
 
-    fn export(&mut self, file: File, name: String) {
+    fn export(&mut self, request: i32, mut file: DocumentFile, name: String) {
         let Some(output) = &self.output else { return };
         let image = output.image.clone();
-        self.start_job("Saving PNG", false, move |_, _| {
-            let mut writer = BufWriter::new(file);
-            image.write_png(&mut writer)?;
-            writer.flush()?;
-            Ok(Work::Exported(name))
-        });
+        let fits = request == SAVE_FITS;
+        self.start_job(
+            if fits { "Saving FITS" } else { "Saving PNG" },
+            false,
+            move |_, _| {
+                let result = (|| -> Result<(), Error> {
+                    let mut writer = BufWriter::new(&mut file.file);
+                    if fits {
+                        image.write_fits(&mut writer)?;
+                    } else {
+                        image.write_png(&mut writer)?;
+                    }
+                    writer.flush()?;
+                    Ok(())
+                })();
+                let closed = file.finish_export(result.is_err());
+                result?;
+                closed?;
+                Ok(Work::Exported(name))
+            },
+        );
     }
 
     fn receive(&mut self, ctx: &Context) {
@@ -349,7 +427,7 @@ impl Mobile {
                     self.picker = None;
                     match result {
                         Ok(Some((file, name))) if request == OPEN_SER => self.import(file, name),
-                        Ok(Some((file, name))) => self.export(file, name),
+                        Ok(Some((file, name))) => self.export(request, file, name),
                         Ok(None) => {}
                         Err(error) => self.note = Some((error, true)),
                     }
@@ -388,15 +466,23 @@ impl Mobile {
                             self.output = None;
                             self.view_output = false;
                         }
-                        Ok(Work::Reconstructed(image, preview, shift)) => {
+                        Ok(Work::Reconstructed {
+                            image,
+                            preview,
+                            shift,
+                            corrected,
+                            warning,
+                        }) => {
                             let texture =
                                 ctx.load_texture("reconstruction", preview, TextureOptions::LINEAR);
                             self.output = Some(Output {
                                 image,
                                 texture,
                                 shift,
+                                corrected,
                             });
                             self.view_output = true;
+                            self.note = warning.map(|warning| (warning, true));
                         }
                         Ok(Work::Exported(name)) => {
                             self.note = Some((format!("Saved {name}"), false))
@@ -511,7 +597,7 @@ impl Mobile {
                 &scan.texture,
                 header.width,
                 header.height,
-                200.,
+                112. ..=200.,
                 Sense::click(),
             );
             let rect = response.rect;
@@ -571,6 +657,10 @@ impl Mobile {
                     self.shift = 0.;
                 }
             });
+            ui.add_enabled(
+                !busy,
+                egui::Checkbox::new(&mut self.correct_disk, "Correct full-disk geometry"),
+            );
             if action(ui, "Reconstruct scan", !busy && self.trace.is_some(), true) {
                 self.reconstruct();
             }
@@ -579,20 +669,32 @@ impl Mobile {
 
     fn show_output(&mut self, ui: &mut Ui, busy: bool) {
         let Some(output) = &self.output else { return };
-        let export = card(ui, |ui| {
-            ui.label(RichText::new("Reconstructed scan").size(18.).strong());
+        let request = card(ui, |ui| {
+            let title = if output.corrected {
+                "Geometry-corrected scan"
+            } else {
+                "Reconstructed scan"
+            };
+            ui.label(RichText::new(title).size(18.).strong());
             let (w, h) = (output.image.width(), output.image.height());
             ui.label(
                 RichText::new(format!("{w} × {h} px  ·  {:+.2} px offset", output.shift))
                     .color(MUTED),
             );
-            let save = action(ui, "Save 16-bit PNG", !busy, true);
-            picture(ui, &output.texture, w, h, 360., Sense::hover());
+            let png = action(ui, "Save 16-bit PNG", !busy, true);
+            let fits = action(ui, "Save FITS", !busy, false);
+            picture(ui, &output.texture, w, h, 0. ..=360., Sense::hover());
             ui.label(RichText::new("Preview contrast is stretched.").color(MUTED));
-            save
+            if png {
+                Some(SAVE_PNG)
+            } else if fits {
+                Some(SAVE_FITS)
+            } else {
+                None
+            }
         });
-        if export {
-            self.pick(SAVE_PNG);
+        if let Some(request) = request {
+            self.pick(request);
         }
     }
 }
@@ -641,32 +743,66 @@ fn report<'a>(events: &'a Events, cancel: &'a AtomicBool) -> impl FnMut(f32) -> 
     }
 }
 
-fn cache_document(mut input: File, cache: &Path, cancel: &AtomicBool) -> Result<File, Error> {
+fn cache_document(input: &mut File, cache: &Path, cancel: &AtomicBool) -> Result<File, Error> {
     let mut file = tempfile::tempfile_in(cache)?;
-    let mut buffer = vec![0; 1024 * 1024];
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return Err(Error::Cancelled);
+    let volume = rustix::fs::fstatvfs(&file).map_err(io::Error::from)?;
+    // Keep space for processing output and other applications on the shared volume.
+    let limit = volume.f_bavail.saturating_mul(volume.f_frsize) / 2;
+    let result = cache_frames(PipeReader { input, cancel }, &mut file, limit);
+    if cancel.load(Ordering::Relaxed) {
+        return Err(Error::Cancelled);
+    }
+    result?;
+    Ok(file)
+}
+
+struct PipeReader<'a> {
+    input: &'a mut File,
+    cancel: &'a AtomicBool,
+}
+
+impl Read for PipeReader<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
         }
-        let size = input.read(&mut buffer)?;
-        if size == 0 {
-            return Ok(file);
+        let timeout = Timespec {
+            tv_sec: 0,
+            tv_nsec: 200_000_000,
+        };
+        while !self.cancel.load(Ordering::Relaxed) {
+            let ready = poll(
+                &mut [PollFd::new(&*self.input, PollFlags::IN)],
+                Some(&timeout),
+            );
+            match ready {
+                Ok(0) | Err(Errno::INTR) => continue,
+                Ok(_) => return self.input.read(buffer),
+                Err(error) => return Err(error.into()),
+            }
         }
-        file.write_all(&buffer[..size])?;
+        Err(io::Error::other("processing cancelled"))
     }
 }
 
 fn preview(width: usize, height: usize, value: impl Fn(usize) -> u16) -> ColorImage {
-    let step = width.max(height).div_ceil(1200);
-    let (w, h) = (width.div_ceil(step), height.div_ceil(step));
+    let x_step = width.div_ceil(1200);
+    let y_step = height.div_ceil(1200);
+    let (w, h) = (width.div_ceil(x_step), height.div_ceil(y_step));
     let mut pixels = Vec::with_capacity(w * h);
-    let mut histogram = [0; 256];
+    let (mut min, mut max) = (u16::MAX, 0);
     for y in 0..h {
         for x in 0..w {
-            let sample = value(y * step * width + x * step);
-            histogram[usize::from(sample >> 8)] += 1;
+            let sample = value(y * y_step * width + x * x_step);
+            min = min.min(sample);
+            max = max.max(sample);
             pixels.push(sample);
         }
+    }
+    let span = u32::from((max - min).max(1));
+    let mut histogram = [0; 256];
+    for &sample in &pixels {
+        histogram[(u32::from(sample - min) * 255 / span) as usize] += 1;
     }
     let percentile = |target| {
         let mut seen = 0;
@@ -677,10 +813,12 @@ fn preview(width: usize, height: usize, value: impl Fn(usize) -> u16) -> ColorIm
                 seen > target
             })
             .unwrap_or(255) as u32
-            * 257
+            * span
+            / 255
+            + u32::from(min)
     };
     let lo = percentile(pixels.len() / 100);
-    let hi = percentile(pixels.len() * 99 / 100).max(lo + 512);
+    let hi = percentile(pixels.len() * 99 / 100).max(lo + (span / 128).max(1));
     let gray: Vec<_> = pixels
         .into_iter()
         .map(|sample| (u32::from(sample).saturating_sub(lo) * 255 / (hi - lo)).min(255) as u8)
@@ -719,17 +857,17 @@ fn picture(
     texture: &TextureHandle,
     width: usize,
     height: usize,
-    max_height: f32,
+    height_range: std::ops::RangeInclusive<f32>,
     sense: Sense,
 ) -> egui::Response {
     let aspect = width as f32 / height as f32;
-    let mut w = ui.available_width();
-    let h = (w / aspect).min(max_height);
-    w = (h * aspect).min(w);
+    let w = ui.available_width().min(*height_range.end() * aspect);
+    let h = (w / aspect).clamp(*height_range.start(), *height_range.end());
     ui.with_layout(egui::Layout::top_down(Align::Center), |ui| {
         ui.add(
             egui::Image::from_texture(texture)
                 .fit_to_exact_size(vec2(w, h))
+                .maintain_aspect_ratio(false)
                 .sense(sense),
         )
     })

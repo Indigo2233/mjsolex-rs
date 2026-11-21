@@ -15,8 +15,10 @@ public final class MainActivity extends NativeActivity {
 
     private static final int OPEN_SER = 10;
     private static final int SAVE_PNG = 11;
+    private static final int SAVE_FITS = 12;
 
-    private native void onDocument(int request, int fd, String name, String error);
+    private native boolean onDocument(
+        int request, ParcelFileDescriptor document, String name, String error);
 
     @Override
     protected void onCreate(Bundle state) {
@@ -30,10 +32,11 @@ public final class MainActivity extends NativeActivity {
         launchPicker(intent, OPEN_SER);
     }
 
-    public void createPng(String name) {
-        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT).setType("image/png")
+    public void createImage(int request, String name) {
+        String type = request == SAVE_FITS ? "application/fits" : "image/png";
+        Intent intent = new Intent(Intent.ACTION_CREATE_DOCUMENT).setType(type)
             .putExtra(Intent.EXTRA_TITLE, name);
-        launchPicker(intent, SAVE_PNG);
+        launchPicker(intent, request);
     }
 
     private void launchPicker(Intent intent, int request) {
@@ -42,7 +45,7 @@ public final class MainActivity extends NativeActivity {
             try {
                 startActivityForResult(intent, request);
             } catch (RuntimeException error) {
-                onDocument(request, -1, null, "Cannot open the Android file picker.");
+                onDocument(request, null, null, "Cannot open the Android file picker.");
             }
         });
     }
@@ -50,11 +53,11 @@ public final class MainActivity extends NativeActivity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (request != OPEN_SER && request != SAVE_PNG) {
+        if (request != OPEN_SER && request != SAVE_PNG && request != SAVE_FITS) {
             return;
         }
         if (result != RESULT_OK || data == null || data.getData() == null) {
-            onDocument(request, -1, null, null);
+            onDocument(request, null, null, null);
             return;
         }
         Uri uri = data.getData();
@@ -62,16 +65,32 @@ public final class MainActivity extends NativeActivity {
     }
 
     private void openDocument(int request, Uri uri) {
-        try (ParcelFileDescriptor document =
-                 getContentResolver().openFileDescriptor(uri, request == OPEN_SER ? "r" : "wt")) {
+        ParcelFileDescriptor document = null;
+        try {
+            document = getContentResolver().openFileDescriptor(uri, request == OPEN_SER ? "r" : "wt");
             if (document == null) {
-                onDocument(request, -1, null, "The file provider did not open the document.");
+                onDocument(request, null, null, "The file provider did not open the document.");
                 return;
             }
-            onDocument(request, document.getFd(), displayName(uri, request), null);
+            if (onDocument(request, document, displayName(uri, request), null)) {
+                // Native code owns the descriptor and its provider status channel.
+                document = null;
+            }
         } catch (Exception error) {
             String detail = error.getLocalizedMessage();
-            onDocument(request, -1, null, detail == null ? "Cannot access the document." : detail);
+            onDocument(request, null, null, detail == null ? "Cannot access the document." : detail);
+        } finally {
+            if (document != null) {
+                try {
+                    if (request == OPEN_SER) {
+                        document.close();
+                    } else {
+                        document.closeWithError("MJ Sol'Ex did not accept this export");
+                    }
+                } catch (java.io.IOException ignored) {
+                    // No native job owns this descriptor.
+                }
+            }
         }
     }
 
@@ -84,6 +103,9 @@ public final class MainActivity extends NativeActivity {
         } catch (RuntimeException ignored) {
             // Some providers can open a file without exposing its name.
         }
-        return request == OPEN_SER ? "scan.ser" : "reconstruction.png";
+        if (request == OPEN_SER) {
+            return "scan.ser";
+        }
+        return request == SAVE_FITS ? "reconstruction.fits" : "reconstruction.png";
     }
 }

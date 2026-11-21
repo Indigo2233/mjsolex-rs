@@ -1,12 +1,18 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod fits;
+mod geometry;
 mod reconstruct;
+mod regression;
 mod ser;
 mod spectrum;
 
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(target_os = "android")]
+mod android_document;
 
+pub use geometry::DiskGeometry;
 pub use reconstruct::{Reconstruction, reconstruct};
 pub use ser::{Header, SerReader};
 pub use spectrum::{Spectrum, Trace};
@@ -23,10 +29,16 @@ pub enum Error {
     NoLine,
     #[error("The spectral line or offset lies outside the recording.")]
     InvalidTrace,
+    #[error("A complete solar limb could not be fitted.")]
+    NoSolarLimb,
     #[error("The reconstruction exceeds the supported 32 megapixels.")]
     OutputTooLarge,
     #[error("Processing cancelled.")]
     Cancelled,
+    #[error(
+        "The SER needs {required} bytes of temporary storage, but the cache limit is {limit} bytes."
+    )]
+    CacheLimit { required: u64, limit: u64 },
     #[error("PNG export failed: {0}")]
     Png(#[from] png::EncodingError),
 }
