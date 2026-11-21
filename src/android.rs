@@ -22,7 +22,10 @@ use crate::{
     SerReader, Spectrum, Trace, reconstruct_with_stride,
 };
 
+mod language;
 mod ui;
+
+use language::{Language, Notice};
 
 const OPEN_SER: i32 = 10;
 const SAVE_PNG: i32 = 11;
@@ -65,7 +68,7 @@ enum Work {
         image: Arc<Reconstruction>,
         preview: ColorImage,
         metadata: Box<FitsMetadata>,
-        warning: Option<String>,
+        warning: Option<Error>,
     },
     Exported(String),
 }
@@ -105,7 +108,7 @@ enum Page {
 }
 
 struct Job {
-    label: &'static str,
+    label: (&'static str, &'static str),
     cancel: Arc<AtomicBool>,
     progress: Option<f32>,
     cancellable: bool,
@@ -130,7 +133,8 @@ struct Mobile {
     correct_disk: bool,
     output: Option<Output>,
     page: Page,
-    note: Option<(String, bool)>,
+    language: Language,
+    note: Option<Notice>,
 }
 
 #[unsafe(no_mangle)]
@@ -148,17 +152,33 @@ fn android_main(app: AndroidApp) {
                 .call_method(cache, "getAbsolutePath", "()Ljava/lang/String;", &[])?
                 .l()?;
             let cache: String = env.get_string(&JString::from(cache))?.into();
-            Ok::<_, jni::errors::Error>((activity, PathBuf::from(cache)))
+            let language = env
+                .call_method(
+                    activity.as_obj(),
+                    "getUiLanguage",
+                    "()Ljava/lang/String;",
+                    &[],
+                )?
+                .l()?;
+            let language: String = env.get_string(&JString::from(language))?.into();
+            Ok::<_, jni::errors::Error>((
+                activity,
+                PathBuf::from(cache),
+                Language::from_code(&language),
+            ))
         });
         if matches!(&result, Err(jni::errors::Error::JavaException)) {
             let _ = env.exception_clear();
         }
         drop(env);
-        result.map(|(activity, cache)| (vm, activity, cache))
+        result.map(|(activity, cache, language)| (vm, activity, cache, language))
     });
-    let Ok((vm, activity, cache)) = result else {
-        eprintln!("MJ Sol'Ex could not initialize the Android file picker: {result:?}");
-        return;
+    let (vm, activity, cache, language) = match result {
+        Ok(initialized) => initialized,
+        Err(error) => {
+            eprintln!("MJ Sol'Ex could not initialize the Android activity: {error}");
+            return;
+        }
     };
     let options = eframe::NativeOptions {
         android_app: Some(app),
@@ -168,7 +188,15 @@ fn android_main(app: AndroidApp) {
     if let Err(error) = eframe::run_native(
         "MJ Sol'Ex",
         options,
-        Box::new(move |cc| Ok(Box::new(Mobile::new(vm, activity, cache, &cc.egui_ctx)))),
+        Box::new(move |cc| {
+            Ok(Box::new(Mobile::new(
+                vm,
+                activity,
+                cache,
+                language,
+                &cc.egui_ctx,
+            )))
+        }),
     ) {
         eprintln!("MJ Sol'Ex failed to start: {error}");
     }
@@ -223,11 +251,10 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onDocument(
                 !matches!(request, OPEN_SER | OPEN_SHARED),
             )
             .map(|file| Some((file, name)))
-            .map_err(|error| error.to_string())
+            .map_err(|error| format!("access:{error}"))
         })
     };
-    let document =
-        document.unwrap_or_else(|error| Err(format!("Cannot access Android document: {error}")));
+    let document = document.unwrap_or_else(|error| Err(format!("access:{error}")));
     if env.exception_check().unwrap_or(false) {
         let _ = env.exception_clear();
     }
@@ -252,7 +279,13 @@ fn activity_events(env: &JNIEnv<'_>, activity: &JObject<'_>) -> Option<Events> {
 }
 
 impl Mobile {
-    fn new(vm: JavaVM, activity: GlobalRef, cache: PathBuf, context: &Context) -> Self {
+    fn new(
+        vm: JavaVM,
+        activity: GlobalRef,
+        cache: PathBuf,
+        language: Language,
+        context: &Context,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel();
         let events = Events {
             sender,
@@ -269,6 +302,7 @@ impl Mobile {
             style.spacing.interact_size.y = 42.;
         });
         context.set_theme(egui::Theme::Dark);
+        language::install_fonts(context);
         Self {
             vm,
             activity,
@@ -288,7 +322,32 @@ impl Mobile {
             correct_disk: false,
             output: None,
             page: Page::Scan,
+            language,
             note: None,
+        }
+    }
+
+    fn switch_language(&mut self) {
+        let language = self.language.other();
+        let result = self.vm.attach_current_thread().and_then(|mut env| {
+            let result = env.with_local_frame(4, |env| {
+                let code = env.new_string(language.code())?;
+                env.call_method(
+                    self.activity.as_obj(),
+                    "setUiLanguage",
+                    "(Ljava/lang/String;)V",
+                    &[JValue::Object(&code)],
+                )?;
+                Ok::<_, jni::errors::Error>(())
+            });
+            if matches!(&result, Err(jni::errors::Error::JavaException)) {
+                let _ = env.exception_clear();
+            }
+            result
+        });
+        match result {
+            Ok(()) => self.language = language,
+            Err(error) => self.note = Some(Notice::SaveLanguage(error.to_string())),
         }
     }
 
@@ -342,7 +401,7 @@ impl Mobile {
                 self.note = None;
             }
             Err(err) => {
-                self.note = Some((format!("Cannot open file picker: {err}"), true));
+                self.note = Some(Notice::FilePicker(err.to_string()));
             }
         }
     }
@@ -374,15 +433,13 @@ impl Mobile {
                 self.note = None;
             }
             Ok(false) => {}
-            Err(error) => {
-                self.note = Some((format!("Cannot read the shared recording: {error}"), true))
-            }
+            Err(error) => self.note = Some(Notice::SharedRecording(error.to_string())),
         }
     }
 
     fn start_job(
         &mut self,
-        label: &'static str,
+        label: (&'static str, &'static str),
         cancellable: bool,
         run: impl FnOnce(&Events, &AtomicBool) -> Result<Work, Error> + Send + 'static,
     ) {
@@ -405,39 +462,43 @@ impl Mobile {
                 });
                 self.note = None;
             }
-            Err(error) => self.note = Some((error.to_string(), true)),
+            Err(error) => self.note = Some(Notice::Processing(error.into())),
         }
     }
 
     fn import(&mut self, mut file: DocumentFile, name: String, byte_order: Option<ByteOrder>) {
         let cache = self.cache.clone();
-        self.start_job("Reading spectrum", true, move |events, cancel| {
-            if let Err(error) = file.file.seek(SeekFrom::Start(0)) {
-                if error.raw_os_error() != Some(Errno::SPIPE.raw_os_error()) {
-                    return Err(error.into());
+        self.start_job(
+            ("Reading spectrum", "正在读取光谱"),
+            true,
+            move |events, cancel| {
+                if let Err(error) = file.file.seek(SeekFrom::Start(0)) {
+                    if error.raw_os_error() != Some(Errno::SPIPE.raw_os_error()) {
+                        return Err(error.into());
+                    }
+                    let cached = cache_document(&mut file.file, &cache, cancel)?;
+                    file.check_error()?;
+                    file = DocumentFile::cached(cached);
                 }
-                let cached = cache_document(&mut file.file, &cache, cancel)?;
-                file.check_error()?;
-                file = DocumentFile::cached(cached);
-            }
-            let mut reader = SerReader::open_with_byte_order(&file.file, byte_order)?;
-            let header = reader.header();
-            let observation = reader.observation().clone();
-            let spectrum = Spectrum::average(&mut reader, report(events, cancel))?;
-            let trace = spectrum.fit_line(None);
-            let preview = preview(header.width, header.height, |i| spectrum.pixels()[i] as u16);
-            drop(reader);
-            Ok(Work::Imported(Box::new(Imported {
-                file,
-                name,
-                header,
-                observation,
-                byte_order,
-                spectrum,
-                preview,
-                trace,
-            })))
-        });
+                let mut reader = SerReader::open_with_byte_order(&file.file, byte_order)?;
+                let header = reader.header();
+                let observation = reader.observation().clone();
+                let spectrum = Spectrum::average(&mut reader, report(events, cancel))?;
+                let trace = spectrum.fit_line(None);
+                let preview = preview(header.width, header.height, |i| spectrum.pixels()[i] as u16);
+                drop(reader);
+                Ok(Work::Imported(Box::new(Imported {
+                    file,
+                    name,
+                    header,
+                    observation,
+                    byte_order,
+                    spectrum,
+                    preview,
+                    trace,
+                })))
+            },
+        );
     }
 
     fn reload_byte_order(&mut self, order: Option<ByteOrder>) {
@@ -447,7 +508,7 @@ impl Mobile {
         }
         match scan.file.try_clone() {
             Ok(file) => self.import(file, scan.name.clone(), order),
-            Err(error) => self.note = Some((error.to_string(), true)),
+            Err(error) => self.note = Some(Notice::Processing(error.into())),
         }
     }
 
@@ -458,7 +519,7 @@ impl Mobile {
         let file = match scan.file.try_clone() {
             Ok(file) => file,
             Err(error) => {
-                self.note = Some((error.to_string(), true));
+                self.note = Some(Notice::Processing(error.into()));
                 return;
             }
         };
@@ -478,47 +539,51 @@ impl Mobile {
         };
         let shift = self.shift;
         let stride = self.stride;
-        self.start_job("Reconstructing scan", true, move |events, cancel| {
-            let mut reader = SerReader::open_with_byte_order(&file.file, order)?;
-            if reader.header() != header {
-                return Err(Error::InvalidSer(
-                    "recording changed; open the finished file again",
-                ));
-            }
-            metadata.observation = reader.observation().clone();
-            let mut progress = report(events, cancel);
-            let fraction = if correct_disk { 0.85 } else { 0.98 };
-            let raw = reconstruct_with_stride(&mut reader, trace, shift, stride, |p| {
-                progress(p * fraction)
-            })?;
-            drop(reader);
-            let (image, warning) = if correct_disk {
-                match DiskGeometry::fit(&raw).and_then(|geometry| {
-                    geometry
-                        .correct(&raw, |p| progress(fraction + p * 0.13))
-                        .map(|image| (image, geometry))
-                }) {
-                    Ok((image, geometry)) => {
-                        metadata.geometry = Some(geometry);
-                        (image, None)
-                    }
-                    Err(Error::Cancelled) => return Err(Error::Cancelled),
-                    Err(error) => (raw, Some(format!("Disk correction skipped. {error}"))),
+        self.start_job(
+            ("Reconstructing scan", "正在重建图像"),
+            true,
+            move |events, cancel| {
+                let mut reader = SerReader::open_with_byte_order(&file.file, order)?;
+                if reader.header() != header {
+                    return Err(Error::InvalidSer(
+                        "recording changed; open the finished file again",
+                    ));
                 }
-            } else {
-                (raw, None)
-            };
-            let preview = preview(image.width(), image.height(), |i| image.pixels()[i]);
-            if !progress(1.) {
-                return Err(Error::Cancelled);
-            }
-            Ok(Work::Reconstructed {
-                image: Arc::new(image),
-                preview,
-                metadata: Box::new(metadata),
-                warning,
-            })
-        });
+                metadata.observation = reader.observation().clone();
+                let mut progress = report(events, cancel);
+                let fraction = if correct_disk { 0.85 } else { 0.98 };
+                let raw = reconstruct_with_stride(&mut reader, trace, shift, stride, |p| {
+                    progress(p * fraction)
+                })?;
+                drop(reader);
+                let (image, warning) = if correct_disk {
+                    match DiskGeometry::fit(&raw).and_then(|geometry| {
+                        geometry
+                            .correct(&raw, |p| progress(fraction + p * 0.13))
+                            .map(|image| (image, geometry))
+                    }) {
+                        Ok((image, geometry)) => {
+                            metadata.geometry = Some(geometry);
+                            (image, None)
+                        }
+                        Err(Error::Cancelled) => return Err(Error::Cancelled),
+                        Err(error) => (raw, Some(error)),
+                    }
+                } else {
+                    (raw, None)
+                };
+                let preview = preview(image.width(), image.height(), |i| image.pixels()[i]);
+                if !progress(1.) {
+                    return Err(Error::Cancelled);
+                }
+                Ok(Work::Reconstructed {
+                    image: Arc::new(image),
+                    preview,
+                    metadata: Box::new(metadata),
+                    warning,
+                })
+            },
+        );
     }
 
     fn export(&mut self, request: i32, mut file: DocumentFile, name: String) {
@@ -527,7 +592,11 @@ impl Mobile {
         let metadata = output.metadata.clone();
         let fits = request == SAVE_FITS;
         self.start_job(
-            if fits { "Saving FITS" } else { "Saving PNG" },
+            if fits {
+                ("Saving FITS", "正在保存 FITS")
+            } else {
+                ("Saving PNG", "正在保存 PNG")
+            },
             false,
             move |_, _| {
                 let result = (|| -> Result<(), Error> {
@@ -560,7 +629,7 @@ impl Mobile {
                         }
                         Ok(Some((file, name))) => self.export(request, file, name),
                         Ok(None) => {}
-                        Err(error) => self.note = Some((error, true)),
+                        Err(error) => self.note = Some(Notice::Document(error)),
                     }
                 }
                 Event::Progress(progress) => {
@@ -619,15 +688,10 @@ impl Mobile {
                                 metadata: *metadata,
                             });
                             self.page = Page::Result;
-                            self.note = warning.map(|warning| (warning, true));
+                            self.note = warning.map(Notice::DiskCorrection);
                         }
-                        Ok(Work::Exported(name)) => {
-                            self.note = Some((format!("Saved {name}"), false))
-                        }
-                        Err(Error::Cancelled) => {
-                            self.note = Some(("Processing cancelled.".into(), false))
-                        }
-                        Err(error) => self.note = Some((error.to_string(), true)),
+                        Ok(Work::Exported(name)) => self.note = Some(Notice::Saved(name)),
+                        Err(error) => self.note = Some(Notice::Processing(error)),
                     }
                 }
                 Event::Document(..) => {}
@@ -646,7 +710,7 @@ impl Mobile {
                     .map(|scan| scan.spectrum.line_profile(trace));
                 self.note = None;
             }
-            Err(error) => self.note = Some((error.to_string(), true)),
+            Err(error) => self.note = Some(Notice::Processing(error)),
         }
     }
 }

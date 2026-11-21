@@ -25,6 +25,25 @@ public final class MainActivity extends NativeActivity {
         int request, ParcelFileDescriptor document, String name, String error);
     private native void onShareAvailable();
 
+    public String getUiLanguage() {
+        String preferred = getSharedPreferences("appearance", MODE_PRIVATE)
+            .getString("language", null);
+        if ("zh".equals(preferred) || "en".equals(preferred)) {
+            return preferred;
+        }
+        Locale locale = getResources().getConfiguration().getLocales().get(0);
+        return "zh".equals((locale == null ? Locale.getDefault() : locale).getLanguage()) ? "zh" : "en";
+    }
+
+    public void setUiLanguage(String language) {
+        getSharedPreferences("appearance", MODE_PRIVATE).edit()
+            .putString("language", language).apply();
+    }
+
+    private String uiText(String english, String chinese) {
+        return "zh".equals(getUiLanguage()) ? chinese : english;
+    }
+
     @Override
     protected void onCreate(Bundle state) {
         super.onCreate(state);
@@ -58,7 +77,8 @@ public final class MainActivity extends NativeActivity {
                 onShareAvailable();
             }
         } catch (RuntimeException error) {
-            Toast.makeText(this, "The shared attachment could not be opened.", Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, uiText("The shared attachment could not be opened.",
+                "无法打开分享的文件。"), Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -85,7 +105,8 @@ public final class MainActivity extends NativeActivity {
             try {
                 startActivity(intent);
             } catch (RuntimeException error) {
-                Toast.makeText(this, "Cannot open Indigo Observatory.", Toast.LENGTH_SHORT).show();
+                Toast.makeText(this, uiText("Cannot open Indigo Observatory.",
+                    "无法打开靛空台。"), Toast.LENGTH_SHORT).show();
             }
         });
         return true;
@@ -109,7 +130,7 @@ public final class MainActivity extends NativeActivity {
             try {
                 startActivityForResult(intent, request);
             } catch (RuntimeException error) {
-                onDocument(request, null, null, "Cannot open the Android file picker.");
+                onDocument(request, null, null, "picker");
             }
         });
     }
@@ -133,12 +154,12 @@ public final class MainActivity extends NativeActivity {
         try {
             String name = displayName(uri, request);
             if (request == OPEN_SHARED_SER && !name.toLowerCase(Locale.ROOT).endsWith(".ser")) {
-                onDocument(request, null, null, "Share one original SER recording.");
+                onDocument(request, null, null, "single_ser");
                 return;
             }
             document = getContentResolver().openFileDescriptor(uri, isInput(request) ? "r" : "wt");
             if (document == null) {
-                onDocument(request, null, null, "The file provider did not open the document.");
+                onDocument(request, null, null, "unavailable");
                 return;
             }
             if (onDocument(request, document, name, null)) {
@@ -147,7 +168,7 @@ public final class MainActivity extends NativeActivity {
             }
         } catch (Exception error) {
             String detail = error.getLocalizedMessage();
-            onDocument(request, null, null, detail == null ? "Cannot access the document." : detail);
+            onDocument(request, null, null, detail == null ? "access" : "access:" + detail);
         } finally {
             if (document != null) {
                 try {

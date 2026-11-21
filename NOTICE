@@ -4,3 +4,8 @@ SER layout and solar scan reconstruction are based on Astro4j and JSol'Ex
 (https://github.com/melix/astro4j), revision 7ffdaf5c.
 Copyright 2023 the original author or authors.
 Astro4j is distributed under the Apache License, Version 2.0.
+
+MJ Solex Sans SC is a regular-weight subset of Noto Sans SC 2.04.
+Copyright 2014-2021 Adobe (http://www.adobe.com/), with Reserved Font Name 'Source'.
+The font is distributed under the SIL Open Font License, Version 1.1.
+See assets/MJSolexSansSC-OFL.txt.
