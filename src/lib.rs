@@ -9,6 +9,9 @@ mod regression;
 mod ser;
 mod spectrum;
 
+#[cfg(any(target_os = "android", test))]
+mod solar_atlas;
+
 #[cfg(target_os = "android")]
 mod android;
 #[cfg(target_os = "android")]

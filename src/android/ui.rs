@@ -1,6 +1,8 @@
 use super::*;
+use crate::solar_atlas::{ReferenceProfile, reference_profile};
 
 const CYAN: Color32 = Color32::from_rgb(131, 208, 225);
+const ATLAS_COLOR: Color32 = Color32::from_rgb(194, 160, 255);
 
 impl eframe::App for Mobile {
     fn ui(&mut self, ui: &mut Ui, _: &mut eframe::Frame) {
@@ -316,6 +318,8 @@ impl Mobile {
         if let Some(profile) = &self.profile {
             card(ui, |ui| {
                 heading(ui, lang.text("Line profile", "谱线剖面"));
+                let reference =
+                    reference_profile(&profile.samples, self.wavelength, self.dispersion);
                 if let Some(fit) = profile.fit {
                     let label = lang.text("FWHM", "半高全宽");
                     let width = if self.dispersion != 0. {
@@ -337,42 +341,29 @@ impl Mobile {
                         .color(MUTED),
                     );
                 }
-                profile_chart(ui, profile, lang);
+                profile_chart(ui, profile, reference.as_ref(), lang);
+                if reference.is_none() {
+                    let hint = if self.wavelength == 0. || self.dispersion == 0. {
+                        lang.text(
+                            "Set wavelength and dispersion to compare with BASS2000.",
+                            "填写波长和色散后可与 BASS2000 参考曲线对比。",
+                        )
+                    } else {
+                        lang.text(
+                            "No comparable BASS2000 data in this window.",
+                            "当前波段没有可用于对比的 BASS2000 数据。",
+                        )
+                    };
+                    ui.label(RichText::new(hint).color(MUTED));
+                }
+                wavelength_calibration(ui, &mut self.wavelength, &mut self.dispersion, lang, busy);
             });
         }
         card(ui, |ui| {
             heading(ui, lang.text("Processing options", "处理选项"));
-            egui::CollapsingHeader::new(
-                RichText::new(lang.text("Wavelength calibration", "波长标定")).strong(),
-            )
-            .id_salt("wavelength_calibration")
-            .show(ui, |ui| {
-                ui.add_enabled_ui(!busy, |ui| {
-                    ui.label(lang.text("Zero-offset wavelength (Å)", "零偏移波长（Å）"));
-                    ui.add(
-                        egui::DragValue::new(&mut self.wavelength)
-                            .range(0. ..=100_000.)
-                            .speed(0.02)
-                            .max_decimals(4)
-                            .custom_formatter(move |value, _| optional_number(value, lang)),
-                    );
-                    ui.label(lang.text("Dispersion (Å/px)", "色散（Å/px）"));
-                    ui.add(
-                        egui::DragValue::new(&mut self.dispersion)
-                            .range(-50. ..=50.)
-                            .speed(0.001)
-                            .max_decimals(5)
-                            .custom_formatter(move |value, _| optional_number(value, lang)),
-                    );
-                    ui.label(
-                        RichText::new(lang.text(
-                            "Use negative dispersion if wavelength decreases down the frame.",
-                            "如果波长从画面顶部向底部递减，请输入负色散。",
-                        ))
-                        .color(MUTED),
-                    );
-                });
-            });
+            if self.profile.is_none() {
+                wavelength_calibration(ui, &mut self.wavelength, &mut self.dispersion, lang, busy);
+            }
             ui.add_enabled(
                 !busy,
                 egui::Checkbox::new(
@@ -557,6 +548,46 @@ fn offset_controls(ui: &mut Ui, shift: &mut f64, limit: f64, busy: bool, lang: L
     });
 }
 
+fn wavelength_calibration(
+    ui: &mut Ui,
+    wavelength: &mut f64,
+    dispersion: &mut f64,
+    lang: Language,
+    busy: bool,
+) {
+    egui::CollapsingHeader::new(
+        RichText::new(lang.text("Wavelength calibration", "波长标定")).strong(),
+    )
+    .id_salt("wavelength_calibration")
+    .show(ui, |ui| {
+        ui.add_enabled_ui(!busy, |ui| {
+            ui.label(lang.text("Zero-offset wavelength (Å)", "零偏移波长（Å）"));
+            ui.add(
+                egui::DragValue::new(wavelength)
+                    .range(0. ..=100_000.)
+                    .speed(0.02)
+                    .max_decimals(4)
+                    .custom_formatter(move |value, _| optional_number(value, lang)),
+            );
+            ui.label(lang.text("Dispersion (Å/px)", "色散（Å/px）"));
+            ui.add(
+                egui::DragValue::new(dispersion)
+                    .range(-50. ..=50.)
+                    .speed(0.001)
+                    .max_decimals(5)
+                    .custom_formatter(move |value, _| optional_number(value, lang)),
+            );
+            ui.label(
+                RichText::new(lang.text(
+                    "Use negative dispersion if wavelength decreases down the frame.",
+                    "如果波长从画面顶部向底部递减，请输入负色散。",
+                ))
+                .color(MUTED),
+            );
+        });
+    });
+}
+
 fn optional_number(value: f64, lang: Language) -> String {
     if value == 0. {
         lang.text("Unset", "未设置").into()
@@ -568,7 +599,12 @@ fn optional_number(value: f64, lang: Language) -> String {
     }
 }
 
-fn profile_chart(ui: &mut Ui, profile: &LineProfile, lang: Language) {
+fn profile_chart(
+    ui: &mut Ui,
+    profile: &LineProfile,
+    reference: Option<&ReferenceProfile>,
+    lang: Language,
+) {
     let (Some(first), Some(last)) = (profile.samples.first(), profile.samples.last()) else {
         return;
     };
@@ -576,8 +612,13 @@ fn profile_chart(ui: &mut Ui, profile: &LineProfile, lang: Language) {
         return;
     }
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 136.), Sense::hover());
-    let plot = egui::Rect::from_min_max(rect.min + vec2(7., 8.), rect.max - vec2(7., 20.));
-    let values = profile.samples.iter().map(|p| p[1]);
+    let left_margin = if reference.is_some() { 39. } else { 7. };
+    let plot = egui::Rect::from_min_max(rect.min + vec2(left_margin, 8.), rect.max - vec2(7., 20.));
+    let values = profile
+        .samples
+        .iter()
+        .chain(reference.into_iter().flat_map(|atlas| &atlas.samples))
+        .map(|p| p[1]);
     let (mut lo, mut hi) = (
         values.clone().fold(f64::INFINITY, f64::min),
         values.fold(f64::NEG_INFINITY, f64::max),
@@ -604,12 +645,36 @@ fn profile_chart(ui: &mut Ui, profile: &LineProfile, lang: Language) {
     };
     let painter = ui.painter();
     painter.rect_filled(rect, 8., BACKGROUND);
-    for n in 0..=3 {
-        let y = plot.top() + plot.height() * n as f32 / 3.;
+    let grid_line = |y| {
         painter.line_segment(
             [pos2(plot.left(), y), pos2(plot.right(), y)],
             Stroke::new(1., CARD),
         );
+    };
+    if let Some(atlas) = reference {
+        let tick_spacing = if lo > 0.8 * atlas.observed_peak {
+            5
+        } else {
+            20
+        };
+        for percent in (0..=100).step_by(tick_spacing) {
+            let value = atlas.observed_peak * f64::from(percent) / 100.;
+            if (lo..=hi).contains(&value) {
+                let y = xy(first[0], value).y;
+                grid_line(y);
+                painter.text(
+                    pos2(plot.left() - 4., y),
+                    egui::Align2::RIGHT_CENTER,
+                    format!("{percent}%"),
+                    egui::FontId::proportional(10.),
+                    MUTED,
+                );
+            }
+        }
+    } else {
+        for n in 0..=3 {
+            grid_line(plot.top() + plot.height() * n as f32 / 3.);
+        }
     }
     let points = |samples: &[[f64; 2]]| samples.iter().map(|p| xy(p[0], p[1])).collect();
     painter.add(egui::Shape::line(
@@ -628,6 +693,12 @@ fn profile_chart(ui: &mut Ui, profile: &LineProfile, lang: Language) {
         for marker in markers {
             painter.circle_filled(marker, 2.5, TEXT);
         }
+    }
+    if let Some(atlas) = reference {
+        painter.add(egui::Shape::line(
+            points(&atlas.samples),
+            Stroke::new(1.6, ATLAS_COLOR),
+        ));
     }
     painter.text(
         rect.center_bottom() - vec2(0., 4.),
@@ -648,7 +719,7 @@ fn profile_chart(ui: &mut Ui, profile: &LineProfile, lang: Language) {
             MUTED,
         );
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(
             RichText::new(lang.text("Observed", "实测"))
                 .size(12.)
@@ -659,6 +730,13 @@ fn profile_chart(ui: &mut Ui, profile: &LineProfile, lang: Language) {
                 RichText::new(lang.text("Pseudo-Voigt fit", "伪 Voigt 拟合"))
                     .size(12.)
                     .color(AMBER),
+            );
+        }
+        if reference.is_some() {
+            ui.label(
+                RichText::new(lang.text("BASS2000 reference", "BASS2000 参考"))
+                    .size(12.)
+                    .color(ATLAS_COLOR),
             );
         }
     });

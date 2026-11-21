@@ -1,0 +1,14 @@
+BASS2000 visible solar spectrum
+Delbouille L., Neven L., Roland G. (1972)
+Photometric Atlas of the Solar Spectrum from λ 3000 to λ 10000
+https://bass2000.obspm.fr/solar_spect.php
+
+Source file and license notice from Astro4j revision 7ffdaf5c:
+https://github.com/melix/astro4j/tree/7ffdaf5c/jsolex-core/src/bass2000
+
+The packed data in bass2000.bin are licensed under Creative Commons
+Attribution-NonCommercial-ShareAlike 4.0 International.
+https://creativecommons.org/licenses/by-nc-sa/4.0/
+
+Changes: retain 3000–9999.99 Å at 0.01 Å intervals by taking every fifth
+sample from the 0.002 Å source grid, then pack as little-endian u16.

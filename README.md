@@ -8,7 +8,7 @@
 
 1. 在 **导入**（Import）点击 **打开 SER 文件** 选择太阳扫描。也可在靛空台素材库选中一个 SER，分享原文件到 **MJ Sol’Ex**。**打开靛空台**可以直接跳转。
 2. 在 **Spectrum** 点击想用的暗线，或使用 **Auto-fit**。橙色曲线为谱线，调整取样偏移后青色曲线为实际取样位置。
-3. **Line profile** 显示对齐后的平均谱线、伪 Voigt 拟合和观测半高全宽。输入色散后同时显示 Å 数值。可在 **Wavelength calibration** 录入零偏移对应的波长及带符号的色散。
+3. **谱线剖面**（Line profile）显示对齐后的平均谱线、伪 Voigt 拟合和观测半高全宽。展开图下方的 **波长标定**，输入当前谱线零偏移对应的波长和带符号的色散，即可叠加 BASS2000 参考曲线。实测与参考强度各以峰值为 100%，拟合曲线沿用实测的比例。输入色散后，观测半高全宽也会显示 Å 数值。
 4. 可选 **Correct full-disk geometry** 校正扫描轴比例和剪切。超过 32 Mi 像素的扫描默认增加帧间距，页面显示取样间隔和预期尺寸。
 5. 点击 **Reconstruct scan**。在 **Result** 选择 **Save FITS** 或 **Save PNG**。两者保留 16 位灰度样本，预览对比度只用于显示。
 
@@ -50,5 +50,7 @@ adb push target/demo-scan.ser /sdcard/Download/
 ## 来源与许可证
 
 SER 格式和重建取样参考 Astro4j 的 `jserfile` 与 `jsolex-core`，基准提交为 `7ffdaf5c`。平均光谱从最多 64 个均匀选取的帧计算，移动版使用独立的二次曲线拟合。 [Astro4j 源码](https://github.com/melix/astro4j/tree/7ffdaf5c)
+
+BASS2000 可见光参考数据采用 3000–9999.99 Å、0.01 Å 采样。可使用 `python tools/pack_bass2000.py <Astro4j>/jsolex-core/src/bass2000/atlasvi.dat assets/bass2000.bin` 重新生成。 [数据来源与许可证](assets/bass2000-NOTICE.txt)
 
 Apache License 2.0。见 [LICENSE](LICENSE) 和 [NOTICE](NOTICE)。

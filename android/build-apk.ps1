@@ -56,7 +56,8 @@ try {
     Invoke-Tool "$tools/d8.bat" @('--lib', $platform, '--min-api', '26', '--output', $payload, "$work/activity.jar")
     Invoke-Tool "$tools/aapt2.exe" @('link', '-I', $platform, '--manifest', "$PSScriptRoot/AndroidManifest.xml", '-o', "$work/unsigned.apk")
     Invoke-Tool jar.exe @('uf', "$work/unsigned.apk", '-C', $payload, 'classes.dex', '-C', $payload, 'lib')
-    Invoke-Tool jar.exe @('uf', "$work/unsigned.apk", '-C', $repo, 'assets/MJSolexSansSC-OFL.txt')
+    Invoke-Tool jar.exe @('uf', "$work/unsigned.apk", '-C', $repo,
+        'assets/MJSolexSansSC-OFL.txt', 'assets/bass2000-NOTICE.txt')
     Invoke-Tool "$tools/zipalign.exe" @('-f', '-p', '4', "$work/unsigned.apk", "$work/aligned.apk")
 
     $key = Join-Path $out 'debug.jks'
