@@ -114,7 +114,7 @@ impl Descriptor {
             self.call(
                 &object,
                 "closeWithError",
-                Some("MJ Sol'Ex could not write the image"),
+                Some("MJSol'Ex could not write the image"),
             )
         } else {
             self.call(&object, "close", None)

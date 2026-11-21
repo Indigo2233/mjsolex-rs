@@ -55,7 +55,7 @@ impl Mobile {
     fn navigation(&mut self, ui: &mut Ui) {
         ui.add_space(12.);
         ui.horizontal(|ui| {
-            ui.label(RichText::new("MJ Sol’Ex").size(27.).strong());
+            ui.label(RichText::new(APP_NAME).size(27.).strong());
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 let label = self.language.text("简体中文", "English");
                 if ui.button(label).clicked() {
@@ -152,8 +152,8 @@ impl Mobile {
             heading(ui, lang.text("Indigo Observatory", "靛空台"));
             ui.label(
                 RichText::new(lang.text(
-                    "In the library, select one original SER and share it to MJ Sol’Ex.",
-                    "在素材库中选中一份原始 SER，分享至 MJ Sol’Ex。",
+                    "In the library, select one original SER and share it to MJSol'Ex.",
+                    "在素材库中选中一份原始 SER，分享至 MJSol'Ex。",
                 ))
                 .color(MUTED),
             );

@@ -25,6 +25,8 @@ pub use reconstruct::{Reconstruction, reconstruct, reconstruct_with_stride};
 pub use ser::{ByteOrder, ColorMode, Header, SerReader};
 pub use spectrum::{Spectrum, Trace};
 
+const APP_NAME: &str = "MJSol'Ex";
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("I/O error: {0}")]

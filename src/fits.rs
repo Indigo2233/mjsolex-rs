@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use crate::{DiskGeometry, Header, Observation, Reconstruction};
+use crate::{APP_NAME, DiskGeometry, Header, Observation, Reconstruction};
 
 const CARD: usize = 80;
 const BLOCK: usize = 2880;
@@ -38,7 +38,7 @@ impl Reconstruction {
             format!("NAXIS2  = {:>20}", self.height()),
             "BSCALE  =                    1".to_owned(),
             "BZERO   =                32768".to_owned(),
-            "ORIGIN  = 'MJ SolEx'".to_owned(),
+            text_card("ORIGIN", APP_NAME),
         ];
         metadata.cards(&mut cards);
         cards.push("END".to_owned());

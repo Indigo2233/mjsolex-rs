@@ -323,6 +323,7 @@ fn fits_preserves_unsigned_samples_and_pads_fits_blocks() {
     let metadata = std::str::from_utf8(&fits[..2880]).unwrap();
     assert!(metadata.contains("NAXIS1  =                    3"));
     assert!(metadata.contains("BZERO   =                32768"));
+    assert!(metadata.contains("ORIGIN  = 'MJSol''Ex'"));
     assert_eq!(&fits[2880..2886], &[0x80, 0, 0, 0, 0x7f, 0xff]);
     assert!(fits[2886..].iter().all(|byte| *byte == 0));
 }

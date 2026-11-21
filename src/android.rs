@@ -18,8 +18,8 @@ use winit::platform::android::activity::AndroidApp;
 use crate::android_document::DocumentFile;
 use crate::ser::cache_recording;
 use crate::{
-    ByteOrder, DiskGeometry, Error, FitsMetadata, Header, LineProfile, Observation, Reconstruction,
-    SerReader, Spectrum, Trace, reconstruct_with_stride,
+    APP_NAME, ByteOrder, DiskGeometry, Error, FitsMetadata, Header, LineProfile, Observation,
+    Reconstruction, SerReader, Spectrum, Trace, reconstruct_with_stride,
 };
 
 mod language;
@@ -176,7 +176,7 @@ fn android_main(app: AndroidApp) {
     let (vm, activity, cache, language) = match result {
         Ok(initialized) => initialized,
         Err(error) => {
-            eprintln!("MJ Sol'Ex could not initialize the Android activity: {error}");
+            eprintln!("{APP_NAME} could not initialize the Android activity: {error}");
             return;
         }
     };
@@ -186,7 +186,7 @@ fn android_main(app: AndroidApp) {
         ..Default::default()
     };
     if let Err(error) = eframe::run_native(
-        "MJ Sol'Ex",
+        APP_NAME,
         options,
         Box::new(move |cc| {
             Ok(Box::new(Mobile::new(
@@ -198,7 +198,7 @@ fn android_main(app: AndroidApp) {
             )))
         }),
     ) {
-        eprintln!("MJ Sol'Ex failed to start: {error}");
+        eprintln!("{APP_NAME} failed to start: {error}");
     }
 }
 

@@ -175,7 +175,7 @@ public final class MainActivity extends NativeActivity {
                     if (isInput(request)) {
                         document.close();
                     } else {
-                        document.closeWithError("MJ Sol'Ex did not accept this export");
+                        document.closeWithError("MJSol'Ex did not accept this export");
                     }
                 } catch (java.io.IOException ignored) {
                     // No native job owns this descriptor.
