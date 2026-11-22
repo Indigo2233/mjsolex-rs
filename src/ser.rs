@@ -70,6 +70,7 @@ pub struct Header {
     pub frames: u32,
     pub trimmed: bool,
     pub color: ColorMode,
+    flag_byte_order: ByteOrder,
     byte_order: ByteOrder,
 }
 
@@ -205,12 +206,12 @@ impl Header {
             u32::from_le_bytes([a, b, c, d])
         };
         let color = ColorMode::parse(field(18))?;
-        // Indigo's writer stores little-endian samples with a zero flag. For
-        // other recorders retain the default used by Astro4j and older imports.
         let default_order = match field(22) {
-            0 if observation.recorder.is_some() => ByteOrder::Little,
-            0 => ByteOrder::Big,
-            1 => ByteOrder::Little,
+            // Keep the recorder-specific rule for existing Indigo captures.
+            0 | 1 if observation.recorder.is_some() => ByteOrder::Little,
+            // Follow SER Player and Siril, which invert the original specification.
+            0 => ByteOrder::Little,
+            1 => ByteOrder::Big,
             _ => return Err(Error::InvalidSer("invalid byte order flag")),
         };
         let width = field(26) as usize;
@@ -249,8 +250,74 @@ impl Header {
             frames,
             trimmed,
             color,
+            flag_byte_order: default_order,
             byte_order: order.unwrap_or(default_order),
         })
+    }
+}
+
+fn probe_byte_order(
+    input: &mut (impl Read + Seek),
+    header: Header,
+) -> Result<Option<ByteOrder>, Error> {
+    const MAX_PIXELS: usize = 256;
+    // Sample up to three frame/row positions, at the centers of equal intervals.
+    let positions = |length: u64| {
+        let count = length.min(3);
+        (0..count).map(move |i| (2 * i + 1) * length / (2 * count))
+    };
+    let planes = header.color.planes();
+    let pixels = header.width.min(MAX_PIXELS);
+    let first_sample = (header.width - pixels) / 2 * planes;
+    let mut buffer = [0_u8; MAX_PIXELS * 3 * 2];
+    let samples = &mut buffer[..pixels * planes * 2];
+    let max_sample = u16::MAX >> (16 - header.depth);
+    let pixel_step = match header.color {
+        ColorMode::Rggb | ColorMode::Grbg | ColorMode::Gbrg | ColorMode::Bggr => 2,
+        _ => planes,
+    };
+    let (mut little_invalid, mut big_invalid) = (0, 0);
+    let (mut little_votes, mut big_votes) = (0, 0);
+    for frame in positions(u64::from(header.frames)) {
+        for row in positions(header.height as u64) {
+            let offset = HEADER_LEN
+                + frame * header.frame_bytes() as u64
+                + row * header.row_bytes() as u64
+                + first_sample as u64 * 2;
+            input.seek(SeekFrom::Start(offset))?;
+            input.read_exact(samples)?;
+            let (words, _) = samples.as_chunks::<2>();
+            if header.depth < 16 {
+                for &word in words {
+                    little_invalid += usize::from(u16::from_le_bytes(word) > max_sample);
+                    big_invalid += usize::from(u16::from_be_bytes(word) > max_sample);
+                }
+            } else {
+                for (&left, &right) in words.iter().zip(words.iter().skip(pixel_step)) {
+                    // With only one changing byte, the difference just scales by 256.
+                    // Look for crossings where both bytes change with a small
+                    // intensity step in one order and a large jump in the other.
+                    if left[0] == right[0] || left[1] == right[1] {
+                        continue;
+                    }
+                    let little = u16::from_le_bytes(left).abs_diff(u16::from_le_bytes(right));
+                    let big = u16::from_be_bytes(left).abs_diff(u16::from_be_bytes(right));
+                    little_votes += usize::from(little < 192 && big >= 4096);
+                    big_votes += usize::from(big < 192 && little >= 4096);
+                }
+            }
+        }
+    }
+    if (little_invalid == 0 && big_invalid > 0)
+        || (little_votes >= 8 && little_votes >= 8 * big_votes)
+    {
+        Ok(Some(ByteOrder::Little))
+    } else if (big_invalid == 0 && little_invalid > 0)
+        || (big_votes >= 8 && big_votes >= 8 * little_votes)
+    {
+        Ok(Some(ByteOrder::Big))
+    } else {
+        Ok(None)
     }
 }
 
@@ -293,15 +360,49 @@ impl<R: Read + Seek> SerReader<R> {
         Self::open_with_byte_order(input, None)
     }
 
-    pub fn open_with_byte_order(mut input: R, order: Option<ByteOrder>) -> Result<Self, Error> {
+    pub fn open_with_byte_order(input: R, order: Option<ByteOrder>) -> Result<Self, Error> {
+        Self::open_with_byte_order_hint(input, order, None)
+    }
+
+    pub(crate) fn open_with_byte_order_hint(
+        mut input: R,
+        order: Option<ByteOrder>,
+        scan: Option<(Header, &Observation)>,
+    ) -> Result<Self, Error> {
         input.seek(SeekFrom::Start(0))?;
         let bytes = read_header(&mut input)?;
         let mut observation = Observation::from_header(&bytes);
-        let header = Header::parse(&bytes, &observation, order)?;
+        let mut header = Header::parse(&bytes, &observation, order)?;
         let length = input.seek(SeekFrom::End(0))?;
         let data_end = header.data_end();
         if length < data_end {
             return Err(Error::InvalidSer("frame data is truncated"));
+        }
+        if order.is_none() && header.depth > 8 && observation.recorder.is_none() {
+            let scan_order = scan.filter(|(scan, source)| {
+                // A flat from the same capture setup can have too little
+                // contrast to detect the same reversed flag independently.
+                scan.flag_byte_order != scan.byte_order
+                    && scan.flag_byte_order == header.flag_byte_order
+                    && (
+                        scan.trimmed,
+                        scan.width,
+                        scan.height,
+                        scan.depth,
+                        scan.color,
+                    ) == (
+                        header.trimmed,
+                        header.width,
+                        header.height,
+                        header.depth,
+                        header.color,
+                    )
+                    && source.instrument == observation.instrument
+                    && source.recorder == observation.recorder
+            });
+            header.byte_order = probe_byte_order(&mut input, header)?
+                .or_else(|| scan_order.map(|(scan, _)| scan.byte_order))
+                .unwrap_or(header.flag_byte_order);
         }
         let trailer_end = data_end + header.trailer_bytes();
         if length >= trailer_end {
@@ -361,6 +462,57 @@ impl<R: Read + Seek> SerReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn related_scan_resolves_ambiguous_flat_without_overriding_flat_evidence() {
+        use std::io::Cursor;
+
+        let recording = |order, gradient| {
+            let mut bytes = vec![0; HEADER_LEN as usize];
+            bytes[..14].copy_from_slice(b"LUCAM-RECORDER");
+            for (offset, value) in [(22, 1_u32), (26, 256), (30, 1), (34, 16), (38, 1)] {
+                bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            for x in 0..256 {
+                let value = if gradient { 200 + 9 * x } else { 310_u16 };
+                bytes.extend(match order {
+                    ByteOrder::Little => value.to_le_bytes(),
+                    ByteOrder::Big => value.to_be_bytes(),
+                });
+            }
+            bytes
+        };
+        let scan = SerReader::open(Cursor::new(recording(ByteOrder::Little, true))).unwrap();
+        assert_eq!(scan.header().byte_order(), ByteOrder::Little);
+        let hint = Some((scan.header(), scan.observation()));
+        let mut flat = SerReader::open_with_byte_order_hint(
+            Cursor::new(recording(ByteOrder::Little, false)),
+            None,
+            hint,
+        )
+        .unwrap();
+        assert_eq!(flat.header().byte_order(), ByteOrder::Little);
+        assert_eq!(
+            crate::Spectrum::average(&mut flat, |_| true)
+                .unwrap()
+                .pixels()[0],
+            310.
+        );
+
+        let flat = SerReader::open_with_byte_order_hint(
+            Cursor::new(recording(ByteOrder::Big, true)),
+            None,
+            hint,
+        )
+        .unwrap();
+        assert_eq!(flat.header().byte_order(), ByteOrder::Big);
+
+        let mut unrelated = recording(ByteOrder::Big, false);
+        unrelated[82..88].copy_from_slice(b"Camera");
+        let flat =
+            SerReader::open_with_byte_order_hint(Cursor::new(unrelated), None, hint).unwrap();
+        assert_eq!(flat.header().byte_order(), ByteOrder::Big);
+    }
 
     #[test]
     fn stream_cache_checks_header_and_limit_before_writing() {

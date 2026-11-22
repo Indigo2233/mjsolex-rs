@@ -573,12 +573,18 @@ impl Mobile {
         let cache = self.cache.clone();
         let spectrum = scan.spectrum.clone();
         let byte_order = scan.byte_order;
+        let scan_header = scan.header;
+        let scan_observation = scan.observation.clone();
         self.start_job(
             ("Reading flat SER", "正在读取平场 SER"),
             true,
             move |events, cancel| {
                 let file = seekable_document(file, &cache, cancel)?;
-                let mut reader = SerReader::open_with_byte_order(&file.file, byte_order)?;
+                let mut reader = SerReader::open_with_byte_order_hint(
+                    &file.file,
+                    byte_order,
+                    Some((scan_header, &scan_observation)),
+                )?;
                 let flat = PhysicalFlat::from_ser(&mut reader, &spectrum, report(events, cancel))?;
                 file.check_error()?;
                 Ok(Work::FlatImported(flat, name))

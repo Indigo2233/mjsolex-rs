@@ -29,7 +29,7 @@ fn ser_header(
 }
 
 fn mono(width: u32, height: u32, depth: u32, count: u32) -> Vec<u8> {
-    ser_header(b"LUCAM-RECORDER", width, height, depth, count, 1)
+    ser_header(b"LUCAM-RECORDER", width, height, depth, count, 0)
 }
 
 #[test]
@@ -78,7 +78,7 @@ fn exports_display_pixels_and_preserves_raw_16_bit_samples() {
 
 #[test]
 fn verifies_doppler_coverage_and_color_direction() {
-    let mut bytes = ser_header(b"JSOLEX-TRIMMED", 4, 7, 16, 1, 1);
+    let mut bytes = ser_header(b"JSOLEX-TRIMMED", 4, 7, 16, 1, 0);
     for y in 0..7 {
         let samples = match y {
             2 => [200_u16, 450, 750, 600],
@@ -179,17 +179,18 @@ fn captured_flat_corrects_slit_response_and_rejects_invalid_inputs() {
 fn captured_flat_accepts_the_scan_byte_order_override() {
     const WIDTH: u32 = 16;
     const HEIGHT: u32 = 5;
-    // Both files declare big-endian but contain little-endian samples.
+    // Both files declare little-endian but have big-endian data. The flat
+    // contains two broad levels, which are not enough to infer the order.
     let mut science = ser_header(b"LUCAM-RECORDER", WIDTH, HEIGHT, 16, 1, 0);
     let mut flat = science.clone();
     for _ in 0..HEIGHT {
         for x in 0..WIDTH {
             let gain = if x < WIDTH / 2 { 1 } else { 2 };
-            science.extend((3000_u16 * gain).to_le_bytes());
-            flat.extend((1000_u16 * gain).to_le_bytes());
+            science.extend((3000_u16 * gain).to_be_bytes());
+            flat.extend((1000_u16 * gain).to_be_bytes());
         }
     }
-    let order = Some(ByteOrder::Little);
+    let order = Some(ByteOrder::Big);
     let mut scan = SerReader::open_with_byte_order(Cursor::new(science), order).unwrap();
     let spectrum = Spectrum::average(&mut scan, |_| true).unwrap();
     let trace = Trace::constant(WIDTH as usize, 2.);
@@ -238,10 +239,15 @@ fn rejects_bad_headers_and_truncated_frames() {
 
 #[test]
 fn decodes_mono_depths_and_both_byte_orders() {
-    for endian in [0, 1] {
-        let mut bytes = ser_header(b"LUCAM-RECORDER", 2, 1, 12, 1, endian);
+    for (flag, order) in [
+        (0, ByteOrder::Little),
+        (1, ByteOrder::Big),
+        (0, ByteOrder::Big),
+        (1, ByteOrder::Little),
+    ] {
+        let mut bytes = ser_header(b"LUCAM-RECORDER", 2, 1, 12, 1, flag);
         for sample in [0x039a_u16, 0x0fff] {
-            bytes.extend(if endian == 1 {
+            bytes.extend(if order == ByteOrder::Little {
                 sample.to_le_bytes()
             } else {
                 sample.to_be_bytes()
@@ -249,6 +255,7 @@ fn decodes_mono_depths_and_both_byte_orders() {
         }
         bytes.extend([0; 8]); // Optional timestamps follow frame data.
         let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.header().byte_order(), order);
         assert_eq!(
             Spectrum::average(&mut reader, |_| true).unwrap().pixels(),
             &[14752., 65520.]
@@ -262,6 +269,50 @@ fn decodes_mono_depths_and_both_byte_orders() {
         Spectrum::average(&mut reader, |_| true).unwrap().pixels(),
         &[8192., 65280.]
     );
+}
+
+#[test]
+fn decodes_both_16_bit_flag_conventions_with_byte_crossings() {
+    let samples: Vec<u16> = (0..256).map(|x| 200 + 9 * x).collect();
+    let expected: Vec<_> = samples.iter().copied().map(f32::from).collect();
+    for (order, encode) in [
+        (ByteOrder::Little, u16::to_le_bytes as fn(u16) -> [u8; 2]),
+        (ByteOrder::Big, u16::to_be_bytes),
+    ] {
+        for signature in [b"LUCAM-RECORDER", b"JSOLEX-TRIMMED"] {
+            for flag in [0, 1] {
+                let mut bytes = ser_header(signature, 256, 1, 16, 1, flag);
+                bytes.extend(samples.iter().copied().flat_map(encode));
+                let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+                assert_eq!(reader.header().byte_order(), order);
+                assert_eq!(
+                    Spectrum::average(&mut reader, |_| true).unwrap().pixels(),
+                    expected
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn follows_ser_player_flags_when_only_one_byte_varies() {
+    let expected: Vec<_> = (0..256).map(|x| f32::from(x * 256_u16)).collect();
+    for (flag, order) in [(0, ByteOrder::Little), (1, ByteOrder::Big)] {
+        let mut bytes = ser_header(b"LUCAM-RECORDER", 256, 1, 16, 1, flag);
+        for x in 0..=255 {
+            bytes.extend(if order == ByteOrder::Little {
+                [0, x]
+            } else {
+                [x, 0]
+            });
+        }
+        let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+        assert_eq!(reader.header().byte_order(), order);
+        assert_eq!(
+            Spectrum::average(&mut reader, |_| true).unwrap().pixels(),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -456,8 +507,10 @@ fn narrow_trace_reads_only_the_relevant_rows_and_preserves_endianness() {
 
     let read = Cell::new(0);
     let mut reader = SerReader::open(Counted(Cursor::new(bytes), &read)).unwrap();
+    // The order probe reads nine partial rows without touching the rest of the scan.
+    assert_eq!(read.replace(0), 178 + 9 * 32 * 2);
     let image = reconstruct(&mut reader, Trace::constant(32, 120.25), 0., |_| true).unwrap();
-    assert_eq!(read.get(), 178 + 6 * 4 * 32 * 2);
+    assert_eq!(read.get(), 6 * 4 * 32 * 2);
     for (index, &pixel) in image.pixels().iter().enumerate() {
         assert_eq!(
             usize::from(pixel),
@@ -479,7 +532,7 @@ fn narrow_trace_reads_only_the_relevant_rows_and_preserves_endianness() {
 #[test]
 fn reconstructs_one_spectral_row_without_interpolation() {
     for signature in [b"LUCAM-RECORDER", b"JSOLEX-TRIMMED"] {
-        let mut bytes = ser_header(signature, 3, 1, 16, 2, 1);
+        let mut bytes = ser_header(signature, 3, 1, 16, 2, 0);
         let pixels = [1_u16, 100, 65535, 90, 21, 0];
         for pixel in pixels {
             bytes.extend(pixel.to_le_bytes());
@@ -499,7 +552,7 @@ fn reconstructs_one_spectral_row_without_interpolation() {
 
 #[test]
 fn fits_preserves_unsigned_samples_and_pads_fits_blocks() {
-    let mut bytes = ser_header(b"JSOLEX-TRIMMED", 3, 2, 16, 1, 1);
+    let mut bytes = ser_header(b"JSOLEX-TRIMMED", 3, 2, 16, 1, 0);
     for value in [0u16, 32768, 65535, 900, 900, 900] {
         bytes.extend(value.to_le_bytes());
     }
@@ -563,7 +616,7 @@ fn matches_jsolex_sampling_and_exports_lossless_png() {
     ];
     // Expected samples come from SolexVideoProcessor.processSingleFrame at 7ffdaf5c.
     for (signature, row, shift, expected) in cases {
-        let mut bytes = ser_header(signature, 4, 6, 16, 1, 1);
+        let mut bytes = ser_header(signature, 4, 6, 16, 1, 0);
         for sample in rows.into_iter().flatten() {
             bytes.extend(u16::to_le_bytes(sample));
         }
