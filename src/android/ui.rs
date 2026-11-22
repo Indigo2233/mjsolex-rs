@@ -86,10 +86,55 @@ impl eframe::App for Mobile {
                         });
                     });
             });
+        self.shared_document_dialog(ui.ctx());
     }
 }
 
 impl Mobile {
+    fn shared_document_dialog(&mut self, ctx: &Context) {
+        let Some((_, name)) = &self.shared_document else {
+            return;
+        };
+        let lang = self.language;
+        let dialog = egui::Modal::new(egui::Id::unique("shared_ser_destination")).show(ctx, |ui| {
+            ui.set_max_width((ctx.content_rect().width() - 48.).clamp(0., 340.));
+            heading(ui, lang.text("Import shared SER", "导入分享的 SER"));
+            ui.add(egui::Label::new(name).wrap());
+            ui.add_space(6.);
+            if action(
+                ui,
+                lang.text("Use as captured flat", "用作实拍平场"),
+                true,
+                true,
+            ) {
+                Some(OPEN_FLAT)
+            } else if action(
+                ui,
+                lang.text("Replace solar scan", "替换太阳扫描"),
+                true,
+                false,
+            ) {
+                Some(OPEN_SER)
+            } else {
+                if action(ui, lang.text("Cancel", "取消"), true, false) {
+                    ui.close();
+                }
+                None
+            }
+        });
+        if let Some(request) = dialog.inner {
+            if let Some((file, name)) = self.shared_document.take() {
+                if request == OPEN_FLAT {
+                    self.import_flat(file, name);
+                } else {
+                    self.import(file, name, None);
+                }
+            }
+        } else if dialog.should_close() {
+            self.shared_document = None;
+        }
+    }
+
     fn navigation(&mut self, ui: &mut Ui) {
         ui.add_space(12.);
         ui.horizontal(|ui| {
@@ -201,11 +246,7 @@ impl Mobile {
                 !busy,
                 false,
             ) {
-                self.note = match self.activity_flag("openIndigo") {
-                    Ok(true) => None,
-                    Ok(false) => Some(Notice::IndigoUnavailable),
-                    Err(error) => Some(Notice::IndigoLaunch(error.to_string())),
-                };
+                self.open_indigo();
             }
         });
         let Some(scan) = &self.scan else { return };
@@ -524,6 +565,12 @@ impl Mobile {
                     {
                         self.pick(OPEN_FLAT);
                     }
+                }
+                if ui
+                    .button(lang.text("Choose a flat in Indigo Observatory", "在靛空台选择平场"))
+                    .clicked()
+                {
+                    self.open_indigo();
                 }
                 if self.flat_mode == FlatMode::Synthetic {
                     ui.add(

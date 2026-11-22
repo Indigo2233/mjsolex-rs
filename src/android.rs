@@ -213,6 +213,7 @@ struct Mobile {
     receiver: mpsc::Receiver<Event>,
     picker: Option<i32>,
     shared_available: bool,
+    shared_document: Document,
     job: Option<Job>,
     scan: Option<Scan>,
     trace: Option<Trace>,
@@ -427,6 +428,7 @@ impl Mobile {
             receiver,
             picker: None,
             shared_available: true,
+            shared_document: None,
             job: None,
             scan: None,
             trace: None,
@@ -523,7 +525,15 @@ impl Mobile {
     }
 
     fn busy(&self) -> bool {
-        self.picker.is_some() || self.job.is_some()
+        self.picker.is_some() || self.job.is_some() || self.shared_document.is_some()
+    }
+
+    fn open_indigo(&mut self) {
+        self.note = match self.activity_flag("openIndigo") {
+            Ok(true) => None,
+            Ok(false) => Some(Notice::IndigoUnavailable),
+            Err(error) => Some(Notice::IndigoLaunch(error.to_string())),
+        };
     }
 
     fn read_shared(&mut self) {
@@ -533,7 +543,6 @@ impl Mobile {
         match self.activity_flag("openSharedSer") {
             Ok(true) => {
                 self.picker = Some(OPEN_SHARED);
-                self.page = Page::Scan;
                 self.note = None;
             }
             Ok(false) => {}
@@ -881,6 +890,9 @@ impl Mobile {
                 Event::Document(request, result) if self.picker == Some(request) => {
                     self.picker = None;
                     match result {
+                        Ok(Some((file, name))) if request == OPEN_SHARED && self.scan.is_some() => {
+                            self.shared_document = Some((file, name));
+                        }
                         Ok(Some((file, name))) if matches!(request, OPEN_SER | OPEN_SHARED) => {
                             self.import(file, name, None)
                         }
@@ -957,6 +969,7 @@ impl Mobile {
                         Ok(Work::FlatImported(flat, name)) => {
                             self.physical_flat = Some((Arc::new(flat), name));
                             self.flat_mode = FlatMode::Physical;
+                            self.page = Page::Spectrum;
                         }
                         Ok(Work::Exported(name)) => self.note = Some(Notice::Saved(name)),
                         Ok(Work::Previewed(product, preview)) => {
