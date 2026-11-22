@@ -93,52 +93,89 @@ impl eframe::App for Mobile {
 
 impl Mobile {
     fn sequence_dialog(&mut self, ctx: &Context) {
-        let Some(selection) = &mut self.sequence else {
-            return;
-        };
-        if self.picker.is_some() {
+        if !self.sequence_options || self.picker.is_some() || self.job.is_some() {
             return;
         }
         let lang = self.language;
         let dialog = egui::Modal::new(egui::Id::unique("sequence_export")).show(ctx, |ui| {
             ui.set_max_width((ctx.content_rect().width() - 48.).clamp(0., 340.));
             heading(ui, lang.text("Reconstruct SER sequence", "重建 SER 序列"));
-            ui.label(match lang {
-                Language::English => format!(
-                    "{} files selected. Processes in filename order.",
-                    selection.count
-                ),
-                Language::Chinese => format!("已选 {} 个文件。按文件名顺序处理。", selection.count),
-            });
-            ui.horizontal_wrapped(|ui| {
-                for (format, label) in [
-                    (sequence::Format::All, lang.text("All images", "全部影像")),
-                    (
-                        sequence::Format::Display,
-                        lang.text("Display PNGs", "显示 PNG"),
-                    ),
-                    (sequence::Format::Raw, lang.text("16-bit PNG", "16 位 PNG")),
-                    (sequence::Format::Fits, "FITS"),
-                ] {
-                    ui.selectable_value(&mut selection.format, format, label);
-                }
-            });
             if let Some(notice) = &self.note {
                 ui.colored_label(Color32::LIGHT_RED, notice.message(lang));
             }
-            let start = action(
-                ui,
-                lang.text("Choose output folder", "选择输出目录"),
-                true,
-                true,
-            );
-            let cancel = action(ui, lang.text("Cancel", "取消"), true, false);
-            (start, cancel)
+            let mut start = false;
+            if let Some(selection) = &mut self.sequence {
+                ui.label(match lang {
+                    Language::English => format!("{} SER files selected", selection.count),
+                    Language::Chinese => format!("已选 {} 份 SER", selection.count),
+                });
+                ui.checkbox(
+                    &mut selection.capture_order,
+                    lang.text("Sort by capture time", "按拍摄时间排序"),
+                );
+                if selection.capture_order {
+                    ui.label(
+                        RichText::new(lang.text(
+                            "Uses filename order if any capture time is unavailable.",
+                            "有文件缺少拍摄时间时，整批按文件名排序。",
+                        ))
+                        .color(MUTED),
+                    );
+                }
+                let direction = ui.checkbox(
+                    &mut selection.alternate_direction,
+                    lang.text("Back-and-forth scans", "往返扫描"),
+                );
+                if direction.changed() && selection.alternate_direction {
+                    selection.capture_order = true;
+                }
+                if selection.alternate_direction {
+                    ui.label(
+                        RichText::new(lang.text(
+                            "Flip every second scan along the scan axis.",
+                            "沿扫描轴翻转第 2、4、6 份扫描。",
+                        ))
+                        .color(MUTED),
+                    );
+                }
+                ui.horizontal_wrapped(|ui| {
+                    for (format, label) in [
+                        (sequence::Format::All, lang.text("All images", "全部影像")),
+                        (
+                            sequence::Format::Display,
+                            lang.text("Display PNGs", "显示 PNG"),
+                        ),
+                        (sequence::Format::Raw, lang.text("16-bit PNG", "16 位 PNG")),
+                        (sequence::Format::Fits, "FITS"),
+                    ] {
+                        ui.selectable_value(&mut selection.format, format, label);
+                    }
+                });
+                start = action(
+                    ui,
+                    lang.text("Choose output folder", "选择输出目录"),
+                    true,
+                    true,
+                );
+            }
+            let mut folder = false;
+            let mut files = false;
+            let mut cancel = false;
+            ui.horizontal_wrapped(|ui| {
+                folder = ui.button(lang.text("Select folder", "选择目录")).clicked();
+                files = ui.button(lang.text("Select files", "多选文件")).clicked();
+                cancel = ui.button(lang.text("Cancel", "取消")).clicked();
+            });
+            (start, folder, files, cancel)
         });
         if dialog.inner.0 {
             self.pick(SAVE_SEQUENCE);
-        } else if dialog.inner.1 || dialog.should_close() {
-            self.sequence = None;
+        } else if dialog.inner.1 {
+            self.pick(OPEN_SEQUENCE_FOLDER);
+        } else if dialog.inner.2 {
+            self.pick(OPEN_SEQUENCE);
+        } else if dialog.inner.3 || dialog.should_close() {
+            self.sequence_options = false;
         }
     }
 
@@ -178,7 +215,7 @@ impl Mobile {
                 if request == OPEN_FLAT {
                     self.import_flat(document.file, document.name);
                 } else {
-                    self.import(document, None);
+                    self.import(document, None, false);
                 }
             }
         } else if dialog.should_close() {
@@ -293,6 +330,23 @@ impl Mobile {
                         });
                 });
             }
+            if let Notice::Sequence(summary) = notice
+                && !summary.outputs.is_empty()
+            {
+                ui.collapsing(lang.text("Exported images", "已导出影像"), |ui| {
+                    let row_height = ui.text_style_height(&egui::TextStyle::Body);
+                    egui::ScrollArea::both()
+                        .id_salt("sequence_outputs")
+                        .max_height(220.)
+                        .show_rows(ui, row_height, summary.outputs.len(), |ui, rows| {
+                            for output in &summary.outputs[rows] {
+                                ui.add(
+                                    egui::Label::new(output).wrap_mode(egui::TextWrapMode::Extend),
+                                );
+                            }
+                        });
+                });
+            }
         }
     }
 
@@ -307,6 +361,14 @@ impl Mobile {
             }
             if action(ui, lang.text("Open SER file", "打开 SER 文件"), !busy, true) {
                 self.pick(OPEN_SER);
+            }
+            if action(
+                ui,
+                lang.text("Open SER folder", "打开 SER 目录"),
+                !busy,
+                false,
+            ) {
+                self.pick(OPEN_SEQUENCE_FOLDER);
             }
         });
         card(ui, |ui| {
@@ -409,6 +471,17 @@ impl Mobile {
         let mut selected = None;
         card(ui, |ui| {
             heading(ui, lang.text("Average spectrum", "平均光谱"));
+            if let Some(selection) = &self.sequence {
+                let description = match lang {
+                    Language::English => {
+                        format!("Reference · {} · {} files", scan.name, selection.count)
+                    }
+                    Language::Chinese => {
+                        format!("参考 · {} · {} 份文件", scan.name, selection.count)
+                    }
+                };
+                ui.label(RichText::new(description).color(MUTED));
+            }
             let response = picture(
                 ui,
                 &scan.texture,
@@ -826,7 +899,8 @@ impl Mobile {
                     ready,
                     false,
                 ) {
-                    self.pick(OPEN_SEQUENCE);
+                    self.note = None;
+                    self.sequence_options = true;
                 }
             }
             Page::Result => {

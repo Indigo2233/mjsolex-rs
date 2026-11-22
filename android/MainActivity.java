@@ -11,6 +11,7 @@ import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.widget.Toast;
 import java.io.FileNotFoundException;
+import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.Locale;
 
@@ -28,11 +29,12 @@ public final class MainActivity extends NativeActivity {
     private static final int SAVE_BATCH = 16;
     private static final int OPEN_SEQUENCE = 17;
     private static final int SAVE_SEQUENCE = 18;
+    private static final int OPEN_SEQUENCE_FOLDER = 19;
     private Uri pendingShared;
 
     private native boolean onDocument(
         int request, ParcelFileDescriptor document, String name, String error, String source);
-    private native void onExportDirectory(int request, Uri directory);
+    private native void onDirectory(int request, Uri directory);
     private native void onSequence(Uri[] files);
     private native void onShareAvailable();
 
@@ -138,8 +140,34 @@ public final class MainActivity extends NativeActivity {
         launchPicker(intent, request);
     }
 
-    public void pickExportDirectory(int request) {
+    public void pickDirectory(int request) {
         launchPicker(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), request);
+    }
+
+    public Uri[] listSequenceFolder(Uri directory) {
+        Uri children = DocumentsContract.buildChildDocumentsUriUsingTree(
+            directory, DocumentsContract.getTreeDocumentId(directory));
+        String[] columns = {
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_FLAGS
+        };
+        ArrayList<Uri> files = new ArrayList<>();
+        try (Cursor cursor = getContentResolver().query(children, columns, null, null, null)) {
+            if (cursor == null) {
+                throw new IllegalStateException("The provider could not list the folder");
+            }
+            while (cursor.moveToNext()) {
+                String name = cursor.getString(1);
+                if (name != null && name.toLowerCase(Locale.ROOT).endsWith(".ser")
+                    && !DocumentsContract.Document.MIME_TYPE_DIR.equals(cursor.getString(2))
+                    && (cursor.getInt(3) & DocumentsContract.Document.FLAG_VIRTUAL_DOCUMENT) == 0) {
+                    files.add(DocumentsContract.buildDocumentUriUsingTree(directory, cursor.getString(0)));
+                }
+            }
+        }
+        return files.toArray(new Uri[0]);
     }
 
     public String sequenceFileName(Uri file) {
@@ -148,6 +176,11 @@ public final class MainActivity extends NativeActivity {
 
     public ParcelFileDescriptor openSequenceFile(Uri file) throws FileNotFoundException {
         return getContentResolver().openFileDescriptor(file, "r");
+    }
+
+    public String exportFileName(Uri file, String suggested) {
+        String actual = queryDisplayName(file);
+        return actual == null ? suggested : actual;
     }
 
     public Uri createExportFile(Uri directory, String mimeType, String name)
@@ -166,7 +199,7 @@ public final class MainActivity extends NativeActivity {
     }
 
     private void launchPicker(Intent intent, int request) {
-        if (request != SAVE_BATCH && request != SAVE_SEQUENCE) {
+        if (!isDirectoryPicker(request)) {
             intent.addCategory(Intent.CATEGORY_OPENABLE);
         }
         runOnUiThread(() -> {
@@ -178,11 +211,15 @@ public final class MainActivity extends NativeActivity {
         });
     }
 
+    private static boolean isDirectoryPicker(int request) {
+        return request == SAVE_BATCH || request == SAVE_SEQUENCE || request == OPEN_SEQUENCE_FOLDER;
+    }
+
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (request == SAVE_BATCH || request == SAVE_SEQUENCE) {
-            onExportDirectory(request, result == RESULT_OK && data != null ? data.getData() : null);
+        if (isDirectoryPicker(request)) {
+            onDirectory(request, result == RESULT_OK && data != null ? data.getData() : null);
             return;
         }
         if (request == OPEN_SEQUENCE) {
@@ -257,7 +294,7 @@ public final class MainActivity extends NativeActivity {
             || request == OPEN_SEQUENCE;
     }
 
-    private String displayName(Uri uri, int request) {
+    private String queryDisplayName(Uri uri) {
         try (Cursor cursor = getContentResolver().query(uri,
                  new String[] {OpenableColumns.DISPLAY_NAME}, null, null, null)) {
             if (cursor != null && cursor.moveToFirst() && !cursor.isNull(0)) {
@@ -265,6 +302,14 @@ public final class MainActivity extends NativeActivity {
             }
         } catch (RuntimeException ignored) {
             // Some providers can open a file without exposing its name.
+        }
+        return null;
+    }
+
+    private String displayName(Uri uri, int request) {
+        String actual = queryDisplayName(uri);
+        if (actual != null) {
+            return actual;
         }
         if (request == OPEN_SHARED_SER && uri.getLastPathSegment() != null) {
             return uri.getLastPathSegment();

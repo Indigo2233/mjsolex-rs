@@ -44,6 +44,7 @@ const SAVE_RAW_PNG: i32 = 15;
 const SAVE_BATCH: i32 = 16;
 const OPEN_SEQUENCE: i32 = 17;
 const SAVE_SEQUENCE: i32 = 18;
+const OPEN_SEQUENCE_FOLDER: i32 = 19;
 const BACKGROUND: Color32 = Color32::from_rgb(17, 21, 27);
 const CARD: Color32 = Color32::from_rgb(28, 35, 44);
 const TEXT: Color32 = Color32::from_rgb(240, 243, 247);
@@ -83,7 +84,12 @@ enum Event {
 }
 
 enum Work {
-    Imported(Box<Imported>),
+    Imported {
+        scan: Box<Imported>,
+        sequence: Option<sequence::Selection>,
+        reloading: bool,
+    },
+    FolderSelected(sequence::Selection),
     FlatImported(PhysicalFlat, String),
     Reconstructed {
         images: Arc<Images>,
@@ -227,6 +233,7 @@ struct Mobile {
     receiver: mpsc::Receiver<Event>,
     picker: Option<i32>,
     sequence: Option<sequence::Selection>,
+    sequence_options: bool,
     shared_available: bool,
     shared_document: Option<Document>,
     job: Option<Job>,
@@ -392,7 +399,7 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onShareAvailable(
 }
 
 #[unsafe(no_mangle)]
-extern "system" fn Java_org_mjsolex_mobile_MainActivity_onExportDirectory(
+extern "system" fn Java_org_mjsolex_mobile_MainActivity_onDirectory(
     env: JNIEnv<'_>,
     activity: JObject<'_>,
     request: i32,
@@ -428,6 +435,8 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onSequence(
                 files: env.new_global_ref(files)?,
                 count,
                 format: sequence::Format::default(),
+                capture_order: false,
+                alternate_direction: false,
             }))
         });
         results::clear_exception(&env);
@@ -475,6 +484,7 @@ impl Mobile {
             receiver,
             picker: None,
             sequence: None,
+            sequence_options: false,
             shared_available: true,
             shared_document: None,
             job: None,
@@ -525,7 +535,7 @@ impl Mobile {
         let output = self.output.as_ref();
         if !matches!(
             request,
-            OPEN_SER | OPEN_FLAT | OPEN_SEQUENCE | SAVE_SEQUENCE
+            OPEN_SER | OPEN_FLAT | OPEN_SEQUENCE | SAVE_SEQUENCE | OPEN_SEQUENCE_FOLDER
         ) && output.is_none()
         {
             return;
@@ -535,13 +545,8 @@ impl Mobile {
                 let activity = self.activity.as_obj();
                 if matches!(request, OPEN_SER | OPEN_FLAT | OPEN_SEQUENCE) {
                     env.call_method(activity, "pickSer", "(I)V", &[JValue::Int(request)])?;
-                } else if matches!(request, SAVE_BATCH | SAVE_SEQUENCE) {
-                    env.call_method(
-                        activity,
-                        "pickExportDirectory",
-                        "(I)V",
-                        &[JValue::Int(request)],
-                    )?;
+                } else if matches!(request, SAVE_BATCH | SAVE_SEQUENCE | OPEN_SEQUENCE_FOLDER) {
+                    env.call_method(activity, "pickDirectory", "(I)V", &[JValue::Int(request)])?;
                 } else if let Some(output) = output {
                     let name = env.new_string(output.images.file_name(output.export(request)))?;
                     env.call_method(
@@ -585,7 +590,7 @@ impl Mobile {
         self.picker.is_some()
             || self.job.is_some()
             || self.shared_document.is_some()
-            || self.sequence.is_some()
+            || self.sequence_options
     }
 
     fn open_indigo(&mut self) {
@@ -640,32 +645,18 @@ impl Mobile {
         }
     }
 
-    fn import(&mut self, document: Document, byte_order: Option<ByteOrder>) {
-        let Document { file, name, source } = document;
+    fn import(&mut self, document: Document, byte_order: Option<ByteOrder>, reloading: bool) {
         let cache = self.cache.clone();
         self.start_job(
             ("Reading spectrum", "正在读取光谱"),
             true,
             move |events, cancel| {
-                let file = seekable_document(file, &cache, cancel)?;
-                let mut reader = SerReader::open_with_byte_order(&file.file, byte_order)?;
-                let header = reader.header();
-                let observation = reader.observation().clone();
-                let spectrum = Spectrum::average(&mut reader, report(events, cancel))?;
-                let trace = spectrum.fit_line(None);
-                let preview = preview(header.width, header.height, |i| spectrum.pixels()[i] as u16);
-                drop(reader);
-                Ok(Work::Imported(Box::new(Imported {
-                    file,
-                    name,
-                    source,
-                    header,
-                    observation,
-                    byte_order,
-                    spectrum,
-                    preview,
-                    trace,
-                })))
+                let scan = load_scan(document, byte_order, &cache, cancel, report(events, cancel))?;
+                Ok(Work::Imported {
+                    scan: Box::new(scan),
+                    sequence: None,
+                    reloading,
+                })
             },
         );
     }
@@ -734,6 +725,7 @@ impl Mobile {
                     source: scan.source.clone(),
                 },
                 order,
+                true,
             ),
             Err(error) => self.note = Some(Notice::Processing(error.into())),
         }
@@ -889,9 +881,13 @@ impl Mobile {
                     self.picker = None;
                     match result {
                         Ok(Some(directory)) if request == SAVE_SEQUENCE => {
-                            if let Some(selection) = self.sequence.take() {
+                            self.sequence_options = false;
+                            if let Some(selection) = self.sequence.clone() {
                                 self.reconstruct_sequence(selection, directory);
                             }
+                        }
+                        Ok(Some(directory)) if request == OPEN_SEQUENCE_FOLDER => {
+                            self.open_sequence_folder(directory, self.page == Page::Spectrum)
                         }
                         Ok(Some(directory)) => self.export_directory(directory),
                         Ok(None) => {}
@@ -901,7 +897,11 @@ impl Mobile {
                 Event::Sequence(result) if self.picker == Some(OPEN_SEQUENCE) => {
                     self.picker = None;
                     match result {
-                        Ok(selection) => self.sequence = selection,
+                        Ok(Some(selection)) => {
+                            self.sequence = Some(selection);
+                            self.sequence_options = true;
+                        }
+                        Ok(None) => {}
                         Err(error) => self.note = Some(Notice::Document(error)),
                     }
                 }
@@ -917,7 +917,7 @@ impl Mobile {
                             self.shared_document = Some(document);
                         }
                         Ok(Some(document)) if matches!(request, OPEN_SER | OPEN_SHARED) => {
-                            self.import(document, None)
+                            self.import(document, None, false)
                         }
                         Ok(Some(Document { file, name, .. })) if request == OPEN_FLAT => {
                             self.import_flat(file, name)
@@ -935,7 +935,14 @@ impl Mobile {
                 Event::Finished(result) => {
                     self.job = None;
                     match result {
-                        Ok(Work::Imported(import)) => {
+                        Ok(Work::Imported {
+                            scan: import,
+                            sequence,
+                            reloading,
+                        }) => {
+                            if !reloading {
+                                self.sequence = sequence;
+                            }
                             let Imported {
                                 file,
                                 name,
@@ -997,6 +1004,7 @@ impl Mobile {
                             self.flat_mode = FlatMode::Physical;
                             self.page = Page::Spectrum;
                         }
+                        Ok(Work::FolderSelected(selection)) => self.sequence = Some(selection),
                         Ok(Work::Exported(name)) => self.note = Some(Notice::Saved(name)),
                         Ok(Work::Previewed(product, tone, preview)) => {
                             if let Some(output) = &mut self.output {
@@ -1091,6 +1099,36 @@ fn seekable_document(
         }
         Err(error) => Err(error.into()),
     }
+}
+
+fn load_scan(
+    document: Document,
+    byte_order: Option<ByteOrder>,
+    cache: &Path,
+    cancel: &AtomicBool,
+    progress: impl FnMut(f32) -> bool,
+) -> Result<Imported, Error> {
+    let Document { file, name, source } = document;
+    let file = seekable_document(file, cache, cancel)?;
+    let mut reader = SerReader::open_with_byte_order(&file.file, byte_order)?;
+    let header = reader.header();
+    let observation = reader.observation().clone();
+    let spectrum = Spectrum::average(&mut reader, progress)?;
+    drop(reader);
+    file.check_error()?;
+    let trace = spectrum.fit_line(None);
+    let preview = preview(header.width, header.height, |i| spectrum.pixels()[i] as u16);
+    Ok(Imported {
+        file,
+        name,
+        source,
+        header,
+        observation,
+        byte_order,
+        spectrum,
+        preview,
+        trace,
+    })
 }
 
 struct PipeReader<'a> {

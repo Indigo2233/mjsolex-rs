@@ -204,9 +204,9 @@ pub(super) fn write_in_directory(
     images: &Images,
     export: Export,
     name: &str,
-) -> Result<(), Error> {
+) -> Result<String, Error> {
     let result = env.with_local_frame(10, |env| {
-        let name = env.new_string(name)?;
+        let requested = env.new_string(name)?;
         let mime = env.new_string(export.mime())?;
         let uri = env
             .call_method(
@@ -216,7 +216,7 @@ pub(super) fn write_in_directory(
                 &[
                     JValue::Object(directory),
                     JValue::Object(&mime),
-                    JValue::Object(&name),
+                    JValue::Object(&requested),
                 ],
             )?
             .l()?;
@@ -249,7 +249,7 @@ pub(super) fn write_in_directory(
             };
             write_destination(file, images, export)
         })();
-        if written.is_err() {
+        if let Err(error) = written {
             clear_exception(env);
             let _ = env.call_method(
                 activity,
@@ -258,8 +258,20 @@ pub(super) fn write_in_directory(
                 &[JValue::Object(&uri)],
             );
             clear_exception(env);
+            return Ok(Err(error));
         }
-        Ok::<_, jni::errors::Error>(written)
+        let actual = (|| {
+            let actual = env
+                .call_method(
+                    activity,
+                    "exportFileName",
+                    "(Landroid/net/Uri;Ljava/lang/String;)Ljava/lang/String;",
+                    &[JValue::Object(&uri), JValue::Object(&requested)],
+                )?
+                .l()?;
+            Ok::<String, jni::errors::Error>(env.get_string(&JString::from(actual))?.into())
+        })();
+        Ok::<_, jni::errors::Error>(Ok(actual.unwrap_or_else(|_| name.to_owned())))
     });
     clear_exception(env);
     result.map_err(io::Error::other)?

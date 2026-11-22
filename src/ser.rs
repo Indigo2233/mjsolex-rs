@@ -321,6 +321,14 @@ fn probe_byte_order(
     }
 }
 
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn header_capture_utc(input: &mut impl Read) -> Result<Option<String>, Error> {
+    let bytes = read_header(input)?;
+    let observation = Observation::from_header(&bytes);
+    Header::parse(&bytes, &observation, None)?;
+    Ok(observation.start_utc)
+}
+
 /// Stage the frame data and any complete timestamp trailer that fits the limit.
 /// Some document providers deliver a stream without a size or seek support.
 #[cfg(any(target_os = "android", test))]
@@ -462,6 +470,26 @@ impl<R: Read + Seek> SerReader<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_capture_time_without_frame_data() {
+        let mut header = [0; HEADER_LEN as usize];
+        header[..14].copy_from_slice(b"LUCAM-RECORDER");
+        for (offset, value) in [(26, 256_u32), (30, 64), (34, 16), (38, 240)] {
+            header[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(header_capture_utc(&mut &header[..]).unwrap(), None);
+        header[170..178].copy_from_slice(&621_355_968_000_000_001_u64.to_le_bytes());
+        assert_eq!(
+            header_capture_utc(&mut &header[..]).unwrap().as_deref(),
+            Some("1970-01-01T00:00:00.0000001")
+        );
+        header[0] = 0;
+        assert!(matches!(
+            header_capture_utc(&mut &header[..]),
+            Err(Error::InvalidSer(_))
+        ));
+    }
 
     #[test]
     fn related_scan_resolves_ambiguous_flat_without_overriding_flat_evidence() {

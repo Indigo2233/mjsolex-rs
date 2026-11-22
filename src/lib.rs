@@ -63,6 +63,10 @@ pub enum Error {
         "The scan dimensions, color mode, bit depth and trimming must match the reference SER."
     )]
     SequenceMismatch,
+    #[error("The folder contains no SER files.")]
+    EmptySequenceFolder,
+    #[error("No SER in the folder could be opened as a reference scan.")]
+    UnreadableSequenceFolder,
     #[error("The scan uses slit columns outside the captured flat calibration.")]
     FlatCoverage,
     #[error("The flat SER does not illuminate the full slit reliably.")]

@@ -72,6 +72,8 @@ impl Language {
             Error::SequenceMismatch => {
                 "扫描的尺寸、颜色模式、位深和裁剪格式须与参考 SER 一致。".into()
             }
+            Error::EmptySequenceFolder => "所选目录中没有 SER 文件。".into(),
+            Error::UnreadableSequenceFolder => "目录中没有可用作参考扫描的 SER 文件。".into(),
             Error::FlatCoverage => "扫描使用的狭缝列超出了实拍平场的校准范围。".into(),
             Error::InvalidPhysicalFlat => "平场 SER 未能充分照亮整条狭缝。".into(),
             Error::DopplerCoverage => "当前扫描无法覆盖所选偏移处的两侧谱翼。".into(),
@@ -213,14 +215,21 @@ impl Notice {
                 } else {
                     language.text("Sequence finished.", "序列处理结束。")
                 };
-                match language {
+                let mut message = match language {
                     Language::English => format!(
                         "{status} {completed}/{total} scans complete, {failed} failed, {saved} files saved."
                     ),
                     Language::Chinese => format!(
                         "{status} 已完成 {completed}/{total} 份扫描，失败 {failed} 份，已保存 {saved} 个文件。"
                     ),
+                };
+                if summary.capture_fallback {
+                    message.push_str(language.text(
+                        "\nSome capture times were unavailable. Used filename order.",
+                        "\n部分文件缺少拍摄时间，已按文件名顺序处理。",
+                    ));
                 }
+                message
             }
             Self::SaveLanguage(detail) => with_detail(
                 "Could not save language preference",

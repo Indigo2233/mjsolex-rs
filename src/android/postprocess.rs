@@ -83,6 +83,7 @@ pub(super) fn doppler_shift(
     Ok(wing_offset.copysign(dispersion))
 }
 
+#[derive(Clone)]
 pub(super) struct ReconstructionOptions {
     pub(super) wavelength: f64,
     pub(super) dispersion: Option<f64>,
