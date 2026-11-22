@@ -152,13 +152,42 @@ struct Job {
 struct Calibration {
     wavelength: f64,
     custom_wavelength: bool,
+    wavelength_input: String,
     manual_dispersion: f64,
+    dispersion_input: String,
     use_optics: bool,
     optics: OpticalSetup,
     increases_downward: Option<bool>,
 }
 
+const WAVELENGTH_RANGE: std::ops::RangeInclusive<f64> = 0. ..=100_000.;
+const DISPERSION_RANGE: std::ops::RangeInclusive<f64> = -50. ..=50.;
+
+fn optional_decimal(text: &str, range: std::ops::RangeInclusive<f64>) -> Option<f64> {
+    let text = text.trim();
+    if text.is_empty() {
+        Some(0.)
+    } else {
+        text.replace('−', "-").replace(',', ".").parse().ok()
+    }
+    .filter(|number| range.contains(number))
+}
+
 impl Calibration {
+    fn edited_numeric_values(&self) -> Option<(f64, f64)> {
+        let wavelength = if self.custom_wavelength {
+            optional_decimal(&self.wavelength_input, WAVELENGTH_RANGE)?
+        } else {
+            self.wavelength
+        };
+        let dispersion = if self.use_optics {
+            self.manual_dispersion
+        } else {
+            optional_decimal(&self.dispersion_input, DISPERSION_RANGE)?
+        };
+        Some((wavelength, dispersion))
+    }
+
     fn dispersion(&self) -> Option<f64> {
         if self.use_optics {
             let increasing = self.increases_downward?;
@@ -172,6 +201,7 @@ impl Calibration {
     fn clear_line(&mut self) {
         self.wavelength = 0.;
         self.custom_wavelength = false;
+        self.wavelength_input.clear();
     }
 }
 
@@ -637,11 +667,15 @@ impl Mobile {
         let (Some(scan), Some(trace)) = (&self.scan, self.trace) else {
             return;
         };
+        let Some((wavelength, manual_dispersion)) = self.calibration.edited_numeric_values() else {
+            return;
+        };
+        self.calibration.wavelength = wavelength;
+        self.calibration.manual_dispersion = manual_dispersion;
         let palettes = self.palettes;
         let wing_offset = self.wing_offset;
         let shift = self.shift;
         let dispersion = self.calibration.dispersion();
-        let wavelength = self.calibration.wavelength;
         let (wing_shift, doppler_error) = match self.doppler_shift() {
             Ok(shift) => (shift, None),
             Err(error) => (None, Some(error)),
@@ -656,7 +690,8 @@ impl Mobile {
         let order = scan.byte_order;
         let header = scan.header;
         let processing = self.processing;
-        let synthetic_flat = self.flat_mode == FlatMode::Synthetic;
+        let synthetic_flat =
+            self.flat_mode == FlatMode::Synthetic && processing.synthetic_strength > 0;
         let physical_flat = if self.flat_mode == FlatMode::Physical {
             self.physical_flat.clone()
         } else {
@@ -713,10 +748,14 @@ impl Mobile {
                     ..CorrectionWarnings::default()
                 };
                 if synthetic_flat {
-                    match raw.correct_synthetic_flat(|p| {
-                        progress(flat_start + p * (corrections_start - flat_start))
-                    }) {
-                        Ok(_) => {}
+                    match raw
+                        .correct_synthetic_flat_at_strength(processing.synthetic_strength, |p| {
+                            progress(flat_start + p * (corrections_start - flat_start))
+                        }) {
+                        Ok(applied) => {
+                            metadata.synthetic_flat_strength =
+                                applied.then_some(processing.synthetic_strength);
+                        }
                         Err(Error::Cancelled) => return Err(Error::Cancelled),
                         Err(error) => warnings.flat = Some(error),
                     }
@@ -891,6 +930,7 @@ impl Mobile {
                             self.shift = 0.;
                             self.calibration.clear_line();
                             self.calibration.manual_dispersion = 0.;
+                            self.calibration.dispersion_input.clear();
                             self.stride = header.minimum_stride();
                             self.physical_flat = None;
                             if self.flat_mode == FlatMode::Physical {

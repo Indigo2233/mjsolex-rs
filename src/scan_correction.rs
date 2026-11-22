@@ -11,6 +11,8 @@ pub enum BandingAxis {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScanSettings {
     pub banding: BandingAxis,
+    /// Width of the reference neighborhood in pixels. None selects it automatically.
+    pub banding_width: Option<u8>,
     pub oscillation: bool,
     pub jagged: bool,
 }
@@ -26,6 +28,7 @@ pub struct ScanReport {
     pub banding: BandingAxis,
     /// Global attenuation of the signal above the sky pedestal during banding correction.
     pub banding_scale: Option<f64>,
+    pub banding_width: Option<u8>,
     pub jagged: bool,
     /// Fitted period in reconstructed scan rows and amplitude in slit pixels.
     pub oscillation: Option<(f64, f64)>,
@@ -50,6 +53,7 @@ mod model {
         start: usize,
         gains: Vec<f64>,
         scale: f64,
+        width: u8,
     }
 
     impl BandCorrection {
@@ -91,7 +95,7 @@ mod model {
             let disk = DiskGeometry::fit_limb(image)?;
             let sky = disk.sky;
             let banding = if settings.banding != BandingAxis::Off {
-                banding_model(image, &disk, settings.banding, |p| progress(p * 0.25))?
+                banding_model(image, &disk, settings, |p| progress(p * 0.25))?
             } else {
                 None
             };
@@ -108,6 +112,7 @@ mod model {
                     BandingAxis::Off
                 },
                 banding_scale: banding.as_ref().map(|model| model.scale),
+                banding_width: banding.as_ref().map(|model| model.width),
                 jagged: motion.as_ref().is_some_and(|m| !m.rows.is_empty()),
                 oscillation: motion.as_ref().and_then(|m| m.wave).map(|wave| {
                     (
@@ -221,10 +226,10 @@ mod model {
     fn banding_model(
         image: &Reconstruction,
         disk: &FittedDisk,
-        axis: BandingAxis,
+        settings: ScanSettings,
         mut progress: impl FnMut(f32) -> bool,
     ) -> Result<Option<BandCorrection>, Error> {
-        let vertical = axis == BandingAxis::Slit;
+        let vertical = settings.banding == BandingAxis::Slit;
         let g = disk.geometry;
         let tilted = g.shear * g.scan_radius;
         let projected_x = g.slit_radius.hypot(tilted);
@@ -287,7 +292,10 @@ mod model {
             }
             levels.push(sectors);
         }
-        let half_window = (radius / 12.).round().clamp(3., 12.) as usize;
+        let half_window = settings.banding_width.map_or_else(
+            || (radius / 12.).round().clamp(3., 12.) as usize,
+            |width| usize::from(width.clamp(7, 51)) / 2,
+        );
         let mut gains = vec![1.; levels.len()];
         let mut applied = false;
         for (i, gain) in gains
@@ -343,6 +351,7 @@ mod model {
             start: range.start,
             gains,
             scale: maximum.recip(),
+            width: (2 * half_window + 1) as u8,
         }))
     }
 
@@ -596,12 +605,14 @@ mod tests {
                 &image,
                 ScanSettings {
                     banding: axis,
+                    banding_width: Some(17),
                     ..ScanSettings::default()
                 },
                 |_| true,
             )
             .unwrap();
             assert_eq!(plan.report.banding, axis);
+            assert_eq!(plan.report.banding_width, Some(17));
             assert!(plan.report.banding_scale.unwrap() < 1.);
             plan.apply(&mut image, |_| true).unwrap();
             assert!(error(&image) < before * 0.24);

@@ -21,7 +21,7 @@ impl LocalContrast {
         let (width, height) = (image.width(), image.height());
         let tile = width.max(height).div_ceil(24).max(64);
         let [cols, rows] = [width.div_ceil(tile), height.div_ceil(tile)];
-        let stretch = Stretch::estimate(width, height, |i| image.pixels()[i]);
+        let stretch = Stretch::estimate_with_highlights(width, height, |i| image.pixels()[i]);
         let mut maps = Vec::new();
         maps.try_reserve_exact(cols * rows)?;
         for ty in 0..rows {
@@ -82,7 +82,8 @@ impl LocalContrast {
         );
         // A gradual transition leaves the sky black and reduces halos at the limb.
         let strength = 0.58 * (f32::from(gray - 3) / 32.).min(1.);
-        lerp(f32::from(gray), local, strength).round() as u8
+        let enhanced = lerp(f32::from(gray), local, strength).round() as u8;
+        enhanced.min(if gray == 255 { 255 } else { 254 })
     }
 }
 
@@ -109,6 +110,28 @@ fn clipped_map(mut histogram: [usize; 256], area: usize) -> [u8; 256] {
 mod tests {
     use super::*;
     use crate::{DisplayImage, Product};
+
+    #[test]
+    fn highlight_tail_remains_visible_in_intensity_enhanced_and_doppler_views() {
+        let (width, height) = (192, 128);
+        let mut image = Reconstruction {
+            width,
+            height,
+            pixels: (0..width * height).map(|i| 200 + (i % 17) as u16).collect(),
+            synthetic_flat: false,
+        };
+        let first = 56 * width + 28;
+        image.pixels[first..first + 3].copy_from_slice(&[240, 300, 386]);
+        let base = DisplayImage::new(&image, None, Product::Gray).unwrap();
+        let contrast = LocalContrast::prepare(&image, |_| true).unwrap();
+        let enhanced = DisplayImage::enhanced(&image, Product::Gray, &contrast).unwrap();
+        let doppler = DisplayImage::new(&image, Some(&image), Product::Doppler).unwrap();
+        for view in [&base, &enhanced, &doppler] {
+            assert!(view.pixel(first)[0] < view.pixel(first + 1)[0]);
+            assert!(view.pixel(first + 1)[0] < 255);
+            assert_eq!(view.pixel(first + 2)[0], 255);
+        }
+    }
 
     #[test]
     fn enhances_local_contrast_without_mutating_strength_or_black_sky() {

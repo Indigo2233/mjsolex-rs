@@ -217,6 +217,7 @@ mod tests {
             scan_corrections: crate::ScanReport {
                 banding: crate::BandingAxis::Slit,
                 banding_scale: Some(0.91),
+                banding_width: Some(17),
                 jagged: true,
                 oscillation: Some((21., 2.5)),
             },
@@ -232,6 +233,7 @@ mod tests {
             "CROPFACT=",
             "BANDCORR= 'SLIT'",
             "BANDSCL",
+            "BANDWID",
             "OSCPER",
             "OSCAMP",
             "JAGGCOR",

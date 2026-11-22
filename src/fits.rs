@@ -13,6 +13,7 @@ pub struct FitsMetadata {
     pub source_name: Option<String>,
     pub source_header: Option<Header>,
     pub flat_file: Option<String>,
+    pub synthetic_flat_strength: Option<u8>,
     pub frame_step: Option<u32>,
     pub offset_pixels: Option<f64>,
     pub line_center_angstrom: Option<f64>,
@@ -49,6 +50,9 @@ impl Reconstruction {
             cards.push(text_card("FLATCORR", "PHYSICAL"));
         } else if self.has_synthetic_flat() {
             cards.push(text_card("FLATCORR", "SYNTHETIC"));
+            if let Some(strength) = metadata.synthetic_flat_strength {
+                cards.push(format!("FLATSTR = {strength:>20}"));
+            }
         }
         metadata.cards(&mut cards);
         cards.push("END".to_owned());
@@ -110,6 +114,9 @@ impl FitsMetadata {
             BandingAxis::Off => {}
             BandingAxis::Slit => cards.push(text_card("BANDCORR", "SLIT")),
             BandingAxis::Scan => cards.push(text_card("BANDCORR", "SCAN")),
+        }
+        if let Some(width) = self.scan_corrections.banding_width {
+            cards.push(format!("BANDWID = {width:>20}"));
         }
         for (key, applied) in [
             ("JAGGCOR", self.scan_corrections.jagged),

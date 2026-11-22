@@ -28,6 +28,7 @@ impl Product {
 pub struct Stretch {
     low: u32,
     high: u32,
+    peak: u32,
 }
 
 impl Stretch {
@@ -58,12 +59,39 @@ impl Stretch {
         };
         let low = percentile(size / 100);
         let high = percentile(size * 99 / 100).max(low + (span / 128).max(1));
-        Self { low, high }
+        Self {
+            low,
+            high,
+            peak: high,
+        }
+    }
+
+    pub(crate) fn estimate_with_highlights(
+        width: usize,
+        height: usize,
+        value: impl Fn(usize) -> u16,
+    ) -> Self {
+        let mut stretch = Self::estimate(width, height, &value);
+        if let Some(peak) = (0..width * height).map(value).max() {
+            stretch.peak = stretch.high.max(u32::from(peak));
+        }
+        stretch
     }
 
     pub fn map(self, sample: u16) -> u8 {
-        let delta = u32::from(sample).saturating_sub(self.low);
-        (255 * delta / (self.high - self.low)).min(255) as u8
+        let sample = u32::from(sample);
+        let delta = sample.saturating_sub(self.low);
+        if self.peak == self.high {
+            return (255 * delta / (self.high - self.low)).min(255) as u8;
+        }
+        // Set aside the top display levels for the tail above the 99th percentile.
+        const KNEE: u32 = 224;
+        if sample <= self.high {
+            (KNEE * delta / (self.high - self.low)) as u8
+        } else {
+            (KNEE + (255 - KNEE) * (sample.min(self.peak) - self.high) / (self.peak - self.high))
+                as u8
+        }
     }
 }
 
@@ -109,7 +137,7 @@ impl<'a> DisplayImage<'a> {
         }
         let stretch = local.map_or_else(
             || {
-                Stretch::estimate(image.width(), image.height(), |i| {
+                Stretch::estimate_with_highlights(image.width(), image.height(), |i| {
                     let red = image.pixels()[i];
                     blue.map_or(red, |wing| red.midpoint(wing.pixels()[i]))
                 })

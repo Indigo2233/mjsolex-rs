@@ -129,9 +129,17 @@ impl Reconstruction {
     /// Cancellation is checked throughout model estimation and before applying the gains.
     pub fn correct_synthetic_flat(
         &mut self,
+        progress: impl FnMut(f32) -> bool,
+    ) -> Result<bool, Error> {
+        self.correct_synthetic_flat_at_strength(100, progress)
+    }
+
+    pub(crate) fn correct_synthetic_flat_at_strength(
+        &mut self,
+        percent: u8,
         mut progress: impl FnMut(f32) -> bool,
     ) -> Result<bool, Error> {
-        if self.synthetic_flat {
+        if self.synthetic_flat || percent == 0 {
             return Ok(false);
         }
         if !progress(0.) {
@@ -200,7 +208,7 @@ impl Reconstruction {
         }
         // Normalize to the faintest fitted column. Attenuation preserves headroom
         // and the sky pedestal. Limit the whole correction without flattening it.
-        let strength = (-MIN_GAIN.ln() / spread).min(1.);
+        let strength = (-MIN_GAIN.ln() / spread).min(1.) * f64::from(percent.min(100)) / 100.;
         for gain in &mut gains {
             *gain = ((low - *gain) * strength).exp();
         }
@@ -347,6 +355,38 @@ mod tests {
             str::from_utf8(&fits[..2880])
                 .unwrap()
                 .contains("FLATCORR= 'SYNTHETIC'")
+        );
+    }
+
+    #[test]
+    fn synthetic_flat_strength_controls_attenuation() {
+        let reference = disk(125., false);
+        let mut image = disk(125., true);
+        let original = image.pixels.clone();
+        let before = response_error(&reference, &image);
+        assert!(
+            !image
+                .correct_synthetic_flat_at_strength(0, |_| true)
+                .unwrap()
+        );
+        assert_eq!(image.pixels, original);
+        assert!(
+            image
+                .correct_synthetic_flat_at_strength(50, |_| true)
+                .unwrap()
+        );
+        let partial = response_error(&reference, &image);
+
+        let mut full = disk(125., true);
+        assert!(full.correct_synthetic_flat(|_| true).unwrap());
+        assert!(response_error(&reference, &full) < partial && partial < before);
+        assert!(
+            image
+                .pixels
+                .iter()
+                .zip(&full.pixels)
+                .zip(original)
+                .all(|((&partial, &full), original)| full <= partial && partial <= original)
         );
     }
 

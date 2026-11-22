@@ -5,6 +5,7 @@ use crate::scan_correction::ScanPlan;
 pub(super) struct ProcessingOptions {
     pub(super) scan: ScanSettings,
     pub(super) correct_disk: bool,
+    pub(super) synthetic_strength: u8,
     pub(super) framing: Framing,
     pub(super) enhance: bool,
 }
@@ -13,7 +14,8 @@ impl Default for ProcessingOptions {
     fn default() -> Self {
         Self {
             scan: ScanSettings::default(),
-            correct_disk: false,
+            correct_disk: true,
+            synthetic_strength: 100,
             framing: Framing::default(),
             enhance: true,
         }
@@ -100,15 +102,21 @@ pub(super) fn finish(
     }
     if options.correct_disk {
         let corrected = DiskGeometry::fit(&images.center).and_then(|geometry| {
+            let scale_error = (geometry.slit_radius - geometry.scan_radius).abs();
+            let shear_error = geometry.shear.abs() * geometry.scan_radius;
+            // Keep the existing sampling grid when the fitted limb barely moves.
+            if scale_error.max(shear_error) <= 1.5 {
+                return Ok(None);
+            }
             images.transform(|image, index| {
                 geometry.correct_with_budget(image, budget, |p| {
                     progress(0.4 + 0.26 * (index as f32 + p) / count)
                 })
             })?;
-            Ok(geometry)
+            Ok(Some(geometry))
         });
         match corrected {
-            Ok(geometry) => images.metadata.geometry = Some(geometry),
+            Ok(geometry) => images.metadata.geometry = geometry,
             Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(error) => warnings.disk = Some(error),
         }

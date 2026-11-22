@@ -525,6 +525,13 @@ impl Mobile {
                         self.pick(OPEN_FLAT);
                     }
                 }
+                if self.flat_mode == FlatMode::Synthetic {
+                    ui.add(
+                        egui::Slider::new(&mut self.processing.synthetic_strength, 0..=100)
+                            .text(lang.text("Synthetic flat strength", "虚拟平场强度"))
+                            .suffix("%"),
+                    );
+                }
                 if self.flat_mode == FlatMode::Synthetic && self.doppler {
                     ui.label(
                         RichText::new(lang.text(
@@ -539,7 +546,7 @@ impl Mobile {
                 !busy,
                 egui::Checkbox::new(
                     &mut self.processing.correct_disk,
-                    lang.text("Correct full-disk geometry", "校正太阳盘几何形状"),
+                    lang.text("Auto-correct full-disk geometry", "自动校正太阳盘几何形状"),
                 ),
             );
             ui.add_enabled_ui(!busy, |ui| {
@@ -631,7 +638,12 @@ impl Mobile {
                     lang.text("Applied scan corrections", "已应用的扫描校正"),
                     |ui| {
                         if report.banding != BandingAxis::Off {
-                            ui.label(lang.text("Banding correction", "条带校正"));
+                            let label = lang.text("Banding correction", "条带校正");
+                            if let Some(width) = report.banding_width {
+                                ui.label(format!("{label} · {width} px"));
+                            } else {
+                                ui.label(label);
+                            }
                         }
                         if report.jagged {
                             ui.label(lang.text("Jagged limb correction", "盘缘锯齿校正"));
@@ -642,7 +654,9 @@ impl Mobile {
                                     format!("Oscillation · {period:.1} rows · {amplitude:.2} px")
                                 }
                                 Language::Chinese => {
-                                    format!("周期抖动 · {period:.1} 行 · {amplitude:.2} px")
+                                    format!(
+                                        "支架系统周期性抖动 · {period:.1} 行 · {amplitude:.2} px"
+                                    )
                                 }
                             };
                             ui.label(details);
@@ -665,7 +679,9 @@ impl Mobile {
                 if action(
                     ui,
                     lang.text("Reconstruct scan", "重建图像"),
-                    !busy && self.trace.is_some(),
+                    !busy
+                        && self.trace.is_some()
+                        && self.calibration.edited_numeric_values().is_some(),
                     true,
                 ) {
                     self.reconstruct();
@@ -723,11 +739,41 @@ fn scan_options(ui: &mut Ui, scan: &mut ScanSettings, lang: Language) {
                 }
             }
         });
+        if scan.banding != BandingAxis::Off {
+            let mut custom = scan.banding_width.is_some();
+            if ui
+                .checkbox(
+                    &mut custom,
+                    lang.text("Set banding reference width", "手动设置条带参考宽度"),
+                )
+                .changed()
+            {
+                scan.banding_width = custom.then_some(15);
+            }
+            if let Some(width) = &mut scan.banding_width {
+                ui.add(egui::Slider::new(width, 7..=51).step_by(2.).suffix(" px"));
+            }
+        }
         ui.checkbox(
             &mut scan.oscillation,
-            lang.text("Periodic mount oscillation", "装架周期抖动"),
+            lang.text(
+                "Correct periodic mount oscillation",
+                "校正支架系统周期性抖动",
+            ),
         );
-        ui.checkbox(&mut scan.jagged, lang.text("Jagged solar limb", "盘缘锯齿"));
+        ui.checkbox(
+            &mut scan.jagged,
+            lang.text("Correct local limb jaggedness", "修正局部盘缘锯齿"),
+        );
+        if scan.oscillation && scan.jagged {
+            ui.label(
+                RichText::new(lang.text(
+                    "The limb correction uses the residual shifts after periodic correction.",
+                    "先校正周期性抖动，再处理余下的局部盘缘位移。",
+                ))
+                .color(MUTED),
+            );
+        }
     });
 }
 
@@ -873,18 +919,24 @@ fn wavelength_calibration(ui: &mut Ui, calibration: &mut Calibration, lang: Lang
                 }
                 let custom = egui::Button::new(lang.text("Custom", "自定义"))
                     .selected(calibration.custom_wavelength);
-                if ui.add(custom).clicked() {
+                if ui.add(custom).clicked() && !calibration.custom_wavelength {
                     calibration.custom_wavelength = true;
+                    calibration.wavelength_input = if calibration.wavelength > 0. {
+                        calibration.wavelength.to_string()
+                    } else {
+                        String::new()
+                    };
                 }
             });
             if calibration.custom_wavelength {
                 ui.label(lang.text("Zero-offset wavelength (Å)", "零偏移波长（Å）"));
-                ui.add(
-                    egui::DragValue::new(&mut calibration.wavelength)
-                        .range(0. ..=100_000.)
-                        .speed(0.02)
-                        .max_decimals(4)
-                        .custom_formatter(move |value, _| optional_number(value, lang)),
+                decimal_entry(
+                    ui,
+                    "wavelength_value",
+                    &mut calibration.wavelength_input,
+                    &mut calibration.wavelength,
+                    WAVELENGTH_RANGE,
+                    lang,
                 );
             } else if calibration.wavelength > 0. {
                 let label = lang.text("Reference wavelength", "参考波长");
@@ -912,12 +964,13 @@ fn wavelength_calibration(ui: &mut Ui, calibration: &mut Calibration, lang: Lang
                 optical_calibration(ui, calibration, lang);
             } else {
                 ui.label(lang.text("Dispersion (Å/px)", "色散（Å/px）"));
-                ui.add(
-                    egui::DragValue::new(&mut calibration.manual_dispersion)
-                        .range(-50. ..=50.)
-                        .speed(0.001)
-                        .max_decimals(5)
-                        .custom_formatter(move |value, _| optional_number(value, lang)),
+                decimal_entry(
+                    ui,
+                    "dispersion_value",
+                    &mut calibration.dispersion_input,
+                    &mut calibration.manual_dispersion,
+                    DISPERSION_RANGE,
+                    lang,
                 );
                 ui.label(RichText::new(lang.text(
                     "Use negative dispersion if wavelength decreases down the frame.",
@@ -1017,15 +1070,42 @@ fn optical_calibration(ui: &mut Ui, calibration: &mut Calibration, lang: Languag
     ui.label(RichText::new(result).color(AMBER));
 }
 
-fn optional_number(value: f64, lang: Language) -> String {
-    if value == 0. {
-        lang.text("Unset", "未设置").into()
-    } else {
-        format!("{value:.5}")
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_owned()
-    }
+fn decimal_entry(
+    ui: &mut Ui,
+    key: &'static str,
+    draft: &mut String,
+    value: &mut f64,
+    range: std::ops::RangeInclusive<f64>,
+    lang: Language,
+) {
+    let id = ui.make_persistent_id(key);
+    ui.horizontal_wrapped(|ui| {
+        let entry = ui.add(
+            egui::TextEdit::singleline(draft)
+                .id(id)
+                .desired_width(112.)
+                .char_limit(32)
+                .hint_text(lang.text("Unset", "未设置")),
+        );
+        let next = optional_decimal(draft, range);
+        let apply = ui
+            .add_enabled(
+                next.is_some(),
+                egui::Button::new(lang.text("Apply", "应用")),
+            )
+            .clicked();
+        if apply {
+            ui.memory_mut(|memory| memory.surrender_focus(id));
+        }
+        if (apply || entry.lost_focus())
+            && let Some(next) = next
+        {
+            *value = next;
+        }
+        if !entry.has_focus() && next.is_none() {
+            ui.colored_label(AMBER, lang.text("Invalid number", "数值无效"));
+        }
+    });
 }
 
 fn profile_chart(
