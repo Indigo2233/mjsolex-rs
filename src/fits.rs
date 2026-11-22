@@ -1,6 +1,8 @@
 use std::io::Write;
 
-use crate::{APP_NAME, DiskGeometry, Header, Observation, Reconstruction};
+use crate::{
+    APP_NAME, BandingAxis, DiskGeometry, Framing, Header, Observation, Reconstruction, ScanReport,
+};
 
 const CARD: usize = 80;
 const BLOCK: usize = 2880;
@@ -17,6 +19,8 @@ pub struct FitsMetadata {
     pub dispersion_angstrom: Option<f64>,
     pub fwhm_pixels: Option<f64>,
     pub geometry: Option<DiskGeometry>,
+    pub framing: Framing,
+    pub scan_corrections: ScanReport,
 }
 
 impl Reconstruction {
@@ -102,6 +106,20 @@ impl FitsMetadata {
         if let Some(stride) = self.frame_step {
             cards.push(format!("SCNSTEP = {stride:>20}"));
         }
+        match self.scan_corrections.banding {
+            BandingAxis::Off => {}
+            BandingAxis::Slit => cards.push(text_card("BANDCORR", "SLIT")),
+            BandingAxis::Scan => cards.push(text_card("BANDCORR", "SCAN")),
+        }
+        for (key, applied) in [
+            ("JAGGCOR", self.scan_corrections.jagged),
+            ("FLIPX", self.framing.flip_x),
+            ("FLIPY", self.framing.flip_y),
+        ] {
+            if applied {
+                cards.push(format!("{key:<8}=                    T"));
+            }
+        }
         let wavelength =
             self.line_center_angstrom
                 .zip(self.offset_pixels)
@@ -129,6 +147,20 @@ impl FitsMetadata {
             ("SLITRAD", self.geometry.map(|g| g.slit_radius)),
             ("SCANRAD", self.geometry.map(|g| g.scan_radius)),
             ("SHEAR", self.geometry.map(|g| g.shear)),
+            (
+                "ROTANGLE",
+                (self.framing.rotation_deg != 0.).then_some(self.framing.rotation_deg),
+            ),
+            ("CROPFACT", self.framing.crop_factor),
+            ("BANDSCL", self.scan_corrections.banding_scale),
+            (
+                "OSCPER",
+                self.scan_corrections.oscillation.map(|(period, _)| period),
+            ),
+            (
+                "OSCAMP",
+                self.scan_corrections.oscillation.map(|(_, amp)| amp),
+            ),
         ] {
             if let Some(value) = value.filter(|n| n.is_finite()) {
                 cards.push(format!("{key:<8}= {value:>20.12E}"));

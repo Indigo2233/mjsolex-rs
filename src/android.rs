@@ -19,17 +19,20 @@ use crate::android_document::DocumentFile;
 use crate::reconstruct::{MAX_DOPPLER_WING_PIXELS, MAX_PIXELS};
 use crate::ser::cache_recording;
 use crate::{
-    APP_NAME, ByteOrder, DiskGeometry, DisplayImage, Error, FitsMetadata, Header, LineProfile,
-    Observation, OpticalSetup, PhysicalFlat, Product, Reconstruction, SerReader, Spectrum, Stretch,
-    Trace, reconstruct_offsets, reconstruct_with_stride,
+    APP_NAME, BandingAxis, ByteOrder, DiskGeometry, DisplayImage, Error, FitsMetadata, Framing,
+    Header, LineProfile, LocalContrast, Observation, OpticalSetup, PhysicalFlat, Product,
+    Reconstruction, ScanSettings, SerReader, Spectrum, Stretch, Trace, reconstruct_offsets,
+    reconstruct_with_stride,
 };
 
 mod language;
+mod postprocess;
 mod results;
 mod ui;
 
 use language::{Language, Notice};
-use results::{Export, Images, PALETTES};
+use postprocess::{CorrectionWarnings, ProcessingOptions};
+use results::{Export, Images, PALETTES, View};
 
 const OPEN_SER: i32 = 10;
 const SAVE_PNG: i32 = 11;
@@ -78,7 +81,7 @@ enum Work {
         preview: ColorImage,
         warning: Option<Notice>,
     },
-    Previewed(Product, ColorImage),
+    Previewed(View, ColorImage),
     Exported(String),
     BatchExported {
         saved: usize,
@@ -109,7 +112,7 @@ struct Scan {
 
 struct Output {
     images: Arc<Images>,
-    shown: Product,
+    shown: View,
     texture: TextureHandle,
 }
 
@@ -187,7 +190,7 @@ struct Mobile {
     shift: f64,
     calibration: Calibration,
     stride: u32,
-    correct_disk: bool,
+    processing: ProcessingOptions,
     flat_mode: FlatMode,
     physical_flat: Option<(Arc<PhysicalFlat>, String)>,
     palettes: [bool; 3],
@@ -401,7 +404,7 @@ impl Mobile {
             shift: 0.,
             calibration: Calibration::default(),
             stride: 1,
-            correct_disk: false,
+            processing: ProcessingOptions::default(),
             flat_mode: FlatMode::default(),
             physical_flat: None,
             palettes: [true, false, false],
@@ -646,7 +649,7 @@ impl Mobile {
         };
         let order = scan.byte_order;
         let header = scan.header;
-        let correct_disk = self.correct_disk;
+        let processing = self.processing;
         let synthetic_flat = self.flat_mode == FlatMode::Synthetic;
         let physical_flat = if self.flat_mode == FlatMode::Physical {
             self.physical_flat.clone()
@@ -663,8 +666,7 @@ impl Mobile {
             line_center_angstrom: (wavelength > 0.).then_some(wavelength),
             dispersion_angstrom: dispersion,
             fwhm_pixels: self.profile.as_ref().and_then(|p| p.fit).map(|f| f.fwhm),
-            geometry: None,
-            flat_file: None,
+            ..FitsMetadata::default()
         };
         self.start_job(
             ("Reconstructing scan", "正在重建图像"),
@@ -678,11 +680,11 @@ impl Mobile {
                 }
                 metadata.observation = reader.observation().clone();
                 let mut progress = report(events, cancel);
-                let geometry_start = if correct_disk { 0.85 } else { 0.98 };
+                let corrections_start = 0.8;
                 let flat_start = if synthetic_flat || physical_flat.is_some() {
-                    geometry_start - 0.10
+                    corrections_start - 0.10
                 } else {
-                    geometry_start
+                    corrections_start
                 };
                 let (mut raw, mut wings) = if let Some(wing) = wing_shift {
                     let [center, red, blue] = reconstruct_offsets(
@@ -700,14 +702,17 @@ impl Mobile {
                     (center, None)
                 };
                 drop(reader);
-                let mut flat_error = None;
+                let mut warnings = CorrectionWarnings {
+                    doppler: doppler_error,
+                    ..CorrectionWarnings::default()
+                };
                 if synthetic_flat {
                     match raw.correct_synthetic_flat(|p| {
-                        progress(flat_start + p * (geometry_start - flat_start))
+                        progress(flat_start + p * (corrections_start - flat_start))
                     }) {
                         Ok(_) => {}
                         Err(Error::Cancelled) => return Err(Error::Cancelled),
-                        Err(error) => flat_error = Some(error),
+                        Err(error) => warnings.flat = Some(error),
                     }
                 } else if let Some((flat, name)) = physical_flat {
                     flat.apply(&mut raw)?;
@@ -718,61 +723,29 @@ impl Mobile {
                     }
                     metadata.flat_file = Some(name);
                 }
-                if !progress(geometry_start) {
+                if !progress(corrections_start) {
                     return Err(Error::Cancelled);
                 }
-                let mut disk_error = None;
-                if correct_disk {
-                    let corrected = (|| {
-                        let geometry = DiskGeometry::fit(&raw)?;
-                        let span = if wings.is_some() { 0.13 / 3. } else { 0.13 };
-                        let budget = if wings.is_some() {
-                            MAX_DOPPLER_WING_PIXELS
-                        } else {
-                            MAX_PIXELS
-                        };
-                        let mut correct = |image, step| {
-                            geometry.correct_with_budget(image, budget, |p| {
-                                progress(geometry_start + (step + p) * span)
-                            })
-                        };
-                        let center = correct(&raw, 0.)?;
-                        let wings = wings
-                            .as_ref()
-                            .map(|[red, blue]| {
-                                Ok::<_, Error>([correct(red, 1.)?, correct(blue, 2.)?])
-                            })
-                            .transpose()?;
-                        Ok::<_, Error>((geometry, center, wings))
-                    })();
-                    match corrected {
-                        Ok((geometry, corrected_center, corrected_wings)) => {
-                            metadata.geometry = Some(geometry);
-                            raw = corrected_center;
-                            wings = corrected_wings;
-                        }
-                        Err(Error::Cancelled) => return Err(Error::Cancelled),
-                        Err(error) => disk_error = Some(error),
-                    }
-                }
-                let images = Images {
+                let mut images = Images {
                     center: raw,
                     wings,
                     palettes,
                     wing_offset,
                     metadata,
+                    enhancement: None,
                 };
-                let preview = images.preview(Product::Gray)?;
+                postprocess::finish(&mut images, processing, &mut warnings, |p| {
+                    progress(corrections_start + 0.18 * p)
+                })?;
+                let preview = images.preview(View::GRAY)?;
                 if !progress(1.) {
                     return Err(Error::Cancelled);
                 }
-                let warning =
-                    (flat_error.is_some() || disk_error.is_some() || doppler_error.is_some())
-                        .then_some(Notice::Corrections {
-                            flat: flat_error,
-                            disk: disk_error,
-                            doppler: doppler_error,
-                        });
+                let warning = warnings
+                    .entries()
+                    .iter()
+                    .any(|(error, ..)| error.is_some())
+                    .then(|| Notice::Corrections(Box::new(warnings)));
                 Ok(Work::Reconstructed {
                     images: Arc::new(images),
                     preview,
@@ -782,16 +755,16 @@ impl Mobile {
         );
     }
 
-    fn show_product(&mut self, product: Product) {
+    fn show_product(&mut self, view: View) {
         let Some(output) = &self.output else { return };
-        if output.shown == product || !output.images.products().any(|item| item == product) {
+        if output.shown == view || !output.images.views().any(|item| item == view) {
             return;
         }
         let images = output.images.clone();
         self.start_job(
             ("Preparing preview", "正在准备预览"),
             false,
-            move |_, _| Ok(Work::Previewed(product, images.preview(product)?)),
+            move |_, _| Ok(Work::Previewed(view, images.preview(view)?)),
         );
     }
 
@@ -929,7 +902,7 @@ impl Mobile {
                                 ctx.load_texture("reconstruction", preview, TextureOptions::LINEAR);
                             self.output = Some(Output {
                                 images,
-                                shown: Product::Gray,
+                                shown: View::GRAY,
                                 texture,
                             });
                             self.page = Page::Result;

@@ -185,7 +185,7 @@ impl DiskGeometry {
     }
 }
 
-fn limb_levels(pixels: &[u16]) -> Option<(u16, f64)> {
+pub(crate) fn limb_levels(pixels: &[u16]) -> Option<(u16, f64)> {
     let stride = pixels.len().div_ceil(100_000);
     let mut bins = vec![0u32; 65536];
     let count = pixels.len().div_ceil(stride);
@@ -204,7 +204,7 @@ fn limb_levels(pixels: &[u16]) -> Option<(u16, f64)> {
     (disk > sky + 6).then(|| (sky as u16, sky as f64 + (disk - sky) as f64 * 0.20))
 }
 
-fn chord_edges(row: &[u16], threshold: f64) -> Option<(f64, f64)> {
+pub(crate) fn chord_edges(row: &[u16], threshold: f64) -> Option<(f64, f64)> {
     let inside = |samples: &[u16]| samples.iter().all(|&value| f64::from(value) >= threshold);
     let left = row.windows(3).position(inside)?;
     let right = row.windows(3).rposition(inside)? + 2;

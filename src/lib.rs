@@ -1,14 +1,17 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod contrast;
 mod display;
 mod fits;
 mod flat;
+mod framing;
 mod geometry;
 mod observation;
 mod optics;
 mod profile;
 mod reconstruct;
 mod regression;
+mod scan_correction;
 mod ser;
 mod spectrum;
 
@@ -20,14 +23,17 @@ mod android;
 #[cfg(target_os = "android")]
 mod android_document;
 
+pub use contrast::LocalContrast;
 pub use display::{DisplayImage, Product, Stretch};
 pub use fits::FitsMetadata;
 pub use flat::PhysicalFlat;
+pub use framing::Framing;
 pub use geometry::DiskGeometry;
 pub use observation::Observation;
 pub use optics::OpticalSetup;
 pub use profile::{LineFit, LineProfile};
 pub use reconstruct::{Reconstruction, reconstruct, reconstruct_offsets, reconstruct_with_stride};
+pub use scan_correction::{BandingAxis, ScanReport, ScanSettings};
 pub use ser::{ByteOrder, ColorMode, Header, SerReader};
 pub use spectrum::{Spectrum, Trace};
 
@@ -47,6 +53,8 @@ pub enum Error {
     InvalidTrace,
     #[error("A complete solar limb could not be fitted.")]
     NoSolarLimb,
+    #[error("The rotation or crop settings are invalid.")]
+    InvalidFraming,
     #[error("Too few usable disk samples for synthetic flat correction.")]
     NoFlatSamples,
     #[error("The flat SER must match the scan dimensions, color mode and bit depth.")]

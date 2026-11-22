@@ -1,6 +1,6 @@
 use std::io::Write;
 
-use crate::{Error, Reconstruction};
+use crate::{Error, LocalContrast, Reconstruction};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Product {
@@ -72,6 +72,7 @@ pub struct DisplayImage<'a> {
     blue: Option<&'a Reconstruction>,
     product: Product,
     stretch: Stretch,
+    local: Option<&'a LocalContrast>,
     palette: [[u8; 3]; 256],
 }
 
@@ -81,17 +82,40 @@ impl<'a> DisplayImage<'a> {
         blue: Option<&'a Reconstruction>,
         product: Product,
     ) -> Result<Self, Error> {
+        Self::with_map(image, blue, product, None)
+    }
+
+    pub fn enhanced(
+        image: &'a Reconstruction,
+        product: Product,
+        local: &'a LocalContrast,
+    ) -> Result<Self, Error> {
+        Self::with_map(image, None, product, Some(local))
+    }
+
+    fn with_map(
+        image: &'a Reconstruction,
+        blue: Option<&'a Reconstruction>,
+        product: Product,
+        local: Option<&'a LocalContrast>,
+    ) -> Result<Self, Error> {
         if (product == Product::Doppler) != blue.is_some()
             || blue.is_some_and(|other| {
                 (other.width(), other.height()) != (image.width(), image.height())
             })
+            || local.is_some_and(|map| map.size != [image.width(), image.height()])
         {
             return Err(Error::InvalidTrace);
         }
-        let stretch = Stretch::estimate(image.width(), image.height(), |i| {
-            let red = image.pixels()[i];
-            blue.map_or(red, |wing| red.midpoint(wing.pixels()[i]))
-        });
+        let stretch = local.map_or_else(
+            || {
+                Stretch::estimate(image.width(), image.height(), |i| {
+                    let red = image.pixels()[i];
+                    blue.map_or(red, |wing| red.midpoint(wing.pixels()[i]))
+                })
+            },
+            |map| map.stretch,
+        );
         let palette = std::array::from_fn(|gray| {
             let level = gray as f32 / 255.;
             let gray = gray as u8;
@@ -108,6 +132,7 @@ impl<'a> DisplayImage<'a> {
             blue,
             product,
             stretch,
+            local,
             palette,
         })
     }
@@ -129,7 +154,10 @@ impl<'a> DisplayImage<'a> {
                 (level * (1. - signal).clamp(0.2, 1.5)).min(255.) as u8,
             ];
         }
-        self.palette[self.stretch.map(red) as usize]
+        let gray = self
+            .local
+            .map_or_else(|| self.stretch.map(red), |map| map.map(index, red));
+        self.palette[gray as usize]
     }
 
     pub fn write_png(&self, output: impl Write) -> Result<(), Error> {

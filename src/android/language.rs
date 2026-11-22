@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use eframe::egui::{Context, FontData, FontDefinitions};
 
+use super::CorrectionWarnings;
 use crate::Error;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,7 @@ impl Language {
             Error::NoLine => "未找到可靠的吸收线。请在光谱图中点选一条暗线。".into(),
             Error::InvalidTrace => "谱线或采样偏移超出录制范围。".into(),
             Error::NoSolarLimb => "无法拟合完整的太阳边缘。".into(),
+            Error::InvalidFraming => "旋转或裁切设置无效。".into(),
             Error::NoFlatSamples => "用于估计合成平场的盘内样本不足。".into(),
             Error::FlatMismatch => "平场 SER 的尺寸、颜色模式和位深必须与扫描文件一致。".into(),
             Error::InvalidPhysicalFlat => "平场 SER 未能充分照亮整条狭缝。".into(),
@@ -89,16 +91,9 @@ pub(super) enum Notice {
     SharedRecording(String),
     IndigoUnavailable,
     IndigoLaunch(String),
-    Corrections {
-        flat: Option<Error>,
-        disk: Option<Error>,
-        doppler: Option<Error>,
-    },
+    Corrections(Box<CorrectionWarnings>),
     Saved(String),
-    BatchSaved {
-        saved: usize,
-        error: Option<Error>,
-    },
+    BatchSaved { saved: usize, error: Option<Error> },
     SaveLanguage(String),
 }
 
@@ -167,32 +162,17 @@ impl Notice {
             Self::IndigoLaunch(detail) => {
                 with_detail("Cannot open Indigo Observatory", "无法打开靛空台", detail)
             }
-            Self::Corrections {
-                flat,
-                disk,
-                doppler,
-            } => [
-                (
-                    flat,
-                    language.text("Synthetic flat skipped. ", "已跳过合成平场。"),
-                ),
-                (
-                    disk,
-                    language.text("Disk correction skipped. ", "已跳过太阳盘几何校正。"),
-                ),
-                (
-                    doppler,
-                    language.text("Doppler image skipped. ", "已跳过双翼多普勒图。"),
-                ),
-            ]
-            .into_iter()
-            .filter_map(|(error, prefix)| {
-                error
-                    .as_ref()
-                    .map(|e| format!("{prefix}{}", language.error(e)))
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+            Self::Corrections(warnings) => warnings
+                .entries()
+                .into_iter()
+                .filter_map(|(error, english, chinese)| {
+                    let prefix = language.text(english, chinese);
+                    error
+                        .as_ref()
+                        .map(|e| format!("{prefix}{}", language.error(e)))
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
             Self::Saved(name) => {
                 let prefix = language.text("Saved ", "已保存 ");
                 format!("{prefix}{name}")

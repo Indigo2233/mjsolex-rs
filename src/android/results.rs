@@ -8,11 +8,25 @@ pub(super) struct Images {
     pub(super) palettes: [bool; 3],
     pub(super) wing_offset: f64,
     pub(super) metadata: FitsMetadata,
+    pub(super) enhancement: Option<LocalContrast>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct View {
+    pub(super) product: Product,
+    pub(super) enhanced: bool,
+}
+
+impl View {
+    pub(super) const GRAY: Self = Self {
+        product: Product::Gray,
+        enhanced: false,
+    };
 }
 
 #[derive(Clone, Copy)]
 pub(super) enum Export {
-    Display(Product),
+    Display(View),
     RawPng,
     Fits,
 }
@@ -27,34 +41,53 @@ impl Export {
 }
 
 impl Images {
-    pub(super) fn products(&self) -> impl Iterator<Item = Product> + '_ {
-        std::iter::once(Product::Gray)
+    pub(super) fn views(&self) -> impl Iterator<Item = View> + '_ {
+        let intensity = std::iter::once(Product::Gray).chain(
+            PALETTES
+                .into_iter()
+                .zip(self.palettes)
+                .filter_map(|(product, selected)| selected.then_some(product)),
+        );
+        intensity
+            .clone()
+            .map(|product| View {
+                product,
+                enhanced: false,
+            })
             .chain(
-                PALETTES
-                    .into_iter()
-                    .zip(self.palettes)
-                    .filter_map(|(product, selected)| selected.then_some(product)),
+                intensity
+                    .filter(|_| self.enhancement.is_some())
+                    .map(|product| View {
+                        product,
+                        enhanced: true,
+                    }),
             )
-            .chain(self.wings.as_ref().map(|_| Product::Doppler))
+            .chain(self.wings.as_ref().map(|_| View {
+                product: Product::Doppler,
+                enhanced: false,
+            }))
     }
 
     pub(super) fn exports(&self) -> impl Iterator<Item = Export> + '_ {
-        self.products()
+        self.views()
             .map(Export::Display)
             .chain([Export::RawPng, Export::Fits])
     }
 
-    fn display(&self, product: Product) -> Result<DisplayImage<'_>, Error> {
-        if product == Product::Doppler {
+    fn display(&self, view: View) -> Result<DisplayImage<'_>, Error> {
+        if view.enhanced {
+            let enhancement = self.enhancement.as_ref().ok_or(Error::InvalidTrace)?;
+            DisplayImage::enhanced(&self.center, view.product, enhancement)
+        } else if view.product == Product::Doppler {
             let [red, blue] = self.wings.as_ref().ok_or(Error::DopplerCoverage)?;
-            DisplayImage::new(red, Some(blue), product)
+            DisplayImage::new(red, Some(blue), view.product)
         } else {
-            DisplayImage::new(&self.center, None, product)
+            DisplayImage::new(&self.center, None, view.product)
         }
     }
 
-    pub(super) fn preview(&self, product: Product) -> Result<ColorImage, Error> {
-        let display = self.display(product)?;
+    pub(super) fn preview(&self, view: View) -> Result<ColorImage, Error> {
+        let display = self.display(view)?;
         Ok(preview_rgb(
             self.center.width(),
             self.center.height(),
@@ -81,8 +114,13 @@ impl Images {
             .and_then(|name| Path::new(name).file_stem())
             .and_then(|name| name.to_str())
             .unwrap_or("scan");
-        let synthetic = !matches!(export, Export::Display(Product::Doppler))
-            && self.center.has_synthetic_flat();
+        let synthetic = !matches!(
+            export,
+            Export::Display(View {
+                product: Product::Doppler,
+                ..
+            })
+        ) && self.center.has_synthetic_flat();
         let flat = if synthetic || self.metadata.flat_file.is_some() {
             "-flat"
         } else {
@@ -100,12 +138,39 @@ impl Images {
             .map(|shift| format!("-{shift:+.2}px"))
             .unwrap_or_default();
         let suffix = match export {
-            Export::Display(Product::Doppler) => format!("-doppler-w{:.2}px.png", self.wing_offset),
-            Export::Display(product) => format!("{}-display.png", product.suffix()),
+            Export::Display(View {
+                product: Product::Doppler,
+                ..
+            }) => format!("-doppler-w{:.2}px.png", self.wing_offset),
+            Export::Display(view) if view.enhanced => {
+                format!("{}-enhanced.png", view.product.suffix())
+            }
+            Export::Display(view) => format!("{}-display.png", view.product.suffix()),
             Export::RawPng => "-raw.png".into(),
             Export::Fits => ".fits".into(),
         };
         format!("{stem}-reconstruction{shift}{flat}{disk}{suffix}")
+    }
+
+    pub(super) fn count(&self) -> usize {
+        if self.wings.is_some() { 3 } else { 1 }
+    }
+
+    /// Commit matching geometry to the center and both wings only after all
+    /// resampling succeeds.
+    pub(super) fn transform(
+        &mut self,
+        mut transform: impl FnMut(&Reconstruction, usize) -> Result<Reconstruction, Error>,
+    ) -> Result<(), Error> {
+        let center = transform(&self.center, 0)?;
+        let wings = self
+            .wings
+            .as_ref()
+            .map(|[red, blue]| Ok::<_, Error>([transform(red, 1)?, transform(blue, 2)?]))
+            .transpose()?;
+        self.center = center;
+        self.wings = wings;
+        Ok(())
     }
 }
 

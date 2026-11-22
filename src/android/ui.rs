@@ -21,6 +21,19 @@ fn product_label(product: Product, lang: Language) -> &'static str {
     }
 }
 
+fn view_label(view: View, lang: Language) -> &'static str {
+    if !view.enhanced {
+        return product_label(view.product, lang);
+    }
+    match view.product {
+        Product::Gray => lang.text("Enhanced grayscale", "增强灰度"),
+        Product::Hydrogen => lang.text("Enhanced Hα", "增强 Hα 假彩色"),
+        Product::Calcium => lang.text("Enhanced Ca II", "增强 Ca II 假彩色"),
+        Product::Helium => lang.text("Enhanced He I", "增强 He I 假彩色"),
+        Product::Doppler => product_label(view.product, lang),
+    }
+}
+
 fn flat_label(mode: FlatMode, lang: Language) -> &'static str {
     match mode {
         FlatMode::Off => lang.text("Off", "关闭"),
@@ -434,6 +447,10 @@ impl Mobile {
                         }
                     }
                 });
+                ui.checkbox(
+                    &mut self.processing.enhance,
+                    lang.text("Enhanced images (local contrast)", "增强图（局部对比度）"),
+                );
                 if self.doppler {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
@@ -521,10 +538,14 @@ impl Mobile {
             ui.add_enabled(
                 !busy,
                 egui::Checkbox::new(
-                    &mut self.correct_disk,
+                    &mut self.processing.correct_disk,
                     lang.text("Correct full-disk geometry", "校正太阳盘几何形状"),
                 ),
             );
+            ui.add_enabled_ui(!busy, |ui| {
+                scan_options(ui, &mut self.processing.scan, lang);
+                framing_options(ui, &mut self.processing.framing, lang);
+            });
             let minimum = self.minimum_stride(header);
             let mut stride = self.stride.max(minimum);
             if minimum > 1 || stride > 1 {
@@ -571,11 +592,11 @@ impl Mobile {
         let mut clicked = None;
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                for product in images.products() {
-                    let button = egui::Button::new(product_label(product, lang))
-                        .selected(output.shown == product);
+                for view in images.views() {
+                    let button =
+                        egui::Button::new(view_label(view, lang)).selected(output.shown == view);
                     if ui.add_enabled(!busy, button).clicked() {
-                        clicked = Some(product);
+                        clicked = Some(view);
                     }
                 }
             });
@@ -586,7 +607,7 @@ impl Mobile {
                 Language::Chinese => format!("{w} × {h} px · 偏移 {shift:+.2} px"),
             };
             ui.label(RichText::new(size).color(MUTED));
-            if output.shown == Product::Doppler {
+            if output.shown.product == Product::Doppler {
                 let offset = images.wing_offset;
                 let label = match lang {
                     Language::English => format!("Wings ±{offset:.2} px · qualitative contrast"),
@@ -597,10 +618,36 @@ impl Mobile {
             if let Some(name) = &images.metadata.flat_file {
                 let label = lang.text("Captured flat applied", "已应用实拍平场");
                 ui.label(RichText::new(format!("{label} · {name}")).color(MUTED));
-            } else if output.shown != Product::Doppler && images.center.has_synthetic_flat() {
+            } else if output.shown.product != Product::Doppler && images.center.has_synthetic_flat()
+            {
                 ui.label(
                     RichText::new(lang.text("Synthetic flat applied", "已应用虚拟平场"))
                         .color(MUTED),
+                );
+            }
+            let report = images.metadata.scan_corrections;
+            if report.banding != BandingAxis::Off || report.jagged || report.oscillation.is_some() {
+                ui.collapsing(
+                    lang.text("Applied scan corrections", "已应用的扫描校正"),
+                    |ui| {
+                        if report.banding != BandingAxis::Off {
+                            ui.label(lang.text("Banding correction", "条带校正"));
+                        }
+                        if report.jagged {
+                            ui.label(lang.text("Jagged limb correction", "盘缘锯齿校正"));
+                        }
+                        if let Some((period, amplitude)) = report.oscillation {
+                            let details = match lang {
+                                Language::English => {
+                                    format!("Oscillation · {period:.1} rows · {amplitude:.2} px")
+                                }
+                                Language::Chinese => {
+                                    format!("周期抖动 · {period:.1} 行 · {amplitude:.2} px")
+                                }
+                            };
+                            ui.label(details);
+                        }
+                    },
                 );
             }
             picture(ui, &output.texture, w, h, 0. ..=430., Sense::hover());
@@ -657,6 +704,81 @@ impl Mobile {
             Page::Scan => {}
         }
     }
+}
+
+fn scan_options(ui: &mut Ui, scan: &mut ScanSettings, lang: Language) {
+    ui.collapsing(lang.text("Scan artifacts", "扫描伪影校正"), |ui| {
+        ui.label(lang.text("Banding before rotation", "旋转前的条带方向"));
+        ui.horizontal_wrapped(|ui| {
+            for (axis, label) in [
+                (BandingAxis::Off, lang.text("Off", "关闭")),
+                (BandingAxis::Slit, lang.text("Vertical", "竖条")),
+                (BandingAxis::Scan, lang.text("Horizontal", "横条")),
+            ] {
+                if ui
+                    .add(egui::Button::new(label).selected(scan.banding == axis))
+                    .clicked()
+                {
+                    scan.banding = axis;
+                }
+            }
+        });
+        ui.checkbox(
+            &mut scan.oscillation,
+            lang.text("Periodic mount oscillation", "装架周期抖动"),
+        );
+        ui.checkbox(&mut scan.jagged, lang.text("Jagged solar limb", "盘缘锯齿"));
+    });
+}
+
+fn framing_options(ui: &mut Ui, framing: &mut Framing, lang: Language) {
+    ui.collapsing(lang.text("Orientation and crop", "方向与裁切"), |ui| {
+        ui.horizontal_wrapped(|ui| {
+            ui.checkbox(
+                &mut framing.flip_x,
+                lang.text("Flip left/right", "左右翻转"),
+            );
+            ui.checkbox(&mut framing.flip_y, lang.text("Flip up/down", "上下翻转"));
+        });
+        ui.label(lang.text("Clockwise rotation", "顺时针旋转"));
+        ui.horizontal_wrapped(|ui| {
+            for step in [-90., 90.] {
+                if ui.button(format!("{step:+.0}°")).clicked() {
+                    framing.rotation_deg =
+                        (framing.rotation_deg + step + 180.).rem_euclid(360.) - 180.;
+                }
+            }
+            ui.add(
+                egui::DragValue::new(&mut framing.rotation_deg)
+                    .range(-180. ..=180.)
+                    .speed(0.25)
+                    .suffix("°"),
+            );
+        });
+        ui.label(lang.text("Crop to disk diameter", "按盘面直径裁切"));
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add(
+                    egui::Button::new(lang.text("Off", "关闭"))
+                        .selected(framing.crop_factor.is_none()),
+                )
+                .clicked()
+            {
+                framing.crop_factor = None;
+            }
+            for factor in [1.1, 1.2, 1.5] {
+                if ui
+                    .add(
+                        egui::Button::new(format!("{factor:.1}×"))
+                            .selected(framing.crop_factor == Some(factor)),
+                    )
+                    .clicked()
+                {
+                    framing.crop_factor = Some(factor);
+                }
+            }
+        });
+    });
 }
 
 fn centered<R>(ui: &mut Ui, contents: impl FnOnce(&mut Ui) -> R) -> R {
