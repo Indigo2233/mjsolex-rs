@@ -3,6 +3,13 @@ use crate::solar_atlas::{ReferenceProfile, reference_profile};
 
 const CYAN: Color32 = Color32::from_rgb(131, 208, 225);
 const ATLAS_COLOR: Color32 = Color32::from_rgb(194, 160, 255);
+const SPECTRAL_LINES: [(&str, f64); 5] = [
+    ("Hα", 6562.81),
+    ("Ca II K", 3933.66),
+    ("Ca II H", 3968.47),
+    ("Hβ", 4861.34),
+    ("He I D3", 5875.62),
+];
 
 fn product_label(product: Product, lang: Language) -> &'static str {
     match product {
@@ -336,14 +343,16 @@ impl Mobile {
         if let Some(profile) = &self.profile {
             card(ui, |ui| {
                 heading(ui, lang.text("Line profile", "谱线剖面"));
-                let reference = reference_profile(profile, self.wavelength, self.dispersion);
+                let wavelength = self.calibration.wavelength;
+                let dispersion = self.calibration.dispersion();
+                let reference = reference_profile(profile, wavelength, dispersion.unwrap_or(0.));
                 if let Some(fit) = profile.fit {
                     let label = lang.text("FWHM", "半高全宽");
-                    let width = if self.dispersion != 0. {
+                    let width = if let Some(dispersion) = dispersion {
                         format!(
                             "{label}  {:.2} px  ·  {:.3} Å",
                             fit.fwhm,
-                            fit.fwhm * self.dispersion.abs()
+                            fit.fwhm * dispersion.abs()
                         )
                     } else {
                         format!("{label}  {:.2} px", fit.fwhm)
@@ -389,10 +398,10 @@ impl Mobile {
                     }
                 }
                 if reference.is_none() {
-                    let hint = if self.wavelength == 0. || self.dispersion == 0. {
+                    let hint = if wavelength == 0. || dispersion.is_none() {
                         lang.text(
-                            "Set wavelength and dispersion to compare with BASS2000.",
-                            "填写波长和色散后可与 BASS2000 参考曲线对比。",
+                            "Select a line and set dispersion to compare with BASS2000.",
+                            "选择谱线并设定色散后，可与 BASS2000 参考曲线对比。",
                         )
                     } else {
                         lang.text(
@@ -402,13 +411,13 @@ impl Mobile {
                     };
                     ui.label(RichText::new(hint).color(MUTED));
                 }
-                wavelength_calibration(ui, &mut self.wavelength, &mut self.dispersion, lang, busy);
+                wavelength_calibration(ui, &mut self.calibration, lang, busy);
             });
         }
         card(ui, |ui| {
             heading(ui, lang.text("Processing options", "处理选项"));
             if self.profile.is_none() {
-                wavelength_calibration(ui, &mut self.wavelength, &mut self.dispersion, lang, busy);
+                wavelength_calibration(ui, &mut self.calibration, lang, busy);
             }
             ui.add_enabled_ui(!busy, |ui| {
                 ui.label(lang.text("Image product", "图像产品"));
@@ -440,11 +449,11 @@ impl Mobile {
                                 .suffix(" px"),
                         );
                     });
-                    let (hint, color) = if self.dispersion == 0. {
+                    let (hint, color) = if self.calibration.dispersion().is_none() {
                         (
                             lang.text(
-                                "Set signed dispersion in Wavelength calibration.",
-                                "请在波长标定中填写带正负号的色散。",
+                                "Set dispersion and its direction in Wavelength calibration.",
+                                "请在波长标定中设定色散和方向。",
                             ),
                             AMBER,
                         )
@@ -710,44 +719,166 @@ fn offset_controls(ui: &mut Ui, shift: &mut f64, limit: f64, busy: bool, lang: L
     });
 }
 
-fn wavelength_calibration(
-    ui: &mut Ui,
-    wavelength: &mut f64,
-    dispersion: &mut f64,
-    lang: Language,
-    busy: bool,
-) {
+fn wavelength_calibration(ui: &mut Ui, calibration: &mut Calibration, lang: Language, busy: bool) {
     egui::CollapsingHeader::new(
         RichText::new(lang.text("Wavelength calibration", "波长标定")).strong(),
     )
     .id_salt("wavelength_calibration")
     .show(ui, |ui| {
         ui.add_enabled_ui(!busy, |ui| {
-            ui.label(lang.text("Zero-offset wavelength (Å)", "零偏移波长（Å）"));
-            ui.add(
-                egui::DragValue::new(wavelength)
-                    .range(0. ..=100_000.)
-                    .speed(0.02)
-                    .max_decimals(4)
-                    .custom_formatter(move |value, _| optional_number(value, lang)),
-            );
-            ui.label(lang.text("Dispersion (Å/px)", "色散（Å/px）"));
-            ui.add(
-                egui::DragValue::new(dispersion)
-                    .range(-50. ..=50.)
-                    .speed(0.001)
-                    .max_decimals(5)
-                    .custom_formatter(move |value, _| optional_number(value, lang)),
-            );
-            ui.label(
-                RichText::new(lang.text(
+            ui.label(lang.text("Selected absorption line", "所选谱线"));
+            ui.horizontal_wrapped(|ui| {
+                for (label, wavelength) in SPECTRAL_LINES {
+                    let selected = !calibration.custom_wavelength && calibration.wavelength == wavelength;
+                    if ui.add(egui::Button::new(label).selected(selected)).clicked() {
+                        calibration.custom_wavelength = false;
+                        calibration.wavelength = wavelength;
+                    }
+                }
+                let custom = egui::Button::new(lang.text("Custom", "自定义"))
+                    .selected(calibration.custom_wavelength);
+                if ui.add(custom).clicked() {
+                    calibration.custom_wavelength = true;
+                }
+            });
+            if calibration.custom_wavelength {
+                ui.label(lang.text("Zero-offset wavelength (Å)", "零偏移波长（Å）"));
+                ui.add(
+                    egui::DragValue::new(&mut calibration.wavelength)
+                        .range(0. ..=100_000.)
+                        .speed(0.02)
+                        .max_decimals(4)
+                        .custom_formatter(move |value, _| optional_number(value, lang)),
+                );
+            } else if calibration.wavelength > 0. {
+                let label = lang.text("Reference wavelength", "参考波长");
+                ui.label(RichText::new(format!("{label}  {:.2} Å", calibration.wavelength)).color(MUTED));
+            }
+            ui.collapsing(lang.text("Tell Ca II K from H", "区分 Ca II K 和 H"), |ui| {
+                ui.label(lang.text(
+                    "Ca II K is at 3933.66 Å and Ca II H is at 3968.47 Å. Look for Hε at 3970.07 Å, about 1.60 Å to the red of Ca II H. For a narrow crop, check the recorded wavelength band.",
+                    "Ca II K 在 3933.66 Å，Ca II H 在 3968.47 Å。Hε 在 3970.07 Å，距 Ca II H 红侧约 1.60 Å。窄幅录制时请核对拍摄波段。",
+                ));
+            });
+
+            ui.label(lang.text("Dispersion source", "色散来源"));
+            ui.horizontal_wrapped(|ui| {
+                for (label, optical) in [
+                    (lang.text("Manual", "手动输入"), false),
+                    (lang.text("Optical setup", "光学参数"), true),
+                ] {
+                    if ui.add(egui::Button::new(label).selected(calibration.use_optics == optical)).clicked() {
+                        calibration.use_optics = optical;
+                    }
+                }
+            });
+            if calibration.use_optics {
+                optical_calibration(ui, calibration, lang);
+            } else {
+                ui.label(lang.text("Dispersion (Å/px)", "色散（Å/px）"));
+                ui.add(
+                    egui::DragValue::new(&mut calibration.manual_dispersion)
+                        .range(-50. ..=50.)
+                        .speed(0.001)
+                        .max_decimals(5)
+                        .custom_formatter(move |value, _| optional_number(value, lang)),
+                );
+                ui.label(RichText::new(lang.text(
                     "Use negative dispersion if wavelength decreases down the frame.",
                     "如果波长从画面顶部向底部递减，请输入负色散。",
-                ))
-                .color(MUTED),
-            );
+                )).color(MUTED));
+            }
         });
     });
+}
+
+fn optical_calibration(ui: &mut Ui, calibration: &mut Calibration, lang: Language) {
+    let optics = &mut calibration.optics;
+    if ui
+        .button(lang.text("Use standard Sol'Ex optics", "填入标准 Sol'Ex 光路"))
+        .clicked()
+    {
+        optics.lines_per_mm = 2400.;
+        optics.order = 1;
+        optics.included_angle_deg = 34.;
+        optics.camera_focal_length_mm = 125.;
+    }
+    egui::Grid::new("optical_setup")
+        .num_columns(2)
+        .show(ui, |ui| {
+            ui.label(lang.text("Grating (lines/mm)", "光栅刻线（条/mm）"));
+            ui.add(
+                egui::DragValue::new(&mut optics.lines_per_mm)
+                    .range(0. ..=12000.)
+                    .speed(10.),
+            );
+            ui.end_row();
+            ui.label(lang.text("Diffraction order", "衍射级次"));
+            ui.add(egui::DragValue::new(&mut optics.order).range(1..=16));
+            ui.end_row();
+            ui.label(lang.text("Angle between arms (°)", "光臂夹角（°）"));
+            ui.add(
+                egui::DragValue::new(&mut optics.included_angle_deg)
+                    .range(0. ..=179.9)
+                    .speed(0.1),
+            );
+            ui.end_row();
+            ui.label(lang.text("Camera focal length (mm)", "成像镜焦距（mm）"));
+            ui.add(
+                egui::DragValue::new(&mut optics.camera_focal_length_mm)
+                    .range(0. ..=2000.)
+                    .speed(0.5),
+            );
+            ui.end_row();
+            ui.label(lang.text("Sensor pixel (µm)", "相机像元（µm）"));
+            ui.add(
+                egui::DragValue::new(&mut optics.pixel_size_um)
+                    .range(0. ..=100.)
+                    .speed(0.02),
+            );
+            ui.end_row();
+            ui.label(lang.text("Spectral binning", "波长方向像元合并"));
+            ui.add(egui::DragValue::new(&mut optics.spectral_binning).range(1..=16));
+            ui.end_row();
+        });
+    ui.label(lang.text(
+        "Wavelength from top to bottom",
+        "从画面顶部到下方的波长方向",
+    ));
+    ui.horizontal_wrapped(|ui| {
+        for (increasing, label) in [
+            (true, lang.text("Increases (+)", "递增（+）")),
+            (false, lang.text("Decreases (−)", "递减（−）")),
+        ] {
+            if ui
+                .add(
+                    egui::Button::new(label)
+                        .selected(calibration.increases_downward == Some(increasing)),
+                )
+                .clicked()
+            {
+                calibration.increases_downward = Some(increasing);
+            }
+        }
+    });
+    let result = if let Some(dispersion) = calibration.dispersion() {
+        let label = lang.text("Estimated dispersion", "估算色散");
+        format!("{label} {dispersion:+.5} Å/px")
+    } else if calibration
+        .optics
+        .dispersion_angstrom(calibration.wavelength)
+        .is_some()
+    {
+        lang.text("Select the wavelength direction.", "请选择波长方向。")
+            .to_owned()
+    } else {
+        lang.text(
+            "Select a line and enter compatible optical parameters.",
+            "请选择谱线并填写有效的光学参数。",
+        )
+        .to_owned()
+    };
+    ui.label(RichText::new(result).color(AMBER));
 }
 
 fn optional_number(value: f64, lang: Language) -> String {

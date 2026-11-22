@@ -20,8 +20,8 @@ use crate::reconstruct::{MAX_DOPPLER_WING_PIXELS, MAX_PIXELS};
 use crate::ser::cache_recording;
 use crate::{
     APP_NAME, ByteOrder, DiskGeometry, DisplayImage, Error, FitsMetadata, Header, LineProfile,
-    Observation, PhysicalFlat, Product, Reconstruction, SerReader, Spectrum, Stretch, Trace,
-    reconstruct_with_stride,
+    Observation, OpticalSetup, PhysicalFlat, Product, Reconstruction, SerReader, Spectrum, Stretch,
+    Trace, reconstruct_with_stride,
 };
 
 mod language;
@@ -133,6 +133,33 @@ struct Job {
     cancellable: bool,
 }
 
+#[derive(Default)]
+struct Calibration {
+    wavelength: f64,
+    custom_wavelength: bool,
+    manual_dispersion: f64,
+    use_optics: bool,
+    optics: OpticalSetup,
+    increases_downward: Option<bool>,
+}
+
+impl Calibration {
+    fn dispersion(&self) -> Option<f64> {
+        if self.use_optics {
+            let increasing = self.increases_downward?;
+            let magnitude = self.optics.dispersion_angstrom(self.wavelength)?;
+            return Some(if increasing { magnitude } else { -magnitude });
+        }
+        let value = self.manual_dispersion;
+        (value.is_finite() && value != 0.).then_some(value)
+    }
+
+    fn clear_line(&mut self) {
+        self.wavelength = 0.;
+        self.custom_wavelength = false;
+    }
+}
+
 struct Mobile {
     vm: JavaVM,
     activity: GlobalRef,
@@ -146,8 +173,7 @@ struct Mobile {
     trace: Option<Trace>,
     profile: Option<LineProfile>,
     shift: f64,
-    wavelength: f64,
-    dispersion: f64,
+    calibration: Calibration,
     stride: u32,
     correct_disk: bool,
     flat_mode: FlatMode,
@@ -339,8 +365,7 @@ impl Mobile {
             trace: None,
             profile: None,
             shift: 0.,
-            wavelength: 0.,
-            dispersion: 0.,
+            calibration: Calibration::default(),
             stride: 1,
             correct_disk: false,
             flat_mode: FlatMode::default(),
@@ -586,16 +611,18 @@ impl Mobile {
         let product = self.product;
         let wing_offset = self.wing_offset;
         let shift = self.shift;
+        let dispersion = self.calibration.dispersion();
+        let wavelength = self.calibration.wavelength;
         let wings = if product == Product::Doppler {
-            if self.dispersion == 0. || !self.dispersion.is_finite() {
+            let Some(dispersion) = dispersion else {
                 self.note = Some(Notice::Processing(Error::DopplerDispersion));
                 return;
-            }
+            };
             if !scan.spectrum.supports_wings(trace, shift, wing_offset) {
                 self.note = Some(Notice::Processing(Error::DopplerCoverage));
                 return;
             }
-            Some(wing_offset.copysign(self.dispersion))
+            Some(wing_offset.copysign(dispersion))
         } else {
             None
         };
@@ -622,8 +649,8 @@ impl Mobile {
             source_header: Some(header),
             offset_pixels: Some(shift),
             frame_step: Some(stride),
-            line_center_angstrom: (self.wavelength > 0.).then_some(self.wavelength),
-            dispersion_angstrom: (self.dispersion != 0.).then_some(self.dispersion),
+            line_center_angstrom: (wavelength > 0.).then_some(wavelength),
+            dispersion_angstrom: dispersion,
             fwhm_pixels: self.profile.as_ref().and_then(|p| p.fit).map(|f| f.fwhm),
             geometry: None,
             flat_file: None,
@@ -828,8 +855,8 @@ impl Mobile {
                             self.profile = None;
                             self.set_trace(trace);
                             self.shift = 0.;
-                            self.wavelength = 0.;
-                            self.dispersion = 0.;
+                            self.calibration.clear_line();
+                            self.calibration.manual_dispersion = 0.;
                             self.stride = header.minimum_stride();
                             self.physical_flat = None;
                             if self.flat_mode == FlatMode::Physical {
@@ -878,7 +905,7 @@ impl Mobile {
         match result {
             Ok(trace) => {
                 if self.trace.is_some_and(|previous| previous != trace) {
-                    self.wavelength = 0.;
+                    self.calibration.clear_line();
                 }
                 self.trace = Some(trace);
                 self.profile = self

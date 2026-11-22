@@ -5,6 +5,7 @@ mod fits;
 mod flat;
 mod geometry;
 mod observation;
+mod optics;
 mod profile;
 mod reconstruct;
 mod regression;
@@ -24,6 +25,7 @@ pub use fits::FitsMetadata;
 pub use flat::PhysicalFlat;
 pub use geometry::DiskGeometry;
 pub use observation::Observation;
+pub use optics::OpticalSetup;
 pub use profile::{LineFit, LineProfile};
 pub use reconstruct::{Reconstruction, reconstruct, reconstruct_with_stride};
 pub use ser::{ByteOrder, ColorMode, Header, SerReader};
@@ -53,7 +55,7 @@ pub enum Error {
     InvalidPhysicalFlat,
     #[error("The scan must cover both wings at the selected Doppler offset.")]
     DopplerCoverage,
-    #[error("Set the signed wavelength dispersion before creating a Doppler image.")]
+    #[error("Set the wavelength dispersion and direction before creating a Doppler image.")]
     DopplerDispersion,
     #[error("The reconstruction exceeds the supported pixel budget.")]
     OutputTooLarge,

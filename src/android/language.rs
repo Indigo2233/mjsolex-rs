@@ -69,7 +69,7 @@ impl Language {
             Error::FlatMismatch => "平场 SER 的尺寸、颜色模式和位深必须与扫描文件一致。".into(),
             Error::InvalidPhysicalFlat => "平场 SER 未能充分照亮整条狭缝。".into(),
             Error::DopplerCoverage => "当前扫描无法覆盖所选偏移处的两侧谱翼。".into(),
-            Error::DopplerDispersion => "请先填写带正负号的波长色散。".into(),
+            Error::DopplerDispersion => "请先设定波长色散和方向。".into(),
             Error::OutputTooLarge => "重建图像的像素数超过上限。".into(),
             Error::InvalidStride => "帧间距至少为 1。".into(),
             Error::Allocation(_) => "可用内存不足，无法处理此录制。".into(),
