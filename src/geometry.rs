@@ -113,6 +113,15 @@ impl DiskGeometry {
     pub fn correct(
         self,
         image: &Reconstruction,
+        progress: impl FnMut(f32) -> bool,
+    ) -> Result<Reconstruction, Error> {
+        self.correct_with_budget(image, MAX_PIXELS, progress)
+    }
+
+    pub(crate) fn correct_with_budget(
+        self,
+        image: &Reconstruction,
+        max_pixels: usize,
         mut progress: impl FnMut(f32) -> bool,
     ) -> Result<Reconstruction, Error> {
         let scale = self.slit_radius / self.scan_radius;
@@ -126,7 +135,7 @@ impl DiskGeometry {
         let height = (((image.height - 1) as f64) * scale).ceil() as usize + 1;
         if width
             .checked_mul(height)
-            .is_none_or(|count| count > MAX_PIXELS)
+            .is_none_or(|count| count > max_pixels)
         {
             return Err(Error::OutputTooLarge);
         }
@@ -275,6 +284,27 @@ mod tests {
         let fitted = DiskGeometry::fit(&corrected).unwrap();
         assert!((fitted.scan_radius / fitted.slit_radius - 1.).abs() < 0.03);
         assert!(fitted.shear.abs() < 0.02);
+    }
+
+    #[test]
+    fn budgets_geometry_output_after_scaling() {
+        let raw = disk(80., 60.);
+        let geometry = DiskGeometry {
+            slit_radius: 70.,
+            scan_radius: 35.,
+            shear: 0.,
+        };
+        let budget = raw.width() * (2 * raw.height() - 1);
+        assert!(matches!(
+            geometry.correct_with_budget(&raw, budget - 1, |_| {
+                panic!("an oversized result must be rejected before resampling");
+            }),
+            Err(Error::OutputTooLarge)
+        ));
+        let corrected = geometry
+            .correct_with_budget(&raw, budget, |_| true)
+            .unwrap();
+        assert_eq!(corrected.pixels().len(), budget);
     }
 
     #[test]

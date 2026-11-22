@@ -55,7 +55,7 @@ pub enum Error {
     DopplerCoverage,
     #[error("Set the signed wavelength dispersion before creating a Doppler image.")]
     DopplerDispersion,
-    #[error("The reconstruction exceeds the supported 32 megapixels.")]
+    #[error("The reconstruction exceeds the supported pixel budget.")]
     OutputTooLarge,
     #[error("The frame interval must be at least one.")]
     InvalidStride,

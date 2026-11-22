@@ -176,6 +176,41 @@ fn captured_flat_corrects_slit_response_and_rejects_invalid_inputs() {
 }
 
 #[test]
+fn captured_flat_accepts_the_scan_byte_order_override() {
+    const WIDTH: u32 = 16;
+    const HEIGHT: u32 = 5;
+    // Both files declare big-endian but contain little-endian samples.
+    let mut science = ser_header(b"LUCAM-RECORDER", WIDTH, HEIGHT, 16, 1, 0);
+    let mut flat = science.clone();
+    for _ in 0..HEIGHT {
+        for x in 0..WIDTH {
+            let gain = if x < WIDTH / 2 { 1 } else { 2 };
+            science.extend((3000_u16 * gain).to_le_bytes());
+            flat.extend((1000_u16 * gain).to_le_bytes());
+        }
+    }
+    let order = Some(ByteOrder::Little);
+    let mut scan = SerReader::open_with_byte_order(Cursor::new(science), order).unwrap();
+    let spectrum = Spectrum::average(&mut scan, |_| true).unwrap();
+    let trace = Trace::constant(WIDTH as usize, 2.);
+    let mut raw = reconstruct(&mut scan, trace, 0., |_| true).unwrap();
+    let mut wrong_order = SerReader::open(Cursor::new(&flat)).unwrap();
+    PhysicalFlat::from_ser(&mut wrong_order, &spectrum, |_| true)
+        .unwrap()
+        .apply(&mut raw)
+        .unwrap();
+    assert_ne!(raw.pixels()[0], raw.pixels()[WIDTH as usize - 1]);
+
+    let mut raw = reconstruct(&mut scan, trace, 0., |_| true).unwrap();
+    let mut same_order = SerReader::open_with_byte_order(Cursor::new(&flat), order).unwrap();
+    PhysicalFlat::from_ser(&mut same_order, &spectrum, |_| true)
+        .unwrap()
+        .apply(&mut raw)
+        .unwrap();
+    assert!(raw.pixels().iter().all(|&sample| sample == 3000));
+}
+
+#[test]
 fn rejects_bad_headers_and_truncated_frames() {
     let mut truncated = mono(3, 2, 8, 2);
     truncated.extend([0; 11]);

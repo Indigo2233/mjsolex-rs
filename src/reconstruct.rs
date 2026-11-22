@@ -3,6 +3,7 @@ use std::io::{Read, Seek, Write};
 use crate::{Error, Header, SerReader, Trace};
 
 pub(crate) const MAX_PIXELS: usize = 32 * 1024 * 1024;
+pub(crate) const MAX_DOPPLER_WING_PIXELS: usize = MAX_PIXELS / 4;
 
 impl Header {
     /// Smallest interval that keeps a reconstruction within the pixel budget.
@@ -11,7 +12,7 @@ impl Header {
     }
 
     pub fn minimum_doppler_stride(self) -> u32 {
-        self.stride_for_budget(MAX_PIXELS / 4)
+        self.stride_for_budget(MAX_DOPPLER_WING_PIXELS)
     }
 
     fn stride_for_budget(self, budget: usize) -> u32 {

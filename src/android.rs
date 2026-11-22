@@ -16,6 +16,7 @@ use rustix::io::Errno;
 use winit::platform::android::activity::AndroidApp;
 
 use crate::android_document::DocumentFile;
+use crate::reconstruct::{MAX_DOPPLER_WING_PIXELS, MAX_PIXELS};
 use crate::ser::cache_recording;
 use crate::{
     APP_NAME, ByteOrder, DiskGeometry, DisplayImage, Error, FitsMetadata, Header, LineProfile,
@@ -545,12 +546,13 @@ impl Mobile {
         let Some(scan) = &self.scan else { return };
         let cache = self.cache.clone();
         let spectrum = scan.spectrum.clone();
+        let byte_order = scan.byte_order;
         self.start_job(
             ("Reading flat SER", "正在读取平场 SER"),
             true,
             move |events, cancel| {
                 let file = seekable_document(file, &cache, cancel)?;
-                let mut reader = SerReader::open(&file.file)?;
+                let mut reader = SerReader::open_with_byte_order(&file.file, byte_order)?;
                 let flat = PhysicalFlat::from_ser(&mut reader, &spectrum, report(events, cancel))?;
                 file.check_error()?;
                 Ok(Work::FlatImported(flat, name))
@@ -687,13 +689,20 @@ impl Mobile {
                     let corrected = (|| {
                         let geometry = DiskGeometry::fit(&raw)?;
                         let span = if blue.is_some() { 0.065 } else { 0.13 };
-                        let red =
-                            geometry.correct(&raw, |p| progress(geometry_start + p * span))?;
+                        let budget = if blue.is_some() {
+                            MAX_DOPPLER_WING_PIXELS
+                        } else {
+                            MAX_PIXELS
+                        };
+                        let red = geometry.correct_with_budget(&raw, budget, |p| {
+                            progress(geometry_start + p * span)
+                        })?;
                         let blue = blue
                             .as_ref()
                             .map(|wing| {
-                                geometry
-                                    .correct(wing, |p| progress(geometry_start + (1. + p) * span))
+                                geometry.correct_with_budget(wing, budget, |p| {
+                                    progress(geometry_start + (1. + p) * span)
+                                })
                             })
                             .transpose()?;
                         Ok::<_, Error>((geometry, red, blue))
