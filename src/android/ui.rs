@@ -367,6 +367,13 @@ impl Mobile {
             ui.add_enabled(
                 !busy,
                 egui::Checkbox::new(
+                    &mut self.synthetic_flat,
+                    lang.text("Synthetic flat correction", "合成平场校正"),
+                ),
+            );
+            ui.add_enabled(
+                !busy,
+                egui::Checkbox::new(
                     &mut self.correct_disk,
                     lang.text("Correct full-disk geometry", "校正太阳盘几何形状"),
                 ),
@@ -422,6 +429,12 @@ impl Mobile {
                 Language::Chinese => format!("{w} × {h} px · 偏移 {shift:+.2} px"),
             };
             ui.label(RichText::new(size).color(MUTED));
+            if output.image.has_synthetic_flat() {
+                ui.label(
+                    RichText::new(lang.text("Synthetic flat applied", "已应用合成平场"))
+                        .color(MUTED),
+                );
+            }
             picture(ui, &output.texture, w, h, 0. ..=430., Sense::hover());
             ui.label(
                 RichText::new(lang.text(

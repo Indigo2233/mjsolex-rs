@@ -12,17 +12,20 @@ use mjsolex::{
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args_os().skip(1);
     let (Some(input), Some(output)) = (args.next(), args.next()) else {
-        return Err("usage: reconstruct INPUT.ser OUTPUT.png|.fits [OFFSET_PIXELS] [--trace-row=ROW] [--step=STEP] [--byte-order=little|big] [--correct-disk]".into());
+        return Err("usage: reconstruct INPUT.ser OUTPUT.png|.fits [OFFSET_PIXELS] [--trace-row=ROW] [--step=STEP] [--byte-order=little|big] [--correct-disk] [--synthetic-flat]".into());
     };
     let mut offset = None;
     let mut row = None;
     let mut step = None;
     let mut order = None;
     let mut correct_disk = false;
+    let mut synthetic_flat = false;
     for arg in args {
         let arg = arg.to_str().ok_or("options must be valid UTF-8")?;
         if arg == "--correct-disk" && !correct_disk {
             correct_disk = true;
+        } else if arg == "--synthetic-flat" && !synthetic_flat {
+            synthetic_flat = true;
         } else if let Some(value) = arg.strip_prefix("--trace-row=")
             && row.is_none()
         {
@@ -69,7 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let shift = offset.unwrap_or(0.);
     let fit = spectrum.line_profile(trace).fit;
     drop(spectrum);
-    let raw = reconstruct_with_stride(&mut reader, trace, shift, step, |_| true)?;
+    let mut raw = reconstruct_with_stride(&mut reader, trace, shift, step, |_| true)?;
     let mut metadata = FitsMetadata {
         observation: reader.observation().clone(),
         source_header: Some(header),
@@ -80,6 +83,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..FitsMetadata::default()
     };
     drop(reader);
+    if synthetic_flat {
+        let start = std::time::Instant::now();
+        let applied = raw.correct_synthetic_flat(|_| true)?;
+        println!(
+            "Synthetic flat applied: {applied}, {:.2} ms",
+            start.elapsed().as_secs_f64() * 1_000.
+        );
+    }
     let image = if correct_disk {
         let disk = DiskGeometry::fit(&raw)?;
         metadata.geometry = Some(disk);

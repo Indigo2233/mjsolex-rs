@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod fits;
+mod flat;
 mod geometry;
 mod observation;
 mod profile;
@@ -41,6 +42,8 @@ pub enum Error {
     InvalidTrace,
     #[error("A complete solar limb could not be fitted.")]
     NoSolarLimb,
+    #[error("Too few usable disk samples for synthetic flat correction.")]
+    NoFlatSamples,
     #[error("The reconstruction exceeds the supported 32 megapixels.")]
     OutputTooLarge,
     #[error("The frame interval must be at least one.")]

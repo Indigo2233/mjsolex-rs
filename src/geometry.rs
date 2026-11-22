@@ -12,6 +12,13 @@ pub struct DiskGeometry {
     pub shear: f64,
 }
 
+pub(crate) struct FittedDisk {
+    pub(crate) geometry: DiskGeometry,
+    pub(crate) center_x: f64,
+    pub(crate) center_y: f64,
+    pub(crate) sky: u16,
+}
+
 struct Chord {
     row: f64,
     center: f64,
@@ -21,8 +28,12 @@ struct Chord {
 impl DiskGeometry {
     /// Fit the centers and squared half lengths of horizontal chords through the limb.
     pub fn fit(image: &Reconstruction) -> Result<Self, Error> {
+        Self::fit_limb(image).map(|disk| disk.geometry)
+    }
+
+    pub(crate) fn fit_limb(image: &Reconstruction) -> Result<FittedDisk, Error> {
         let (width, height) = (image.width, image.height);
-        let threshold = limb_threshold(&image.pixels).ok_or(Error::NoSolarLimb)?;
+        let (sky, threshold) = limb_levels(&image.pixels).ok_or(Error::NoSolarLimb)?;
         let x_scale = (width - 1) as f64 / 2.;
         let y_scale = (height - 1) as f64 / 2.;
         let mut chords = Vec::new();
@@ -90,7 +101,12 @@ impl DiskGeometry {
         {
             return Err(Error::NoSolarLimb);
         }
-        Ok(geometry)
+        Ok(FittedDisk {
+            geometry,
+            center_x: (x + 1.) * x_scale,
+            center_y: (y + 1.) * y_scale,
+            sky,
+        })
     }
 
     /// Remove scan shear and scale the scan axis to make the fitted limb circular.
@@ -155,11 +171,12 @@ impl DiskGeometry {
             width,
             height,
             pixels,
+            synthetic_flat: image.synthetic_flat,
         })
     }
 }
 
-fn limb_threshold(pixels: &[u16]) -> Option<f64> {
+fn limb_levels(pixels: &[u16]) -> Option<(u16, f64)> {
     let stride = pixels.len().div_ceil(100_000);
     let mut bins = vec![0u32; 65536];
     let count = pixels.len().div_ceil(stride);
@@ -175,7 +192,7 @@ fn limb_threshold(pixels: &[u16]) -> Option<f64> {
     };
     let sky = percentile(count / 20)?;
     let disk = percentile(count * 19 / 20)?;
-    (disk > sky + 6).then(|| sky as f64 + (disk - sky) as f64 * 0.20)
+    (disk > sky + 6).then(|| (sky as u16, sky as f64 + (disk - sky) as f64 * 0.20))
 }
 
 fn chord_edges(row: &[u16], threshold: f64) -> Option<(f64, f64)> {
@@ -239,6 +256,7 @@ mod tests {
             width,
             height,
             pixels,
+            synthetic_flat: false,
         }
     }
 

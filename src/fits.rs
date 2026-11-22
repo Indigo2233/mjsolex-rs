@@ -40,6 +40,9 @@ impl Reconstruction {
             "BZERO   =                32768".to_owned(),
             text_card("ORIGIN", APP_NAME),
         ];
+        if self.has_synthetic_flat() {
+            cards.push(text_card("FLATCORR", "SYNTHETIC"));
+        }
         metadata.cards(&mut cards);
         cards.push("END".to_owned());
         for block in cards.chunks(BLOCK / CARD) {

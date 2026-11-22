@@ -16,6 +16,7 @@ pub struct Reconstruction {
     pub(crate) width: usize,
     pub(crate) height: usize,
     pub(crate) pixels: Vec<u16>,
+    pub(crate) synthetic_flat: bool,
 }
 
 impl Reconstruction {
@@ -29,6 +30,10 @@ impl Reconstruction {
 
     pub fn pixels(&self) -> &[u16] {
         &self.pixels
+    }
+
+    pub fn has_synthetic_flat(&self) -> bool {
+        self.synthetic_flat
     }
 
     pub fn write_png(&self, output: impl Write) -> Result<(), Error> {
@@ -188,5 +193,6 @@ pub fn reconstruct_with_stride<R: Read + Seek>(
         width,
         height,
         pixels,
+        synthetic_flat: false,
     })
 }

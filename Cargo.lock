@@ -980,7 +980,7 @@ dependencies = [
 
 [[package]]
 name = "mjsolex"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "eframe",
  "jni 0.21.1",

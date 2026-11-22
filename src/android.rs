@@ -68,7 +68,7 @@ enum Work {
         image: Arc<Reconstruction>,
         preview: ColorImage,
         metadata: Box<FitsMetadata>,
-        warning: Option<Error>,
+        warning: Option<Notice>,
     },
     Exported(String),
 }
@@ -131,6 +131,7 @@ struct Mobile {
     dispersion: f64,
     stride: u32,
     correct_disk: bool,
+    synthetic_flat: bool,
     output: Option<Output>,
     page: Page,
     language: Language,
@@ -320,6 +321,7 @@ impl Mobile {
             dispersion: 0.,
             stride: 1,
             correct_disk: false,
+            synthetic_flat: false,
             output: None,
             page: Page::Scan,
             language,
@@ -369,6 +371,15 @@ impl Mobile {
                         .unwrap_or("scan");
                     let ext = if request == SAVE_FITS { "fits" } else { "png" };
                     let details = self.output.as_ref().map(|output| &output.metadata);
+                    let flat = if self
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| output.image.has_synthetic_flat())
+                    {
+                        "-flat"
+                    } else {
+                        ""
+                    };
                     let geometry = if details.is_some_and(|m| m.geometry.is_some()) {
                         "-disk"
                     } else {
@@ -379,8 +390,9 @@ impl Mobile {
                         .filter(|shift| *shift != 0.)
                         .map(|shift| format!("-{shift:+.2}px"))
                         .unwrap_or_default();
-                    let name =
-                        env.new_string(format!("{stem}-reconstruction{shift}{geometry}.{ext}"))?;
+                    let name = env.new_string(format!(
+                        "{stem}-reconstruction{shift}{flat}{geometry}.{ext}"
+                    ))?;
                     env.call_method(
                         activity,
                         "createImage",
@@ -526,6 +538,7 @@ impl Mobile {
         let order = scan.byte_order;
         let header = scan.header;
         let correct_disk = self.correct_disk;
+        let synthetic_flat = self.synthetic_flat;
         let mut metadata = FitsMetadata {
             observation: scan.observation.clone(),
             source_name: Some(scan.name.clone()),
@@ -551,15 +564,30 @@ impl Mobile {
                 }
                 metadata.observation = reader.observation().clone();
                 let mut progress = report(events, cancel);
-                let fraction = if correct_disk { 0.85 } else { 0.98 };
-                let raw = reconstruct_with_stride(&mut reader, trace, shift, stride, |p| {
-                    progress(p * fraction)
+                let geometry_start = if correct_disk { 0.85 } else { 0.98 };
+                let flat_start = if synthetic_flat {
+                    geometry_start - 0.10
+                } else {
+                    geometry_start
+                };
+                let mut raw = reconstruct_with_stride(&mut reader, trace, shift, stride, |p| {
+                    progress(p * flat_start)
                 })?;
                 drop(reader);
-                let (image, warning) = if correct_disk {
+                let mut flat_error = None;
+                if synthetic_flat {
+                    match raw.correct_synthetic_flat(|p| {
+                        progress(flat_start + p * (geometry_start - flat_start))
+                    }) {
+                        Ok(_) => {}
+                        Err(Error::Cancelled) => return Err(Error::Cancelled),
+                        Err(error) => flat_error = Some(error),
+                    }
+                }
+                let (image, disk_error) = if correct_disk {
                     match DiskGeometry::fit(&raw).and_then(|geometry| {
                         geometry
-                            .correct(&raw, |p| progress(fraction + p * 0.13))
+                            .correct(&raw, |p| progress(geometry_start + p * 0.13))
                             .map(|image| (image, geometry))
                     }) {
                         Ok((image, geometry)) => {
@@ -576,6 +604,11 @@ impl Mobile {
                 if !progress(1.) {
                     return Err(Error::Cancelled);
                 }
+                let warning =
+                    (flat_error.is_some() || disk_error.is_some()).then_some(Notice::Corrections {
+                        flat: flat_error,
+                        disk: disk_error,
+                    });
                 Ok(Work::Reconstructed {
                     image: Arc::new(image),
                     preview,
@@ -688,7 +721,7 @@ impl Mobile {
                                 metadata: *metadata,
                             });
                             self.page = Page::Result;
-                            self.note = warning.map(Notice::DiskCorrection);
+                            self.note = warning;
                         }
                         Ok(Work::Exported(name)) => self.note = Some(Notice::Saved(name)),
                         Err(error) => self.note = Some(Notice::Processing(error)),

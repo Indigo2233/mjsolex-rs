@@ -65,6 +65,7 @@ impl Language {
             Error::NoLine => "未找到可靠的吸收线。请在光谱图中点选一条暗线。".into(),
             Error::InvalidTrace => "谱线或采样偏移超出录制范围。".into(),
             Error::NoSolarLimb => "无法拟合完整的太阳边缘。".into(),
+            Error::NoFlatSamples => "用于估计合成平场的盘内样本不足。".into(),
             Error::OutputTooLarge => "重建图像的像素数超过上限。".into(),
             Error::InvalidStride => "帧间距至少为 1。".into(),
             Error::Allocation(_) => "可用内存不足，无法处理此录制。".into(),
@@ -84,7 +85,10 @@ pub(super) enum Notice {
     SharedRecording(String),
     IndigoUnavailable,
     IndigoLaunch(String),
-    DiskCorrection(Error),
+    Corrections {
+        flat: Option<Error>,
+        disk: Option<Error>,
+    },
     Saved(String),
     SaveLanguage(String),
 }
@@ -149,10 +153,24 @@ impl Notice {
             Self::IndigoLaunch(detail) => {
                 with_detail("Cannot open Indigo Observatory", "无法打开靛空台", detail)
             }
-            Self::DiskCorrection(error) => {
-                let prefix = language.text("Disk correction skipped. ", "已跳过太阳盘几何校正。");
-                format!("{prefix}{}", language.error(error))
-            }
+            Self::Corrections { flat, disk } => [
+                (
+                    flat,
+                    language.text("Synthetic flat skipped. ", "已跳过合成平场。"),
+                ),
+                (
+                    disk,
+                    language.text("Disk correction skipped. ", "已跳过太阳盘几何校正。"),
+                ),
+            ]
+            .into_iter()
+            .filter_map(|(error, prefix)| {
+                error
+                    .as_ref()
+                    .map(|e| format!("{prefix}{}", language.error(e)))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
             Self::Saved(name) => {
                 let prefix = language.text("Saved ", "已保存 ");
                 format!("{prefix}{name}")
