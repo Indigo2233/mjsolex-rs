@@ -18,8 +18,9 @@ use winit::platform::android::activity::AndroidApp;
 use crate::android_document::DocumentFile;
 use crate::ser::cache_recording;
 use crate::{
-    APP_NAME, ByteOrder, DiskGeometry, Error, FitsMetadata, Header, LineProfile, Observation,
-    Reconstruction, SerReader, Spectrum, Trace, reconstruct_with_stride,
+    APP_NAME, ByteOrder, DiskGeometry, DisplayImage, Error, FitsMetadata, Header, LineProfile,
+    Observation, PhysicalFlat, Product, Reconstruction, SerReader, Spectrum, Stretch, Trace,
+    reconstruct_with_stride,
 };
 
 mod language;
@@ -31,6 +32,8 @@ const OPEN_SER: i32 = 10;
 const SAVE_PNG: i32 = 11;
 const SAVE_FITS: i32 = 12;
 const OPEN_SHARED: i32 = 13;
+const OPEN_FLAT: i32 = 14;
+const SAVE_RAW_PNG: i32 = 15;
 const BACKGROUND: Color32 = Color32::from_rgb(17, 21, 27);
 const CARD: Color32 = Color32::from_rgb(28, 35, 44);
 const TEXT: Color32 = Color32::from_rgb(240, 243, 247);
@@ -64,8 +67,12 @@ enum Event {
 
 enum Work {
     Imported(Box<Imported>),
+    FlatImported(PhysicalFlat, String),
     Reconstructed {
         image: Arc<Reconstruction>,
+        blue: Option<Arc<Reconstruction>>,
+        product: Product,
+        wing_offset: f64,
         preview: ColorImage,
         metadata: Box<FitsMetadata>,
         warning: Option<Notice>,
@@ -90,14 +97,25 @@ struct Scan {
     header: Header,
     observation: Observation,
     byte_order: Option<ByteOrder>,
-    spectrum: Spectrum,
+    spectrum: Arc<Spectrum>,
     texture: TextureHandle,
 }
 
 struct Output {
     image: Arc<Reconstruction>,
+    blue: Option<Arc<Reconstruction>>,
+    product: Product,
+    wing_offset: f64,
     texture: TextureHandle,
     metadata: FitsMetadata,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum FlatMode {
+    #[default]
+    Off,
+    Synthetic,
+    Physical,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -131,7 +149,10 @@ struct Mobile {
     dispersion: f64,
     stride: u32,
     correct_disk: bool,
-    synthetic_flat: bool,
+    flat_mode: FlatMode,
+    physical_flat: Option<(Arc<PhysicalFlat>, String)>,
+    product: Product,
+    wing_offset: f64,
     output: Option<Output>,
     page: Page,
     language: Language,
@@ -249,7 +270,7 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onDocument(
             DocumentFile::from_android(
                 &mut env,
                 descriptor,
-                !matches!(request, OPEN_SER | OPEN_SHARED),
+                !matches!(request, OPEN_SER | OPEN_SHARED | OPEN_FLAT),
             )
             .map(|file| Some((file, name)))
             .map_err(|error| format!("access:{error}"))
@@ -321,7 +342,10 @@ impl Mobile {
             dispersion: 0.,
             stride: 1,
             correct_disk: false,
-            synthetic_flat: false,
+            flat_mode: FlatMode::default(),
+            physical_flat: None,
+            product: Product::default(),
+            wing_offset: 2.,
             output: None,
             page: Page::Scan,
             language,
@@ -354,11 +378,15 @@ impl Mobile {
     }
 
     fn pick(&mut self, request: i32) {
+        let output = self.output.as_ref();
+        if !matches!(request, OPEN_SER | OPEN_FLAT) && output.is_none() {
+            return;
+        }
         let result = self.vm.attach_current_thread().and_then(|mut env| {
             let result = env.with_local_frame(8, |env| {
                 let activity = self.activity.as_obj();
-                if request == OPEN_SER {
-                    env.call_method(activity, "pickSer", "()V", &[])?;
+                if matches!(request, OPEN_SER | OPEN_FLAT) {
+                    env.call_method(activity, "pickSer", "(I)V", &[JValue::Int(request)])?;
                 } else {
                     let name = self
                         .scan
@@ -370,28 +398,35 @@ impl Mobile {
                         .and_then(|s| s.to_str())
                         .unwrap_or("scan");
                     let ext = if request == SAVE_FITS { "fits" } else { "png" };
-                    let details = self.output.as_ref().map(|output| &output.metadata);
-                    let flat = if self
-                        .output
-                        .as_ref()
-                        .is_some_and(|output| output.image.has_synthetic_flat())
-                    {
+                    let Some(output) = &self.output else {
+                        return Ok(());
+                    };
+                    let details = &output.metadata;
+                    let flat = if output.image.has_synthetic_flat() || details.flat_file.is_some() {
                         "-flat"
                     } else {
                         ""
                     };
-                    let geometry = if details.is_some_and(|m| m.geometry.is_some()) {
+                    let geometry = if details.geometry.is_some() {
                         "-disk"
                     } else {
                         ""
                     };
                     let shift = details
-                        .and_then(|m| m.offset_pixels)
+                        .offset_pixels
                         .filter(|shift| *shift != 0.)
                         .map(|shift| format!("-{shift:+.2}px"))
                         .unwrap_or_default();
+                    let product = match request {
+                        SAVE_PNG if output.product == Product::Doppler => {
+                            format!("-doppler-w{:.2}px", output.wing_offset)
+                        }
+                        SAVE_PNG => format!("{}-display", output.product.suffix()),
+                        SAVE_RAW_PNG => "-raw".into(),
+                        _ => String::new(),
+                    };
                     let name = env.new_string(format!(
-                        "{stem}-reconstruction{shift}{flat}{geometry}.{ext}"
+                        "{stem}-reconstruction{shift}{flat}{geometry}{product}.{ext}"
                     ))?;
                     env.call_method(
                         activity,
@@ -478,20 +513,13 @@ impl Mobile {
         }
     }
 
-    fn import(&mut self, mut file: DocumentFile, name: String, byte_order: Option<ByteOrder>) {
+    fn import(&mut self, file: DocumentFile, name: String, byte_order: Option<ByteOrder>) {
         let cache = self.cache.clone();
         self.start_job(
             ("Reading spectrum", "正在读取光谱"),
             true,
             move |events, cancel| {
-                if let Err(error) = file.file.seek(SeekFrom::Start(0)) {
-                    if error.raw_os_error() != Some(Errno::SPIPE.raw_os_error()) {
-                        return Err(error.into());
-                    }
-                    let cached = cache_document(&mut file.file, &cache, cancel)?;
-                    file.check_error()?;
-                    file = DocumentFile::cached(cached);
-                }
+                let file = seekable_document(file, &cache, cancel)?;
                 let mut reader = SerReader::open_with_byte_order(&file.file, byte_order)?;
                 let header = reader.header();
                 let observation = reader.observation().clone();
@@ -513,6 +541,31 @@ impl Mobile {
         );
     }
 
+    fn import_flat(&mut self, file: DocumentFile, name: String) {
+        let Some(scan) = &self.scan else { return };
+        let cache = self.cache.clone();
+        let spectrum = scan.spectrum.clone();
+        self.start_job(
+            ("Reading flat SER", "正在读取平场 SER"),
+            true,
+            move |events, cancel| {
+                let file = seekable_document(file, &cache, cancel)?;
+                let mut reader = SerReader::open(&file.file)?;
+                let flat = PhysicalFlat::from_ser(&mut reader, &spectrum, report(events, cancel))?;
+                file.check_error()?;
+                Ok(Work::FlatImported(flat, name))
+            },
+        );
+    }
+
+    fn minimum_stride(&self, header: Header) -> u32 {
+        if self.product == Product::Doppler {
+            header.minimum_doppler_stride()
+        } else {
+            header.minimum_stride()
+        }
+    }
+
     fn reload_byte_order(&mut self, order: Option<ByteOrder>) {
         let Some(scan) = &self.scan else { return };
         if order == scan.byte_order {
@@ -528,6 +581,22 @@ impl Mobile {
         let (Some(scan), Some(trace)) = (&self.scan, self.trace) else {
             return;
         };
+        let product = self.product;
+        let wing_offset = self.wing_offset;
+        let shift = self.shift;
+        let wings = if product == Product::Doppler {
+            if self.dispersion == 0. || !self.dispersion.is_finite() {
+                self.note = Some(Notice::Processing(Error::DopplerDispersion));
+                return;
+            }
+            if !scan.spectrum.supports_wings(trace, shift, wing_offset) {
+                self.note = Some(Notice::Processing(Error::DopplerCoverage));
+                return;
+            }
+            Some(wing_offset.copysign(self.dispersion))
+        } else {
+            None
+        };
         let file = match scan.file.try_clone() {
             Ok(file) => file,
             Err(error) => {
@@ -538,20 +607,25 @@ impl Mobile {
         let order = scan.byte_order;
         let header = scan.header;
         let correct_disk = self.correct_disk;
-        let synthetic_flat = self.synthetic_flat;
+        let synthetic_flat = self.flat_mode == FlatMode::Synthetic && wings.is_none();
+        let physical_flat = if self.flat_mode == FlatMode::Physical {
+            self.physical_flat.clone()
+        } else {
+            None
+        };
+        let stride = self.stride.max(self.minimum_stride(header));
         let mut metadata = FitsMetadata {
             observation: scan.observation.clone(),
             source_name: Some(scan.name.clone()),
             source_header: Some(header),
-            offset_pixels: Some(self.shift),
-            frame_step: Some(self.stride),
+            offset_pixels: Some(shift),
+            frame_step: Some(stride),
             line_center_angstrom: (self.wavelength > 0.).then_some(self.wavelength),
             dispersion_angstrom: (self.dispersion != 0.).then_some(self.dispersion),
             fwhm_pixels: self.profile.as_ref().and_then(|p| p.fit).map(|f| f.fwhm),
             geometry: None,
+            flat_file: None,
         };
-        let shift = self.shift;
-        let stride = self.stride;
         self.start_job(
             ("Reconstructing scan", "正在重建图像"),
             true,
@@ -565,14 +639,29 @@ impl Mobile {
                 metadata.observation = reader.observation().clone();
                 let mut progress = report(events, cancel);
                 let geometry_start = if correct_disk { 0.85 } else { 0.98 };
-                let flat_start = if synthetic_flat {
+                let flat_start = if synthetic_flat || physical_flat.is_some() {
                     geometry_start - 0.10
                 } else {
                     geometry_start
                 };
-                let mut raw = reconstruct_with_stride(&mut reader, trace, shift, stride, |p| {
-                    progress(p * flat_start)
-                })?;
+                let mut raw = reconstruct_with_stride(
+                    &mut reader,
+                    trace,
+                    shift + wings.unwrap_or(0.),
+                    stride,
+                    |p| progress(p * flat_start * if wings.is_some() { 0.5 } else { 1. }),
+                )?;
+                let mut blue = if let Some(wing) = wings {
+                    Some(reconstruct_with_stride(
+                        &mut reader,
+                        trace,
+                        shift - wing,
+                        stride,
+                        |p| progress((0.5 + p * 0.5) * flat_start),
+                    )?)
+                } else {
+                    None
+                };
                 drop(reader);
                 let mut flat_error = None;
                 if synthetic_flat {
@@ -583,24 +672,44 @@ impl Mobile {
                         Err(Error::Cancelled) => return Err(Error::Cancelled),
                         Err(error) => flat_error = Some(error),
                     }
+                } else if let Some((flat, name)) = physical_flat {
+                    flat.apply(&mut raw)?;
+                    if let Some(blue) = &mut blue {
+                        flat.apply(blue)?;
+                    }
+                    metadata.flat_file = Some(name);
                 }
-                let (image, disk_error) = if correct_disk {
-                    match DiskGeometry::fit(&raw).and_then(|geometry| {
-                        geometry
-                            .correct(&raw, |p| progress(geometry_start + p * 0.13))
-                            .map(|image| (image, geometry))
-                    }) {
-                        Ok((image, geometry)) => {
+                if !progress(geometry_start) {
+                    return Err(Error::Cancelled);
+                }
+                let mut disk_error = None;
+                if correct_disk {
+                    let corrected = (|| {
+                        let geometry = DiskGeometry::fit(&raw)?;
+                        let span = if blue.is_some() { 0.065 } else { 0.13 };
+                        let red =
+                            geometry.correct(&raw, |p| progress(geometry_start + p * span))?;
+                        let blue = blue
+                            .as_ref()
+                            .map(|wing| {
+                                geometry
+                                    .correct(wing, |p| progress(geometry_start + (1. + p) * span))
+                            })
+                            .transpose()?;
+                        Ok::<_, Error>((geometry, red, blue))
+                    })();
+                    match corrected {
+                        Ok((geometry, corrected_red, corrected_blue)) => {
                             metadata.geometry = Some(geometry);
-                            (image, None)
+                            raw = corrected_red;
+                            blue = corrected_blue;
                         }
                         Err(Error::Cancelled) => return Err(Error::Cancelled),
-                        Err(error) => (raw, Some(error)),
+                        Err(error) => disk_error = Some(error),
                     }
-                } else {
-                    (raw, None)
-                };
-                let preview = preview(image.width(), image.height(), |i| image.pixels()[i]);
+                }
+                let display = DisplayImage::new(&raw, blue.as_ref(), product)?;
+                let preview = preview_rgb(raw.width(), raw.height(), |i| display.pixel(i));
                 if !progress(1.) {
                     return Err(Error::Cancelled);
                 }
@@ -610,7 +719,10 @@ impl Mobile {
                         disk: disk_error,
                     });
                 Ok(Work::Reconstructed {
-                    image: Arc::new(image),
+                    image: Arc::new(raw),
+                    blue: blue.map(Arc::new),
+                    product,
+                    wing_offset,
                     preview,
                     metadata: Box::new(metadata),
                     warning,
@@ -622,6 +734,8 @@ impl Mobile {
     fn export(&mut self, request: i32, mut file: DocumentFile, name: String) {
         let Some(output) = &self.output else { return };
         let image = output.image.clone();
+        let blue = output.blue.clone();
+        let product = output.product;
         let metadata = output.metadata.clone();
         let fits = request == SAVE_FITS;
         self.start_job(
@@ -634,10 +748,11 @@ impl Mobile {
             move |_, _| {
                 let result = (|| -> Result<(), Error> {
                     let mut writer = BufWriter::new(&mut file.file);
-                    if fits {
-                        image.write_fits_with_metadata(&mut writer, &metadata)?;
-                    } else {
-                        image.write_png(&mut writer)?;
+                    match request {
+                        SAVE_FITS => image.write_fits_with_metadata(&mut writer, &metadata)?,
+                        SAVE_RAW_PNG => image.write_png(&mut writer)?,
+                        _ => DisplayImage::new(&image, blue.as_deref(), product)?
+                            .write_png(&mut writer)?,
                     }
                     writer.flush()?;
                     Ok(())
@@ -659,6 +774,9 @@ impl Mobile {
                     match result {
                         Ok(Some((file, name))) if matches!(request, OPEN_SER | OPEN_SHARED) => {
                             self.import(file, name, None)
+                        }
+                        Ok(Some((file, name))) if request == OPEN_FLAT => {
+                            self.import_flat(file, name)
                         }
                         Ok(Some((file, name))) => self.export(request, file, name),
                         Ok(None) => {}
@@ -690,7 +808,7 @@ impl Mobile {
                                 header,
                                 observation,
                                 byte_order,
-                                spectrum,
+                                spectrum: Arc::new(spectrum),
                                 texture: ctx.load_texture(
                                     "spectrum",
                                     preview,
@@ -704,11 +822,18 @@ impl Mobile {
                             self.wavelength = 0.;
                             self.dispersion = 0.;
                             self.stride = header.minimum_stride();
+                            self.physical_flat = None;
+                            if self.flat_mode == FlatMode::Physical {
+                                self.flat_mode = FlatMode::Off;
+                            }
                             self.output = None;
                             self.page = Page::Spectrum;
                         }
                         Ok(Work::Reconstructed {
                             image,
+                            blue,
+                            product,
+                            wing_offset,
                             preview,
                             metadata,
                             warning,
@@ -717,11 +842,18 @@ impl Mobile {
                                 ctx.load_texture("reconstruction", preview, TextureOptions::LINEAR);
                             self.output = Some(Output {
                                 image,
+                                blue,
+                                product,
+                                wing_offset,
                                 texture,
                                 metadata: *metadata,
                             });
                             self.page = Page::Result;
                             self.note = warning;
+                        }
+                        Ok(Work::FlatImported(flat, name)) => {
+                            self.physical_flat = Some((Arc::new(flat), name));
+                            self.flat_mode = FlatMode::Physical;
                         }
                         Ok(Work::Exported(name)) => self.note = Some(Notice::Saved(name)),
                         Err(error) => self.note = Some(Notice::Processing(error)),
@@ -790,6 +922,22 @@ fn cache_document(input: &mut File, cache: &Path, cancel: &AtomicBool) -> Result
     Ok(file)
 }
 
+fn seekable_document(
+    mut file: DocumentFile,
+    cache: &Path,
+    cancel: &AtomicBool,
+) -> Result<DocumentFile, Error> {
+    match file.file.seek(SeekFrom::Start(0)) {
+        Ok(_) => Ok(file),
+        Err(error) if error.raw_os_error() == Some(Errno::SPIPE.raw_os_error()) => {
+            let cached = cache_document(&mut file.file, cache, cancel)?;
+            file.check_error()?;
+            Ok(DocumentFile::cached(cached))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 struct PipeReader<'a> {
     input: &'a mut File,
     cancel: &'a AtomicBool,
@@ -820,44 +968,22 @@ impl Read for PipeReader<'_> {
 }
 
 fn preview(width: usize, height: usize, value: impl Fn(usize) -> u16) -> ColorImage {
+    let stretch = Stretch::estimate(width, height, &value);
+    preview_rgb(width, height, |i| [stretch.map(value(i)); 3])
+}
+
+fn preview_rgb(width: usize, height: usize, pixel: impl Fn(usize) -> [u8; 3]) -> ColorImage {
     let x_step = width.div_ceil(1200);
     let y_step = height.div_ceil(1200);
     let (w, h) = (width.div_ceil(x_step), height.div_ceil(y_step));
     let mut pixels = Vec::with_capacity(w * h);
-    let (mut min, mut max) = (u16::MAX, 0);
     for y in 0..h {
         for x in 0..w {
-            let sample = value(y * y_step * width + x * x_step);
-            min = min.min(sample);
-            max = max.max(sample);
-            pixels.push(sample);
+            let [r, g, b] = pixel(y * y_step * width + x * x_step);
+            pixels.push(Color32::from_rgb(r, g, b));
         }
     }
-    let span = u32::from((max - min).max(1));
-    let mut histogram = [0; 256];
-    for &sample in &pixels {
-        histogram[(u32::from(sample - min) * 255 / span) as usize] += 1;
-    }
-    let percentile = |target| {
-        let mut seen = 0;
-        histogram
-            .iter()
-            .position(|count| {
-                seen += count;
-                seen > target
-            })
-            .unwrap_or(255) as u32
-            * span
-            / 255
-            + u32::from(min)
-    };
-    let lo = percentile(pixels.len() / 100);
-    let hi = percentile(pixels.len() * 99 / 100).max(lo + (span / 128).max(1));
-    let gray: Vec<_> = pixels
-        .into_iter()
-        .map(|sample| (u32::from(sample).saturating_sub(lo) * 255 / (hi - lo)).min(255) as u8)
-        .collect();
-    ColorImage::from_gray([w, h], &gray)
+    ColorImage::new([w, h], pixels)
 }
 
 fn card<T>(ui: &mut Ui, contents: impl FnOnce(&mut Ui) -> T) -> T {

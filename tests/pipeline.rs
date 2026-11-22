@@ -2,8 +2,8 @@ use std::cell::Cell;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use mjsolex::{
-    ByteOrder, ColorMode, Error, FitsMetadata, SerReader, Spectrum, Trace, reconstruct,
-    reconstruct_with_stride,
+    ByteOrder, ColorMode, DisplayImage, Error, FitsMetadata, PhysicalFlat, Product, SerReader,
+    Spectrum, Trace, reconstruct, reconstruct_with_stride,
 };
 
 fn ser_header(
@@ -30,6 +30,149 @@ fn ser_header(
 
 fn mono(width: u32, height: u32, depth: u32, count: u32) -> Vec<u8> {
     ser_header(b"LUCAM-RECORDER", width, height, depth, count, 1)
+}
+
+#[test]
+fn exports_display_pixels_and_preserves_raw_16_bit_samples() {
+    let mut bytes = mono(5, 1, 16, 1);
+    let samples = [100_u16, 200, 300, 400, 500];
+    bytes.extend(samples.into_iter().flat_map(u16::to_le_bytes));
+    let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+    let image = reconstruct(&mut reader, Trace::constant(5, 0.), 0., |_| true).unwrap();
+    for product in [
+        Product::Gray,
+        Product::Hydrogen,
+        Product::Calcium,
+        Product::Helium,
+    ] {
+        let display = DisplayImage::new(&image, None, product).unwrap();
+        let mut encoded = Vec::new();
+        display.write_png(&mut encoded).unwrap();
+        let mut png = png::Decoder::new(Cursor::new(encoded)).read_info().unwrap();
+        let mut pixels = vec![0; png.output_buffer_size().unwrap()];
+        let info = png.next_frame(&mut pixels).unwrap();
+        assert_eq!(info.bit_depth, png::BitDepth::Eight);
+        let channels = if product == Product::Gray { 1 } else { 3 };
+        for (i, pixel) in pixels.chunks_exact(channels).enumerate() {
+            assert_eq!(pixel, &display.pixel(i)[..channels]);
+        }
+        assert_eq!(display.pixel(0), [0; 3]);
+        assert_eq!(display.pixel(4).into_iter().max(), Some(255));
+    }
+    let mut encoded = Vec::new();
+    image.write_png(&mut encoded).unwrap();
+    let mut png = png::Decoder::new(Cursor::new(encoded)).read_info().unwrap();
+    let mut pixels = vec![0; png.output_buffer_size().unwrap()];
+    assert_eq!(
+        png.next_frame(&mut pixels).unwrap().bit_depth,
+        png::BitDepth::Sixteen
+    );
+    assert_eq!(
+        pixels,
+        samples
+            .into_iter()
+            .flat_map(u16::to_be_bytes)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn verifies_doppler_coverage_and_color_direction() {
+    let mut bytes = ser_header(b"JSOLEX-TRIMMED", 4, 7, 16, 1, 1);
+    for y in 0..7 {
+        let samples = match y {
+            2 => [200_u16, 450, 750, 600],
+            4 => [200_u16, 750, 450, 600],
+            _ => [600_u16; 4],
+        };
+        bytes.extend(samples.into_iter().flat_map(u16::to_le_bytes));
+    }
+    let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+    let spectrum = Spectrum::average(&mut reader, |_| true).unwrap();
+    let trace = Trace::constant(4, 3.);
+    assert!(spectrum.supports_wings(trace, 0., 1.));
+    assert!(!spectrum.supports_wings(trace, 2., 1.));
+    assert!(!spectrum.supports_wings(trace, 0., 0.));
+    let red = reconstruct(&mut reader, trace, 1., |_| true).unwrap();
+    let blue = reconstruct(&mut reader, trace, -1., |_| true).unwrap();
+    let doppler = DisplayImage::new(&red, Some(&blue), Product::Doppler).unwrap();
+    let [r1, _, b1] = doppler.pixel(1);
+    let [r2, _, b2] = doppler.pixel(2);
+    assert!(r1 < b1 && b2 < r2);
+    assert_eq!(doppler.pixel(3), [255; 3]);
+    let reversed = DisplayImage::new(&blue, Some(&red), Product::Doppler).unwrap();
+    assert_eq!(reversed.pixel(1), doppler.pixel(2));
+}
+
+#[test]
+fn captured_flat_corrects_slit_response_and_rejects_invalid_inputs() {
+    const WIDTH: u32 = 24;
+    const HEIGHT: u32 = 5;
+    let mut flat_ser = mono(WIDTH, HEIGHT, 16, 2);
+    let mut scan_ser = mono(WIDTH, HEIGHT, 16, 1);
+    for frame in 0..2 {
+        for y in 0..HEIGHT as u16 {
+            for x in 0..WIDTH {
+                let gain = match x {
+                    0 | 23 => 0,
+                    x if x < WIDTH / 2 => 1,
+                    _ => 2,
+                };
+                let flat_value = gain * (1000 + 700 * y + 23 * frame);
+                flat_ser.extend(flat_value.to_le_bytes());
+                if frame == 0 {
+                    scan_ser.extend((gain * 3000_u16).to_le_bytes());
+                }
+            }
+        }
+    }
+    let mut scan = SerReader::open(Cursor::new(scan_ser)).unwrap();
+    let spectrum = Spectrum::average(&mut scan, |_| true).unwrap();
+    let mut flat_reader = SerReader::open(Cursor::new(flat_ser)).unwrap();
+    assert!(matches!(
+        PhysicalFlat::from_ser(&mut flat_reader, &spectrum, |_| false),
+        Err(Error::Cancelled)
+    ));
+    let mut incompatible = mono(WIDTH, HEIGHT, 8, 1);
+    incompatible.resize(178 + (WIDTH * HEIGHT) as usize, 128);
+    let mut incompatible = SerReader::open(Cursor::new(incompatible)).unwrap();
+    assert!(matches!(
+        PhysicalFlat::from_ser(
+            &mut flat_reader,
+            &Spectrum::average(&mut incompatible, |_| true).unwrap(),
+            |_| true,
+        ),
+        Err(Error::FlatMismatch)
+    ));
+    let mut dark_ser = mono(WIDTH, HEIGHT, 16, 1);
+    dark_ser.resize(178 + (WIDTH * HEIGHT * 2) as usize, 0);
+    let mut dark = SerReader::open(Cursor::new(dark_ser)).unwrap();
+    assert!(matches!(
+        PhysicalFlat::from_ser(&mut dark, &spectrum, |_| true),
+        Err(Error::InvalidPhysicalFlat)
+    ));
+    let flat = PhysicalFlat::from_ser(&mut flat_reader, &spectrum, |_| true).unwrap();
+    let mut image =
+        reconstruct(&mut scan, Trace::constant(WIDTH as usize, 2.), 0., |_| true).unwrap();
+    flat.apply(&mut image).unwrap();
+    let pixels = image.pixels();
+    assert_eq!((pixels[0], pixels[WIDTH as usize - 1]), (0, 0));
+    assert!(
+        pixels[1..WIDTH as usize - 1]
+            .iter()
+            .all(|&sample| sample == 3000)
+    );
+    let metadata = FitsMetadata {
+        flat_file: Some("slit-flat.ser".to_owned()),
+        ..FitsMetadata::default()
+    };
+    let mut fits = Vec::new();
+    image
+        .write_fits_with_metadata(&mut fits, &metadata)
+        .unwrap();
+    let cards = str::from_utf8(&fits[..2880]).unwrap();
+    assert!(cards.contains("FLATCORR= 'PHYSICAL'"));
+    assert!(cards.contains("FLATFILE= 'slit-flat.ser'"));
 }
 
 #[test]

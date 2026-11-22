@@ -7,7 +7,15 @@ pub(crate) const MAX_PIXELS: usize = 32 * 1024 * 1024;
 impl Header {
     /// Smallest interval that keeps a reconstruction within the pixel budget.
     pub fn minimum_stride(self) -> u32 {
-        let rows = (MAX_PIXELS / self.width.max(1)).max(1) as u32;
+        self.stride_for_budget(MAX_PIXELS)
+    }
+
+    pub fn minimum_doppler_stride(self) -> u32 {
+        self.stride_for_budget(MAX_PIXELS / 4)
+    }
+
+    fn stride_for_budget(self, budget: usize) -> u32 {
+        let rows = (budget / self.width.max(1)).max(1) as u32;
         self.frames.div_ceil(rows).max(1)
     }
 }

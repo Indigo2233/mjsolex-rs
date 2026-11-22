@@ -50,6 +50,23 @@ struct Sample {
 }
 
 impl Spectrum {
+    pub(crate) fn slit(&self) -> (Header, (usize, usize)) {
+        (self.header, self.illuminated)
+    }
+
+    /// Both wing samples must have their full extraction kernel across the illuminated slit.
+    pub fn supports_wings(&self, trace: Trace, center: f64, offset: f64) -> bool {
+        let margin = if self.header.trimmed { 0. } else { 1. };
+        let limit = (self.header.height - 1) as f64;
+        offset.is_finite()
+            && offset > 0.
+            && trace.width() == self.header.width
+            && (self.illuminated.0..=self.illuminated.1).all(|x| {
+                let row = trace.row(x) + center;
+                row - offset - margin >= 0. && row + offset + margin < limit
+            })
+    }
+
     pub fn average<R: Read + Seek>(
         reader: &mut SerReader<R>,
         mut progress: impl FnMut(f32) -> bool,

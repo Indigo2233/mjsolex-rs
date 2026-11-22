@@ -19,6 +19,8 @@ public final class MainActivity extends NativeActivity {
     private static final int SAVE_PNG = 11;
     private static final int SAVE_FITS = 12;
     private static final int OPEN_SHARED_SER = 13;
+    private static final int OPEN_FLAT = 14;
+    private static final int SAVE_RAW_PNG = 15;
     private Uri pendingShared;
 
     private native boolean onDocument(
@@ -112,9 +114,9 @@ public final class MainActivity extends NativeActivity {
         return true;
     }
 
-    public void pickSer() {
+    public void pickSer(int request) {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*");
-        launchPicker(intent, OPEN_SER);
+        launchPicker(intent, request);
     }
 
     public void createImage(int request, String name) {
@@ -138,7 +140,8 @@ public final class MainActivity extends NativeActivity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (request != OPEN_SER && request != SAVE_PNG && request != SAVE_FITS) {
+        if (request != OPEN_SER && request != OPEN_FLAT
+            && request != SAVE_PNG && request != SAVE_FITS && request != SAVE_RAW_PNG) {
             return;
         }
         if (result != RESULT_OK || data == null || data.getData() == null) {
@@ -185,7 +188,7 @@ public final class MainActivity extends NativeActivity {
     }
 
     private boolean isInput(int request) {
-        return request == OPEN_SER || request == OPEN_SHARED_SER;
+        return request == OPEN_SER || request == OPEN_SHARED_SER || request == OPEN_FLAT;
     }
 
     private String displayName(Uri uri, int request) {
@@ -201,7 +204,7 @@ public final class MainActivity extends NativeActivity {
             return uri.getLastPathSegment();
         }
         if (isInput(request)) {
-            return "scan.ser";
+            return request == OPEN_FLAT ? "flat.ser" : "scan.ser";
         }
         return request == SAVE_FITS ? "reconstruction.fits" : "reconstruction.png";
     }

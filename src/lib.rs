@@ -1,5 +1,6 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod display;
 mod fits;
 mod flat;
 mod geometry;
@@ -18,7 +19,9 @@ mod android;
 #[cfg(target_os = "android")]
 mod android_document;
 
+pub use display::{DisplayImage, Product, Stretch};
 pub use fits::FitsMetadata;
+pub use flat::PhysicalFlat;
 pub use geometry::DiskGeometry;
 pub use observation::Observation;
 pub use profile::{LineFit, LineProfile};
@@ -44,6 +47,14 @@ pub enum Error {
     NoSolarLimb,
     #[error("Too few usable disk samples for synthetic flat correction.")]
     NoFlatSamples,
+    #[error("The flat SER must match the scan dimensions, color mode and bit depth.")]
+    FlatMismatch,
+    #[error("The flat SER does not illuminate the full slit reliably.")]
+    InvalidPhysicalFlat,
+    #[error("The scan must cover both wings at the selected Doppler offset.")]
+    DopplerCoverage,
+    #[error("Set the signed wavelength dispersion before creating a Doppler image.")]
+    DopplerDispersion,
     #[error("The reconstruction exceeds the supported 32 megapixels.")]
     OutputTooLarge,
     #[error("The frame interval must be at least one.")]

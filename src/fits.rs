@@ -10,6 +10,7 @@ pub struct FitsMetadata {
     pub observation: Observation,
     pub source_name: Option<String>,
     pub source_header: Option<Header>,
+    pub flat_file: Option<String>,
     pub frame_step: Option<u32>,
     pub offset_pixels: Option<f64>,
     pub line_center_angstrom: Option<f64>,
@@ -40,7 +41,9 @@ impl Reconstruction {
             "BZERO   =                32768".to_owned(),
             text_card("ORIGIN", APP_NAME),
         ];
-        if self.has_synthetic_flat() {
+        if metadata.flat_file.is_some() {
+            cards.push(text_card("FLATCORR", "PHYSICAL"));
+        } else if self.has_synthetic_flat() {
             cards.push(text_card("FLATCORR", "SYNTHETIC"));
         }
         metadata.cards(&mut cards);
@@ -77,6 +80,7 @@ impl FitsMetadata {
             ("FILTER", obs.filter.as_deref()),
             ("RECORDER", obs.recorder),
             ("SERFILE", self.source_name.as_deref()),
+            ("FLATFILE", self.flat_file.as_deref()),
         ] {
             if let Some(text) = text {
                 cards.push(text_card(key, text));

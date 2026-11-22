@@ -1,6 +1,7 @@
 use crate::geometry::FittedDisk;
 use crate::regression::weighted_fit;
-use crate::{DiskGeometry, Error, Reconstruction};
+use crate::{DiskGeometry, Error, Reconstruction, SerReader, Spectrum};
+use std::io::{Read, Seek};
 
 const FIT_RADIUS: f64 = 0.85;
 const GRID_SIDE: usize = 160;
@@ -8,6 +9,98 @@ const MIN_GAIN: f64 = 0.8;
 const MIN_RESPONSE_CHANGE: f64 = 0.04;
 // Exclude near-white samples, including an 8-bit SER expanded into 16 bits.
 const SATURATION_CUTOFF: u16 = 65_280;
+
+/// Smooth slit throughput estimated from an independently captured flat SER.
+pub struct PhysicalFlat {
+    gains: Vec<f32>,
+}
+
+impl PhysicalFlat {
+    pub fn from_ser<R: Read + Seek>(
+        reader: &mut SerReader<R>,
+        scan: &Spectrum,
+        mut progress: impl FnMut(f32) -> bool,
+    ) -> Result<Self, Error> {
+        let (scan, (left, right)) = scan.slit();
+        let flat = reader.header();
+        if (scan.width, scan.height, scan.depth, scan.color)
+            != (flat.width, flat.height, flat.depth, flat.color)
+        {
+            return Err(Error::FlatMismatch);
+        }
+        let spectrum = Spectrum::average(reader, |p| progress(p * 0.9))?;
+        let slit_width = right - left + 1;
+        let mut response = vec![0.; slit_width];
+        let mut counts = vec![0_u32; slit_width];
+        let mut row_samples = Vec::with_capacity(slit_width);
+        let mut usable_rows = 0_u32;
+        for row in spectrum
+            .pixels()
+            .chunks_exact(flat.width)
+            .step_by(flat.height.div_ceil(64))
+        {
+            let row = &row[left..=right];
+            row_samples.clear();
+            let usable = |value: f32| (4. ..f32::from(SATURATION_CUTOFF)).contains(&value);
+            row_samples.extend(row.iter().copied().filter(|&v| usable(v)));
+            if row_samples.len() < slit_width * 3 / 4 || row_samples.is_empty() {
+                continue;
+            }
+            let mid = row_samples.len() / 2;
+            let level = *row_samples.select_nth_unstable_by(mid, f32::total_cmp).1;
+            usable_rows += 1;
+            for (x, &value) in row.iter().enumerate() {
+                if usable(value) && value >= level / 8. {
+                    response[x] += value / level;
+                    counts[x] += 1;
+                }
+            }
+        }
+        if usable_rows == 0 || counts.iter().any(|&count| count < usable_rows.div_ceil(2)) {
+            return Err(Error::InvalidPhysicalFlat);
+        }
+        for (value, count) in response.iter_mut().zip(counts) {
+            *value /= count as f32;
+        }
+        let mut gains = vec![1.; flat.width];
+        let slit_gains = &mut gains[left..=right];
+        for (x, gain) in slit_gains.iter_mut().enumerate() {
+            let local = &response[x.saturating_sub(4)..(x + 5).min(slit_width)];
+            let mut median = [0.; 9];
+            median[..local.len()].copy_from_slice(local);
+            *gain = *median[..local.len()]
+                .select_nth_unstable_by(local.len() / 2, f32::total_cmp)
+                .1;
+        }
+        let (low, high) = slit_gains
+            .iter()
+            .fold((f32::INFINITY, 0_f32), |(low, high), &v| {
+                (low.min(v), high.max(v))
+            });
+        if low < high * 0.25 {
+            return Err(Error::InvalidPhysicalFlat);
+        }
+        for gain in slit_gains {
+            *gain = low / *gain;
+        }
+        if !progress(1.) {
+            return Err(Error::Cancelled);
+        }
+        Ok(Self { gains })
+    }
+
+    pub fn apply(&self, image: &mut Reconstruction) -> Result<(), Error> {
+        if image.width != self.gains.len() {
+            return Err(Error::FlatMismatch);
+        }
+        for row in image.pixels.chunks_exact_mut(image.width) {
+            for (pixel, gain) in row.iter_mut().zip(&self.gains) {
+                *pixel = (f32::from(*pixel) * gain).round() as u16;
+            }
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Sample {

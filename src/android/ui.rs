@@ -4,6 +4,24 @@ use crate::solar_atlas::{ReferenceProfile, reference_profile};
 const CYAN: Color32 = Color32::from_rgb(131, 208, 225);
 const ATLAS_COLOR: Color32 = Color32::from_rgb(194, 160, 255);
 
+fn product_label(product: Product, lang: Language) -> &'static str {
+    match product {
+        Product::Gray => lang.text("Grayscale", "灰度图"),
+        Product::Hydrogen => lang.text("Hα false color", "Hα 假彩色"),
+        Product::Calcium => lang.text("Ca II false color", "Ca II 假彩色"),
+        Product::Helium => lang.text("He I false color", "He I 假彩色"),
+        Product::Doppler => lang.text("Doppler contrast", "双翼多普勒图"),
+    }
+}
+
+fn flat_label(mode: FlatMode, lang: Language) -> &'static str {
+    match mode {
+        FlatMode::Off => lang.text("Off", "关闭"),
+        FlatMode::Synthetic => lang.text("Synthetic", "虚拟平场"),
+        FlatMode::Physical => lang.text("Captured SER", "实拍平场"),
+    }
+}
+
 impl eframe::App for Mobile {
     fn ui(&mut self, ui: &mut Ui, _: &mut eframe::Frame) {
         self.receive(ui.ctx());
@@ -364,13 +382,107 @@ impl Mobile {
             if self.profile.is_none() {
                 wavelength_calibration(ui, &mut self.wavelength, &mut self.dispersion, lang, busy);
             }
-            ui.add_enabled(
-                !busy,
-                egui::Checkbox::new(
-                    &mut self.synthetic_flat,
-                    lang.text("Synthetic flat correction", "合成平场校正"),
-                ),
-            );
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.label(lang.text("Image product", "图像产品"));
+                ui.horizontal_wrapped(|ui| {
+                    for product in [
+                        Product::Gray,
+                        Product::Hydrogen,
+                        Product::Calcium,
+                        Product::Helium,
+                        Product::Doppler,
+                    ] {
+                        let button = egui::Button::new(product_label(product, lang))
+                            .selected(self.product == product);
+                        if ui.add(button).clicked() {
+                            self.product = product;
+                        }
+                    }
+                });
+                if self.product == Product::Doppler {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            lang.text("Wing offset from sampling center", "相对采样中心的谱翼偏移"),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut self.wing_offset)
+                                .range(0.5..=(header.height as f64 / 2.).max(0.5))
+                                .speed(0.1)
+                                .prefix("±")
+                                .suffix(" px"),
+                        );
+                    });
+                    let (hint, color) = if self.dispersion == 0. {
+                        (
+                            lang.text(
+                                "Set signed dispersion in Wavelength calibration.",
+                                "请在波长标定中填写带正负号的色散。",
+                            ),
+                            AMBER,
+                        )
+                    } else if self
+                        .scan
+                        .as_ref()
+                        .zip(self.trace)
+                        .is_some_and(|(scan, trace)| {
+                            !scan
+                                .spectrum
+                                .supports_wings(trace, self.shift, self.wing_offset)
+                        })
+                    {
+                        (
+                            lang.text(
+                                "The scan does not cover both wings at this offset.",
+                                "当前扫描无法覆盖所选偏移处的两侧谱翼。",
+                            ),
+                            AMBER,
+                        )
+                    } else {
+                        (
+                            lang.text(
+                                "Red and blue show relative wing contrast.",
+                                "红色和蓝色表示两侧谱翼的相对强度差。",
+                            ),
+                            MUTED,
+                        )
+                    };
+                    ui.label(RichText::new(hint).color(color));
+                }
+                ui.label(lang.text("Flat correction", "平场校正"));
+                ui.horizontal_wrapped(|ui| {
+                    for mode in [FlatMode::Off, FlatMode::Synthetic, FlatMode::Physical] {
+                        let button = egui::Button::new(flat_label(mode, lang))
+                            .selected(self.flat_mode == mode);
+                        if ui.add(button).clicked() {
+                            if mode == FlatMode::Physical && self.physical_flat.is_none() {
+                                self.pick(OPEN_FLAT);
+                            } else {
+                                self.flat_mode = mode;
+                            }
+                        }
+                    }
+                });
+                if self.flat_mode == FlatMode::Physical {
+                    if let Some((_, name)) = &self.physical_flat {
+                        ui.label(RichText::new(name).color(MUTED));
+                    }
+                    if ui
+                        .button(lang.text("Replace flat SER", "更换平场 SER"))
+                        .clicked()
+                    {
+                        self.pick(OPEN_FLAT);
+                    }
+                }
+                if self.flat_mode == FlatMode::Synthetic && self.product == Product::Doppler {
+                    ui.label(
+                        RichText::new(lang.text(
+                            "Doppler skips synthetic flat. Shared slit gain cancels in the ratio.",
+                            "双翼多普勒跳过虚拟平场。共同的狭缝增益在谱翼比值中抵消。",
+                        ))
+                        .color(MUTED),
+                    );
+                }
+            });
             ui.add_enabled(
                 !busy,
                 egui::Checkbox::new(
@@ -378,8 +490,9 @@ impl Mobile {
                     lang.text("Correct full-disk geometry", "校正太阳盘几何形状"),
                 ),
             );
-            if header.minimum_stride() > 1 {
-                let stride = self.stride;
+            let minimum = self.minimum_stride(header);
+            let mut stride = self.stride.max(minimum);
+            if minimum > 1 || stride > 1 {
                 let summary = match lang {
                     Language::English => format!("Large scan · using every {stride} frames"),
                     Language::Chinese => format!("大文件 · 每 {stride} 帧取一帧"),
@@ -391,14 +504,19 @@ impl Mobile {
             )
             .id_salt("scan_sampling")
             .show(ui, |ui| {
-                ui.add_enabled(
-                    !busy,
-                    egui::DragValue::new(&mut self.stride)
-                        .range(header.minimum_stride()..=header.frames)
-                        .prefix(lang.text("Every ", "每 "))
-                        .suffix(lang.text(" frames", " 帧取一帧")),
-                );
-                let (width, height) = (header.width, header.frames.div_ceil(self.stride));
+                if ui
+                    .add_enabled(
+                        !busy,
+                        egui::DragValue::new(&mut stride)
+                            .range(minimum..=header.frames)
+                            .prefix(lang.text("Every ", "每 "))
+                            .suffix(lang.text(" frames", " 帧取一帧")),
+                    )
+                    .changed()
+                {
+                    self.stride = stride;
+                }
+                let (width, height) = (header.width, header.frames.div_ceil(stride));
                 let size = match lang {
                     Language::English => {
                         format!("{width} × {height} px before geometry correction")
@@ -414,14 +532,7 @@ impl Mobile {
         let Some(output) = &self.output else { return };
         let lang = self.language;
         card(ui, |ui| {
-            heading(
-                ui,
-                if output.metadata.geometry.is_some() {
-                    lang.text("Corrected solar scan", "已校正的太阳图像")
-                } else {
-                    lang.text("Reconstructed scan", "重建图像")
-                },
-            );
+            heading(ui, product_label(output.product, lang));
             let (w, h) = (output.image.width(), output.image.height());
             let shift = output.metadata.offset_pixels.unwrap_or(0.);
             let size = match lang {
@@ -429,20 +540,24 @@ impl Mobile {
                 Language::Chinese => format!("{w} × {h} px · 偏移 {shift:+.2} px"),
             };
             ui.label(RichText::new(size).color(MUTED));
-            if output.image.has_synthetic_flat() {
+            if output.product == Product::Doppler {
+                let offset = output.wing_offset;
+                let label = match lang {
+                    Language::English => format!("Wings ±{offset:.2} px · qualitative contrast"),
+                    Language::Chinese => format!("谱翼 ±{offset:.2} px · 定性对比"),
+                };
+                ui.label(RichText::new(label).color(MUTED));
+            }
+            if let Some(name) = &output.metadata.flat_file {
+                let label = lang.text("Captured flat applied", "已应用实拍平场");
+                ui.label(RichText::new(format!("{label} · {name}")).color(MUTED));
+            } else if output.image.has_synthetic_flat() {
                 ui.label(
-                    RichText::new(lang.text("Synthetic flat applied", "已应用合成平场"))
+                    RichText::new(lang.text("Synthetic flat applied", "已应用虚拟平场"))
                         .color(MUTED),
                 );
             }
             picture(ui, &output.texture, w, h, 0. ..=430., Sense::hover());
-            ui.label(
-                RichText::new(lang.text(
-                    "Screen contrast is stretched. Export keeps 16-bit samples.",
-                    "预览已拉伸对比度，导出保留 16 位像素。",
-                ))
-                .color(MUTED),
-            );
         });
     }
 
@@ -461,18 +576,24 @@ impl Mobile {
                 }
             }
             Page::Result => {
+                if action(ui, lang.text("Save PNG", "保存 PNG"), !busy, true) {
+                    self.pick(SAVE_PNG);
+                }
+                if self
+                    .output
+                    .as_ref()
+                    .is_none_or(|output| output.product == Product::Doppler)
+                {
+                    return;
+                }
                 let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.;
                 ui.horizontal(|ui| {
-                    for (label, request, primary) in [
-                        (lang.text("Save FITS", "保存 FITS"), SAVE_FITS, true),
-                        (lang.text("Save PNG", "保存 PNG"), SAVE_PNG, false),
+                    for (label, request) in [
+                        (lang.text("Save FITS", "保存 FITS"), SAVE_FITS),
+                        (lang.text("16-bit PNG", "16 位 PNG"), SAVE_RAW_PNG),
                     ] {
                         let text = RichText::new(label).size(15.).strong();
-                        let button = if primary {
-                            egui::Button::new(text.color(BACKGROUND)).fill(AMBER)
-                        } else {
-                            egui::Button::new(text)
-                        };
+                        let button = egui::Button::new(text);
                         if ui
                             .add_enabled(!busy, button.min_size(vec2(width, 44.)))
                             .clicked()
