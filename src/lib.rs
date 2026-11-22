@@ -27,7 +27,7 @@ pub use geometry::DiskGeometry;
 pub use observation::Observation;
 pub use optics::OpticalSetup;
 pub use profile::{LineFit, LineProfile};
-pub use reconstruct::{Reconstruction, reconstruct, reconstruct_with_stride};
+pub use reconstruct::{Reconstruction, reconstruct, reconstruct_offsets, reconstruct_with_stride};
 pub use ser::{ByteOrder, ColorMode, Header, SerReader};
 pub use spectrum::{Spectrum, Trace};
 

@@ -91,8 +91,21 @@ pub fn reconstruct_with_stride<R: Read + Seek>(
     trace: Trace,
     shift: f64,
     stride: u32,
-    mut progress: impl FnMut(f32) -> bool,
+    progress: impl FnMut(f32) -> bool,
 ) -> Result<Reconstruction, Error> {
+    let [image] = reconstruct_offsets(reader, trace, [shift], stride, progress)?;
+    Ok(image)
+}
+
+/// Extract multiple spectral offsets from each sampled frame before advancing
+/// the reader. Results share the scan sampling and follow the offset order.
+pub fn reconstruct_offsets<R: Read + Seek, const N: usize>(
+    reader: &mut SerReader<R>,
+    trace: Trace,
+    shifts: [f64; N],
+    stride: u32,
+    mut progress: impl FnMut(f32) -> bool,
+) -> Result<[Reconstruction; N], Error> {
     let header = reader.header();
     let width = header.width;
     if stride == 0 {
@@ -100,13 +113,11 @@ pub fn reconstruct_with_stride<R: Read + Seek>(
     }
     let frames = header.frames.div_ceil(stride);
     let height = frames as usize;
-    if width
-        .checked_mul(height)
-        .is_none_or(|size| size > MAX_PIXELS)
-    {
+    let size = width.checked_mul(height).ok_or(Error::OutputTooLarge)?;
+    if size.checked_mul(N).is_none_or(|count| count > MAX_PIXELS) {
         return Err(Error::OutputTooLarge);
     }
-    if !shift.is_finite() || trace.width() != width {
+    if N == 0 || shifts.iter().any(|shift| !shift.is_finite()) || trace.width() != width {
         return Err(Error::InvalidTrace);
     }
 
@@ -116,7 +127,70 @@ pub fn reconstruct_with_stride<R: Read + Seek>(
         &[-1., -0.5, 0., 0.5, 1.]
     };
     let weights: Vec<_> = offsets.iter().map(|dy| (-0.5 * dy * dy).exp()).collect();
-    let mut columns = Vec::with_capacity(width);
+    let mut columns: [Vec<Column>; N] = std::array::from_fn(|_| Vec::new());
+    let mut first_row = header.height;
+    let mut last_row = 0;
+    for (columns, shift) in columns.iter_mut().zip(shifts) {
+        let (first, last) = plan_columns(header, trace, shift, offsets, &weights, columns)?;
+        first_row = first_row.min(first);
+        last_row = last_row.max(last);
+    }
+    let band_height = last_row - first_row + 1;
+    // Keep sequential reads when skipping a small number of bytes per frame.
+    let use_band = band_height <= header.height / 2
+        && (header.height - band_height) * header.row_bytes() >= 4096;
+    let rows = if use_band {
+        let start = first_row * width;
+        for column in columns.iter_mut().flatten() {
+            for tap in &mut column.taps[..column.count] {
+                tap.index -= start;
+            }
+        }
+        first_row..last_row + 1
+    } else {
+        0..header.height
+    };
+
+    let mut images: [Reconstruction; N] = std::array::from_fn(|_| Reconstruction {
+        width,
+        height,
+        pixels: Vec::new(),
+        synthetic_flat: false,
+    });
+    for image in &mut images {
+        image.pixels.try_reserve_exact(size)?;
+    }
+    for i in 0..frames {
+        if !progress(i as f32 / frames as f32) {
+            return Err(Error::Cancelled);
+        }
+        let frame = reader.frame_rows(i * stride, rows.clone())?;
+        for (image, columns) in images.iter_mut().zip(&columns) {
+            for column in columns {
+                let sample = column.taps[..column.count]
+                    .iter()
+                    .map(|tap| tap.weight * f64::from(header.sample(frame, tap.index, rows.start)))
+                    .sum::<f64>();
+                image.pixels.push(sample.round() as u16);
+            }
+        }
+    }
+    if !progress(1.) {
+        return Err(Error::Cancelled);
+    }
+    Ok(images)
+}
+
+fn plan_columns(
+    header: Header,
+    trace: Trace,
+    shift: f64,
+    offsets: &[f64],
+    weights: &[f64],
+    columns: &mut Vec<Column>,
+) -> Result<(usize, usize), Error> {
+    let width = header.width;
+    columns.try_reserve_exact(width)?;
     let mut first_row = header.height;
     let mut last_row = 0;
     for x in 0..width {
@@ -126,7 +200,7 @@ pub fn reconstruct_with_stride<R: Read + Seek>(
             count: 0,
         };
         let mut weight_sum = 0.;
-        for (&offset, &weight) in offsets.iter().zip(&weights) {
+        for (&offset, &weight) in offsets.iter().zip(weights) {
             let y = center + offset;
             let low = y.floor();
             let high = if header.height == 1 && y == 0. {
@@ -164,44 +238,5 @@ pub fn reconstruct_with_stride<R: Read + Seek>(
     if first_row == header.height {
         return Err(Error::InvalidTrace);
     }
-    let band_height = last_row - first_row + 1;
-    // Keep sequential reads when skipping a small number of bytes per frame.
-    let use_band = band_height <= header.height / 2
-        && (header.height - band_height) * header.row_bytes() >= 4096;
-    let rows = if use_band {
-        let start = first_row * width;
-        for column in &mut columns {
-            for tap in &mut column.taps[..column.count] {
-                tap.index -= start;
-            }
-        }
-        first_row..last_row + 1
-    } else {
-        0..header.height
-    };
-
-    let mut pixels = Vec::new();
-    pixels.try_reserve_exact(width * height)?;
-    for i in 0..frames {
-        if !progress(i as f32 / frames as f32) {
-            return Err(Error::Cancelled);
-        }
-        let frame = reader.frame_rows(i * stride, rows.clone())?;
-        for column in &columns {
-            let sample = column.taps[..column.count]
-                .iter()
-                .map(|tap| tap.weight * f64::from(header.sample(frame, tap.index, rows.start)))
-                .sum::<f64>();
-            pixels.push(sample.round() as u16);
-        }
-    }
-    if !progress(1.) {
-        return Err(Error::Cancelled);
-    }
-    Ok(Reconstruction {
-        width,
-        height,
-        pixels,
-        synthetic_flat: false,
-    })
+    Ok((first_row, last_row))
 }

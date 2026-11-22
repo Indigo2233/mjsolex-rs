@@ -17,11 +17,11 @@ pub(crate) struct DocumentFile {
 impl DocumentFile {
     pub(crate) fn from_android(
         env: &mut JNIEnv<'_>,
-        object: JObject<'_>,
+        object: &JObject<'_>,
         export: bool,
     ) -> io::Result<Self> {
         let fd = env
-            .call_method(&object, "getFd", "()I", &[])
+            .call_method(object, "getFd", "()I", &[])
             .and_then(|value| value.i())
             .map_err(io::Error::other)?;
         if fd < 0 {

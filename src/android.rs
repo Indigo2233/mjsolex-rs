@@ -21,13 +21,15 @@ use crate::ser::cache_recording;
 use crate::{
     APP_NAME, ByteOrder, DiskGeometry, DisplayImage, Error, FitsMetadata, Header, LineProfile,
     Observation, OpticalSetup, PhysicalFlat, Product, Reconstruction, SerReader, Spectrum, Stretch,
-    Trace, reconstruct_with_stride,
+    Trace, reconstruct_offsets, reconstruct_with_stride,
 };
 
 mod language;
+mod results;
 mod ui;
 
 use language::{Language, Notice};
+use results::{Export, Images, PALETTES};
 
 const OPEN_SER: i32 = 10;
 const SAVE_PNG: i32 = 11;
@@ -35,6 +37,7 @@ const SAVE_FITS: i32 = 12;
 const OPEN_SHARED: i32 = 13;
 const OPEN_FLAT: i32 = 14;
 const SAVE_RAW_PNG: i32 = 15;
+const SAVE_BATCH: i32 = 16;
 const BACKGROUND: Color32 = Color32::from_rgb(17, 21, 27);
 const CARD: Color32 = Color32::from_rgb(28, 35, 44);
 const TEXT: Color32 = Color32::from_rgb(240, 243, 247);
@@ -61,6 +64,7 @@ impl Events {
 
 enum Event {
     Document(i32, Result<Document, String>),
+    Directory(Result<Option<GlobalRef>, String>),
     SharedAvailable,
     Progress(f32),
     Finished(Result<Work, Error>),
@@ -70,15 +74,16 @@ enum Work {
     Imported(Box<Imported>),
     FlatImported(PhysicalFlat, String),
     Reconstructed {
-        image: Arc<Reconstruction>,
-        blue: Option<Arc<Reconstruction>>,
-        product: Product,
-        wing_offset: f64,
+        images: Arc<Images>,
         preview: ColorImage,
-        metadata: Box<FitsMetadata>,
         warning: Option<Notice>,
     },
+    Previewed(Product, ColorImage),
     Exported(String),
+    BatchExported {
+        saved: usize,
+        error: Option<Error>,
+    },
 }
 
 struct Imported {
@@ -103,12 +108,19 @@ struct Scan {
 }
 
 struct Output {
-    image: Arc<Reconstruction>,
-    blue: Option<Arc<Reconstruction>>,
-    product: Product,
-    wing_offset: f64,
+    images: Arc<Images>,
+    shown: Product,
     texture: TextureHandle,
-    metadata: FitsMetadata,
+}
+
+impl Output {
+    fn export(&self, request: i32) -> Export {
+        match request {
+            SAVE_FITS => Export::Fits,
+            SAVE_RAW_PNG => Export::RawPng,
+            _ => Export::Display(self.shown),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -161,7 +173,7 @@ impl Calibration {
 }
 
 struct Mobile {
-    vm: JavaVM,
+    vm: Arc<JavaVM>,
     activity: GlobalRef,
     cache: PathBuf,
     events: Events,
@@ -178,7 +190,8 @@ struct Mobile {
     correct_disk: bool,
     flat_mode: FlatMode,
     physical_flat: Option<(Arc<PhysicalFlat>, String)>,
-    product: Product,
+    palettes: [bool; 3],
+    doppler: bool,
     wing_offset: f64,
     output: Option<Output>,
     page: Page,
@@ -296,7 +309,7 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onDocument(
         name.map(|name| {
             DocumentFile::from_android(
                 &mut env,
-                descriptor,
+                &descriptor,
                 !matches!(request, OPEN_SER | OPEN_SHARED | OPEN_FLAT),
             )
             .map(|file| Some((file, name)))
@@ -319,6 +332,27 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onShareAvailable(
 ) {
     if let Some(events) = activity_events(&env, &activity) {
         events.post(Event::SharedAvailable);
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_org_mjsolex_mobile_MainActivity_onExportDirectory(
+    env: JNIEnv<'_>,
+    activity: JObject<'_>,
+    uri: JObject<'_>,
+) {
+    if let Some(events) = activity_events(&env, &activity) {
+        let directory = if uri.is_null() {
+            Ok(None)
+        } else {
+            env.new_global_ref(uri)
+                .map(Some)
+                .map_err(|e| format!("access:{e}"))
+        };
+        if env.exception_check().unwrap_or(false) {
+            let _ = env.exception_clear();
+        }
+        events.post(Event::Directory(directory));
     }
 }
 
@@ -353,7 +387,7 @@ impl Mobile {
         context.set_theme(egui::Theme::Dark);
         language::install_fonts(context);
         Self {
-            vm,
+            vm: Arc::new(vm),
             activity,
             cache,
             events,
@@ -370,7 +404,8 @@ impl Mobile {
             correct_disk: false,
             flat_mode: FlatMode::default(),
             physical_flat: None,
-            product: Product::default(),
+            palettes: [true, false, false],
+            doppler: false,
             wing_offset: 2.,
             output: None,
             page: Page::Scan,
@@ -413,47 +448,10 @@ impl Mobile {
                 let activity = self.activity.as_obj();
                 if matches!(request, OPEN_SER | OPEN_FLAT) {
                     env.call_method(activity, "pickSer", "(I)V", &[JValue::Int(request)])?;
-                } else {
-                    let name = self
-                        .scan
-                        .as_ref()
-                        .map(|scan| scan.name.as_str())
-                        .unwrap_or("scan");
-                    let stem = Path::new(name)
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("scan");
-                    let ext = if request == SAVE_FITS { "fits" } else { "png" };
-                    let Some(output) = &self.output else {
-                        return Ok(());
-                    };
-                    let details = &output.metadata;
-                    let flat = if output.image.has_synthetic_flat() || details.flat_file.is_some() {
-                        "-flat"
-                    } else {
-                        ""
-                    };
-                    let geometry = if details.geometry.is_some() {
-                        "-disk"
-                    } else {
-                        ""
-                    };
-                    let shift = details
-                        .offset_pixels
-                        .filter(|shift| *shift != 0.)
-                        .map(|shift| format!("-{shift:+.2}px"))
-                        .unwrap_or_default();
-                    let product = match request {
-                        SAVE_PNG if output.product == Product::Doppler => {
-                            format!("-doppler-w{:.2}px", output.wing_offset)
-                        }
-                        SAVE_PNG => format!("{}-display", output.product.suffix()),
-                        SAVE_RAW_PNG => "-raw".into(),
-                        _ => String::new(),
-                    };
-                    let name = env.new_string(format!(
-                        "{stem}-reconstruction{shift}{flat}{geometry}{product}.{ext}"
-                    ))?;
+                } else if request == SAVE_BATCH {
+                    env.call_method(activity, "pickExportDirectory", "()V", &[])?;
+                } else if let Some(output) = output {
+                    let name = env.new_string(output.images.file_name(output.export(request)))?;
                     env.call_method(
                         activity,
                         "createImage",
@@ -586,11 +584,33 @@ impl Mobile {
     }
 
     fn minimum_stride(&self, header: Header) -> u32 {
-        if self.product == Product::Doppler {
+        if self.doppler_shift().is_ok_and(|shift| shift.is_some()) {
             header.minimum_doppler_stride()
         } else {
             header.minimum_stride()
         }
+    }
+
+    fn doppler_shift(&self) -> Result<Option<f64>, Error> {
+        if !self.doppler {
+            return Ok(None);
+        }
+        let dispersion = self
+            .calibration
+            .dispersion()
+            .ok_or(Error::DopplerDispersion)?;
+        let (scan, trace) = self
+            .scan
+            .as_ref()
+            .zip(self.trace)
+            .ok_or(Error::DopplerCoverage)?;
+        if !scan
+            .spectrum
+            .supports_wings(trace, self.shift, self.wing_offset)
+        {
+            return Err(Error::DopplerCoverage);
+        }
+        Ok(Some(self.wing_offset.copysign(dispersion)))
     }
 
     fn reload_byte_order(&mut self, order: Option<ByteOrder>) {
@@ -608,23 +628,14 @@ impl Mobile {
         let (Some(scan), Some(trace)) = (&self.scan, self.trace) else {
             return;
         };
-        let product = self.product;
+        let palettes = self.palettes;
         let wing_offset = self.wing_offset;
         let shift = self.shift;
         let dispersion = self.calibration.dispersion();
         let wavelength = self.calibration.wavelength;
-        let wings = if product == Product::Doppler {
-            let Some(dispersion) = dispersion else {
-                self.note = Some(Notice::Processing(Error::DopplerDispersion));
-                return;
-            };
-            if !scan.spectrum.supports_wings(trace, shift, wing_offset) {
-                self.note = Some(Notice::Processing(Error::DopplerCoverage));
-                return;
-            }
-            Some(wing_offset.copysign(dispersion))
-        } else {
-            None
+        let (wing_shift, doppler_error) = match self.doppler_shift() {
+            Ok(shift) => (shift, None),
+            Err(error) => (None, Some(error)),
         };
         let file = match scan.file.try_clone() {
             Ok(file) => file,
@@ -636,7 +647,7 @@ impl Mobile {
         let order = scan.byte_order;
         let header = scan.header;
         let correct_disk = self.correct_disk;
-        let synthetic_flat = self.flat_mode == FlatMode::Synthetic && wings.is_none();
+        let synthetic_flat = self.flat_mode == FlatMode::Synthetic;
         let physical_flat = if self.flat_mode == FlatMode::Physical {
             self.physical_flat.clone()
         } else {
@@ -673,23 +684,20 @@ impl Mobile {
                 } else {
                     geometry_start
                 };
-                let mut raw = reconstruct_with_stride(
-                    &mut reader,
-                    trace,
-                    shift + wings.unwrap_or(0.),
-                    stride,
-                    |p| progress(p * flat_start * if wings.is_some() { 0.5 } else { 1. }),
-                )?;
-                let mut blue = if let Some(wing) = wings {
-                    Some(reconstruct_with_stride(
+                let (mut raw, mut wings) = if let Some(wing) = wing_shift {
+                    let [center, red, blue] = reconstruct_offsets(
                         &mut reader,
                         trace,
-                        shift - wing,
+                        [shift, shift + wing, shift - wing],
                         stride,
-                        |p| progress((0.5 + p * 0.5) * flat_start),
-                    )?)
+                        |p| progress(p * flat_start),
+                    )?;
+                    (center, Some([red, blue]))
                 } else {
-                    None
+                    let center = reconstruct_with_stride(&mut reader, trace, shift, stride, |p| {
+                        progress(p * flat_start)
+                    })?;
+                    (center, None)
                 };
                 drop(reader);
                 let mut flat_error = None;
@@ -703,8 +711,10 @@ impl Mobile {
                     }
                 } else if let Some((flat, name)) = physical_flat {
                     flat.apply(&mut raw)?;
-                    if let Some(blue) = &mut blue {
-                        flat.apply(blue)?;
+                    if let Some(wings) = &mut wings {
+                        for wing in wings {
+                            flat.apply(wing)?;
+                        }
                     }
                     metadata.flat_file = Some(name);
                 }
@@ -715,64 +725,80 @@ impl Mobile {
                 if correct_disk {
                     let corrected = (|| {
                         let geometry = DiskGeometry::fit(&raw)?;
-                        let span = if blue.is_some() { 0.065 } else { 0.13 };
-                        let budget = if blue.is_some() {
+                        let span = if wings.is_some() { 0.13 / 3. } else { 0.13 };
+                        let budget = if wings.is_some() {
                             MAX_DOPPLER_WING_PIXELS
                         } else {
                             MAX_PIXELS
                         };
-                        let red = geometry.correct_with_budget(&raw, budget, |p| {
-                            progress(geometry_start + p * span)
-                        })?;
-                        let blue = blue
+                        let mut correct = |image, step| {
+                            geometry.correct_with_budget(image, budget, |p| {
+                                progress(geometry_start + (step + p) * span)
+                            })
+                        };
+                        let center = correct(&raw, 0.)?;
+                        let wings = wings
                             .as_ref()
-                            .map(|wing| {
-                                geometry.correct_with_budget(wing, budget, |p| {
-                                    progress(geometry_start + (1. + p) * span)
-                                })
+                            .map(|[red, blue]| {
+                                Ok::<_, Error>([correct(red, 1.)?, correct(blue, 2.)?])
                             })
                             .transpose()?;
-                        Ok::<_, Error>((geometry, red, blue))
+                        Ok::<_, Error>((geometry, center, wings))
                     })();
                     match corrected {
-                        Ok((geometry, corrected_red, corrected_blue)) => {
+                        Ok((geometry, corrected_center, corrected_wings)) => {
                             metadata.geometry = Some(geometry);
-                            raw = corrected_red;
-                            blue = corrected_blue;
+                            raw = corrected_center;
+                            wings = corrected_wings;
                         }
                         Err(Error::Cancelled) => return Err(Error::Cancelled),
                         Err(error) => disk_error = Some(error),
                     }
                 }
-                let display = DisplayImage::new(&raw, blue.as_ref(), product)?;
-                let preview = preview_rgb(raw.width(), raw.height(), |i| display.pixel(i));
+                let images = Images {
+                    center: raw,
+                    wings,
+                    palettes,
+                    wing_offset,
+                    metadata,
+                };
+                let preview = images.preview(Product::Gray)?;
                 if !progress(1.) {
                     return Err(Error::Cancelled);
                 }
                 let warning =
-                    (flat_error.is_some() || disk_error.is_some()).then_some(Notice::Corrections {
-                        flat: flat_error,
-                        disk: disk_error,
-                    });
+                    (flat_error.is_some() || disk_error.is_some() || doppler_error.is_some())
+                        .then_some(Notice::Corrections {
+                            flat: flat_error,
+                            disk: disk_error,
+                            doppler: doppler_error,
+                        });
                 Ok(Work::Reconstructed {
-                    image: Arc::new(raw),
-                    blue: blue.map(Arc::new),
-                    product,
-                    wing_offset,
+                    images: Arc::new(images),
                     preview,
-                    metadata: Box::new(metadata),
                     warning,
                 })
             },
         );
     }
 
-    fn export(&mut self, request: i32, mut file: DocumentFile, name: String) {
+    fn show_product(&mut self, product: Product) {
         let Some(output) = &self.output else { return };
-        let image = output.image.clone();
-        let blue = output.blue.clone();
-        let product = output.product;
-        let metadata = output.metadata.clone();
+        if output.shown == product || !output.images.products().any(|item| item == product) {
+            return;
+        }
+        let images = output.images.clone();
+        self.start_job(
+            ("Preparing preview", "正在准备预览"),
+            false,
+            move |_, _| Ok(Work::Previewed(product, images.preview(product)?)),
+        );
+    }
+
+    fn export(&mut self, request: i32, file: DocumentFile, name: String) {
+        let Some(output) = &self.output else { return };
+        let images = output.images.clone();
+        let export = output.export(request);
         let fits = request == SAVE_FITS;
         self.start_job(
             if fits {
@@ -782,21 +808,42 @@ impl Mobile {
             },
             false,
             move |_, _| {
-                let result = (|| -> Result<(), Error> {
-                    let mut writer = BufWriter::new(&mut file.file);
-                    match request {
-                        SAVE_FITS => image.write_fits_with_metadata(&mut writer, &metadata)?,
-                        SAVE_RAW_PNG => image.write_png(&mut writer)?,
-                        _ => DisplayImage::new(&image, blue.as_deref(), product)?
-                            .write_png(&mut writer)?,
-                    }
-                    writer.flush()?;
-                    Ok(())
-                })();
-                let closed = file.finish_export(result.is_err());
-                result?;
-                closed?;
+                results::write_destination(file, &images, export)?;
                 Ok(Work::Exported(name))
+            },
+        );
+    }
+
+    fn export_directory(&mut self, directory: GlobalRef) {
+        let Some(output) = &self.output else { return };
+        let images = output.images.clone();
+        let vm = self.vm.clone();
+        let activity = self.activity.clone();
+        self.start_job(
+            ("Saving images", "正在保存图像"),
+            false,
+            move |events, _| {
+                let mut env = vm.attach_current_thread().map_err(io::Error::other)?;
+                let total = images.exports().count();
+                for (saved, export) in images.exports().enumerate() {
+                    events.post(Event::Progress(saved as f32 / total as f32));
+                    if let Err(error) = results::write_in_directory(
+                        &mut env,
+                        activity.as_obj(),
+                        directory.as_obj(),
+                        &images,
+                        export,
+                    ) {
+                        return Ok(Work::BatchExported {
+                            saved,
+                            error: Some(error),
+                        });
+                    }
+                }
+                Ok(Work::BatchExported {
+                    saved: total,
+                    error: None,
+                })
             },
         );
     }
@@ -805,6 +852,14 @@ impl Mobile {
         while let Ok(event) = self.receiver.try_recv() {
             match event {
                 Event::SharedAvailable => self.shared_available = true,
+                Event::Directory(result) if self.picker == Some(SAVE_BATCH) => {
+                    self.picker = None;
+                    match result {
+                        Ok(Some(directory)) => self.export_directory(directory),
+                        Ok(None) => {}
+                        Err(error) => self.note = Some(Notice::Document(error)),
+                    }
+                }
                 Event::Document(request, result) if self.picker == Some(request) => {
                     self.picker = None;
                     match result {
@@ -866,23 +921,16 @@ impl Mobile {
                             self.page = Page::Spectrum;
                         }
                         Ok(Work::Reconstructed {
-                            image,
-                            blue,
-                            product,
-                            wing_offset,
+                            images,
                             preview,
-                            metadata,
                             warning,
                         }) => {
                             let texture =
                                 ctx.load_texture("reconstruction", preview, TextureOptions::LINEAR);
                             self.output = Some(Output {
-                                image,
-                                blue,
-                                product,
-                                wing_offset,
+                                images,
+                                shown: Product::Gray,
                                 texture,
-                                metadata: *metadata,
                             });
                             self.page = Page::Result;
                             self.note = warning;
@@ -892,10 +940,19 @@ impl Mobile {
                             self.flat_mode = FlatMode::Physical;
                         }
                         Ok(Work::Exported(name)) => self.note = Some(Notice::Saved(name)),
+                        Ok(Work::Previewed(product, preview)) => {
+                            if let Some(output) = &mut self.output {
+                                output.shown = product;
+                                output.texture.set(preview, TextureOptions::LINEAR);
+                            }
+                        }
+                        Ok(Work::BatchExported { saved, error }) => {
+                            self.note = Some(Notice::BatchSaved { saved, error });
+                        }
                         Err(error) => self.note = Some(Notice::Processing(error)),
                     }
                 }
-                Event::Document(..) => {}
+                Event::Document(..) | Event::Directory(..) => {}
             }
         }
         self.read_shared();

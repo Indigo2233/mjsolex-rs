@@ -6,8 +6,10 @@ import android.database.Cursor;
 import android.net.Uri;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.widget.Toast;
+import java.io.FileNotFoundException;
 import java.util.Locale;
 
 public final class MainActivity extends NativeActivity {
@@ -21,10 +23,12 @@ public final class MainActivity extends NativeActivity {
     private static final int OPEN_SHARED_SER = 13;
     private static final int OPEN_FLAT = 14;
     private static final int SAVE_RAW_PNG = 15;
+    private static final int SAVE_BATCH = 16;
     private Uri pendingShared;
 
     private native boolean onDocument(
         int request, ParcelFileDescriptor document, String name, String error);
+    private native void onExportDirectory(Uri directory);
     private native void onShareAvailable();
 
     public String getUiLanguage() {
@@ -126,8 +130,29 @@ public final class MainActivity extends NativeActivity {
         launchPicker(intent, request);
     }
 
+    public void pickExportDirectory() {
+        launchPicker(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), SAVE_BATCH);
+    }
+
+    public Uri createExportFile(Uri directory, String mimeType, String name)
+            throws FileNotFoundException {
+        Uri parent = DocumentsContract.buildDocumentUriUsingTree(
+            directory, DocumentsContract.getTreeDocumentId(directory));
+        return DocumentsContract.createDocument(getContentResolver(), parent, mimeType, name);
+    }
+
+    public ParcelFileDescriptor openExportFile(Uri file) throws FileNotFoundException {
+        return getContentResolver().openFileDescriptor(file, "wt");
+    }
+
+    public void deleteExportFile(Uri file) throws FileNotFoundException {
+        DocumentsContract.deleteDocument(getContentResolver(), file);
+    }
+
     private void launchPicker(Intent intent, int request) {
-        intent.addCategory(Intent.CATEGORY_OPENABLE);
+        if (request != SAVE_BATCH) {
+            intent.addCategory(Intent.CATEGORY_OPENABLE);
+        }
         runOnUiThread(() -> {
             try {
                 startActivityForResult(intent, request);
@@ -140,6 +165,10 @@ public final class MainActivity extends NativeActivity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
+        if (request == SAVE_BATCH) {
+            onExportDirectory(result == RESULT_OK && data != null ? data.getData() : null);
+            return;
+        }
         if (request != OPEN_SER && request != OPEN_FLAT
             && request != SAVE_PNG && request != SAVE_FITS && request != SAVE_RAW_PNG) {
             return;

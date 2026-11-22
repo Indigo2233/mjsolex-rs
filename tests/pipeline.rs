@@ -3,7 +3,7 @@ use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use mjsolex::{
     ByteOrder, ColorMode, DisplayImage, Error, FitsMetadata, PhysicalFlat, Product, SerReader,
-    Spectrum, Trace, reconstruct, reconstruct_with_stride,
+    Spectrum, Trace, reconstruct, reconstruct_offsets, reconstruct_with_stride,
 };
 
 fn ser_header(
@@ -463,6 +463,16 @@ fn narrow_trace_reads_only_the_relevant_rows_and_preserves_endianness() {
             usize::from(pixel),
             (index / 32 * 384 + index % 32 * 3 + 481) * 16
         );
+    }
+    let shifts = [0., 2., -2.];
+    let trace = Trace::constant(32, 120.25);
+    read.set(0);
+    let images = reconstruct_offsets(&mut reader, trace, shifts, 2, |_| true).unwrap();
+    // The three overlapping bands form eight rows, read once per sampled frame.
+    assert_eq!(read.get(), 3 * 8 * 32 * 2);
+    for (multi, shift) in images.iter().zip(shifts) {
+        let single = reconstruct_with_stride(&mut reader, trace, shift, 2, |_| true).unwrap();
+        assert_eq!(multi.pixels(), single.pixels());
     }
 }
 

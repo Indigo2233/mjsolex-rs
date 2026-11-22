@@ -92,14 +92,24 @@ pub(super) enum Notice {
     Corrections {
         flat: Option<Error>,
         disk: Option<Error>,
+        doppler: Option<Error>,
     },
     Saved(String),
+    BatchSaved {
+        saved: usize,
+        error: Option<Error>,
+    },
     SaveLanguage(String),
 }
 
 impl Notice {
     pub(super) fn is_error(&self) -> bool {
-        !matches!(self, Self::Saved(_) | Self::Processing(Error::Cancelled))
+        !matches!(
+            self,
+            Self::Saved(_)
+                | Self::BatchSaved { error: None, .. }
+                | Self::Processing(Error::Cancelled)
+        )
     }
 
     pub(super) fn message(&self, language: Language) -> String {
@@ -157,7 +167,11 @@ impl Notice {
             Self::IndigoLaunch(detail) => {
                 with_detail("Cannot open Indigo Observatory", "无法打开靛空台", detail)
             }
-            Self::Corrections { flat, disk } => [
+            Self::Corrections {
+                flat,
+                disk,
+                doppler,
+            } => [
                 (
                     flat,
                     language.text("Synthetic flat skipped. ", "已跳过合成平场。"),
@@ -165,6 +179,10 @@ impl Notice {
                 (
                     disk,
                     language.text("Disk correction skipped. ", "已跳过太阳盘几何校正。"),
+                ),
+                (
+                    doppler,
+                    language.text("Doppler image skipped. ", "已跳过双翼多普勒图。"),
                 ),
             ]
             .into_iter()
@@ -179,6 +197,18 @@ impl Notice {
                 let prefix = language.text("Saved ", "已保存 ");
                 format!("{prefix}{name}")
             }
+            Self::BatchSaved { saved, error } => match (language, error) {
+                (Language::English, None) => format!("Saved {saved} files."),
+                (Language::Chinese, None) => format!("已保存 {saved} 个文件。"),
+                (Language::English, Some(error)) => format!(
+                    "Saved {saved} files. Export stopped: {}",
+                    language.error(error)
+                ),
+                (Language::Chinese, Some(error)) => format!(
+                    "已保存 {saved} 个文件。保存已停止。{}",
+                    language.error(error)
+                ),
+            },
             Self::SaveLanguage(detail) => with_detail(
                 "Could not save language preference",
                 "无法保存语言设置",

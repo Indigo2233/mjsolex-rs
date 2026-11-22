@@ -420,23 +420,21 @@ impl Mobile {
                 wavelength_calibration(ui, &mut self.calibration, lang, busy);
             }
             ui.add_enabled_ui(!busy, |ui| {
-                ui.label(lang.text("Image product", "图像产品"));
+                ui.label(lang.text("Additional images", "附加图像"));
                 ui.horizontal_wrapped(|ui| {
-                    for product in [
-                        Product::Gray,
-                        Product::Hydrogen,
-                        Product::Calcium,
-                        Product::Helium,
-                        Product::Doppler,
-                    ] {
-                        let button = egui::Button::new(product_label(product, lang))
-                            .selected(self.product == product);
+                    for (product, selected) in PALETTES
+                        .into_iter()
+                        .zip(&mut self.palettes)
+                        .chain([(Product::Doppler, &mut self.doppler)])
+                    {
+                        let button =
+                            egui::Button::new(product_label(product, lang)).selected(*selected);
                         if ui.add(button).clicked() {
-                            self.product = product;
+                            *selected = !*selected;
                         }
                     }
                 });
-                if self.product == Product::Doppler {
+                if self.doppler {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(
                             lang.text("Wing offset from sampling center", "相对采样中心的谱翼偏移"),
@@ -510,11 +508,11 @@ impl Mobile {
                         self.pick(OPEN_FLAT);
                     }
                 }
-                if self.flat_mode == FlatMode::Synthetic && self.product == Product::Doppler {
+                if self.flat_mode == FlatMode::Synthetic && self.doppler {
                     ui.label(
                         RichText::new(lang.text(
-                            "Doppler skips synthetic flat. Shared slit gain cancels in the ratio.",
-                            "双翼多普勒跳过虚拟平场。共同的狭缝增益在谱翼比值中抵消。",
+                            "Synthetic flat corrects grayscale and false color.",
+                            "虚拟平场应用于灰度和假彩色图。",
                         ))
                         .color(MUTED),
                     );
@@ -565,30 +563,41 @@ impl Mobile {
         });
     }
 
-    fn result_page(&self, ui: &mut Ui) {
+    fn result_page(&mut self, ui: &mut Ui) {
         let Some(output) = &self.output else { return };
         let lang = self.language;
+        let busy = self.busy();
+        let images = &output.images;
+        let mut clicked = None;
         card(ui, |ui| {
-            heading(ui, product_label(output.product, lang));
-            let (w, h) = (output.image.width(), output.image.height());
-            let shift = output.metadata.offset_pixels.unwrap_or(0.);
+            ui.horizontal_wrapped(|ui| {
+                for product in images.products() {
+                    let button = egui::Button::new(product_label(product, lang))
+                        .selected(output.shown == product);
+                    if ui.add_enabled(!busy, button).clicked() {
+                        clicked = Some(product);
+                    }
+                }
+            });
+            let (w, h) = (images.center.width(), images.center.height());
+            let shift = images.metadata.offset_pixels.unwrap_or(0.);
             let size = match lang {
                 Language::English => format!("{w} × {h} px · {shift:+.2} px offset"),
                 Language::Chinese => format!("{w} × {h} px · 偏移 {shift:+.2} px"),
             };
             ui.label(RichText::new(size).color(MUTED));
-            if output.product == Product::Doppler {
-                let offset = output.wing_offset;
+            if output.shown == Product::Doppler {
+                let offset = images.wing_offset;
                 let label = match lang {
                     Language::English => format!("Wings ±{offset:.2} px · qualitative contrast"),
                     Language::Chinese => format!("谱翼 ±{offset:.2} px · 定性对比"),
                 };
                 ui.label(RichText::new(label).color(MUTED));
             }
-            if let Some(name) = &output.metadata.flat_file {
+            if let Some(name) = &images.metadata.flat_file {
                 let label = lang.text("Captured flat applied", "已应用实拍平场");
                 ui.label(RichText::new(format!("{label} · {name}")).color(MUTED));
-            } else if output.image.has_synthetic_flat() {
+            } else if output.shown != Product::Doppler && images.center.has_synthetic_flat() {
                 ui.label(
                     RichText::new(lang.text("Synthetic flat applied", "已应用虚拟平场"))
                         .color(MUTED),
@@ -596,6 +605,9 @@ impl Mobile {
             }
             picture(ui, &output.texture, w, h, 0. ..=430., Sense::hover());
         });
+        if let Some(product) = clicked {
+            self.show_product(product);
+        }
     }
 
     fn page_actions(&mut self, ui: &mut Ui) {
@@ -613,32 +625,34 @@ impl Mobile {
                 }
             }
             Page::Result => {
-                if action(ui, lang.text("Save PNG", "保存 PNG"), !busy, true) {
-                    self.pick(SAVE_PNG);
-                }
-                if self
-                    .output
-                    .as_ref()
-                    .is_none_or(|output| output.product == Product::Doppler)
-                {
-                    return;
-                }
                 let width = (ui.available_width() - ui.spacing().item_spacing.x) / 2.;
-                ui.horizontal(|ui| {
-                    for (label, request) in [
+                for row in [
+                    [
+                        (lang.text("Save all", "保存全部"), SAVE_BATCH),
+                        (lang.text("Save current PNG", "保存当前 PNG"), SAVE_PNG),
+                    ],
+                    [
                         (lang.text("Save FITS", "保存 FITS"), SAVE_FITS),
                         (lang.text("16-bit PNG", "16 位 PNG"), SAVE_RAW_PNG),
-                    ] {
-                        let text = RichText::new(label).size(15.).strong();
-                        let button = egui::Button::new(text);
-                        if ui
-                            .add_enabled(!busy, button.min_size(vec2(width, 44.)))
-                            .clicked()
-                        {
-                            self.pick(request);
+                    ],
+                ] {
+                    ui.horizontal(|ui| {
+                        for (label, request) in row {
+                            let text = RichText::new(label).size(15.).strong();
+                            let button = if request == SAVE_BATCH {
+                                egui::Button::new(text.color(BACKGROUND)).fill(AMBER)
+                            } else {
+                                egui::Button::new(text)
+                            };
+                            if ui
+                                .add_enabled(!busy, button.min_size(vec2(width, 44.)))
+                                .clicked()
+                            {
+                                self.pick(request);
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
             Page::Scan => {}
         }
