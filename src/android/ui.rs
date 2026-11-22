@@ -336,8 +336,7 @@ impl Mobile {
         if let Some(profile) = &self.profile {
             card(ui, |ui| {
                 heading(ui, lang.text("Line profile", "谱线剖面"));
-                let reference =
-                    reference_profile(&profile.samples, self.wavelength, self.dispersion);
+                let reference = reference_profile(profile, self.wavelength, self.dispersion);
                 if let Some(fit) = profile.fit {
                     let label = lang.text("FWHM", "半高全宽");
                     let width = if self.dispersion != 0. {
@@ -360,6 +359,35 @@ impl Mobile {
                     );
                 }
                 profile_chart(ui, profile, reference.as_ref(), lang);
+                if let Some(atlas) = &reference {
+                    if let Some(depth) = &atlas.line_depth {
+                        let percent = 100. * depth.ratio();
+                        let comparison = match lang {
+                            Language::English => format!("Line depth · {percent:.0}% of BASS2000"),
+                            Language::Chinese => format!("线深为 BASS2000 参考值的 {percent:.0}%"),
+                        };
+                        ui.label(RichText::new(comparison).color(ATLAS_COLOR).strong());
+                        let observed = 100. * depth.observed;
+                        let reference = 100. * depth.reference;
+                        let depths = match lang {
+                            Language::English => {
+                                format!("Observed {observed:.1}% · Reference {reference:.1}%")
+                            }
+                            Language::Chinese => {
+                                format!("实测 {observed:.1}% · 参考 {reference:.1}%")
+                            }
+                        };
+                        ui.label(RichText::new(depths).color(MUTED));
+                    } else {
+                        ui.label(
+                            RichText::new(lang.text(
+                                "Line depth comparison needs both wings and a distinct line core.",
+                                "线深对比需要两侧谱翼和可辨认的线芯。",
+                            ))
+                            .color(MUTED),
+                        );
+                    }
+                }
                 if reference.is_none() {
                     let hint = if self.wavelength == 0. || self.dispersion == 0. {
                         lang.text(
