@@ -2,8 +2,8 @@ use std::cell::Cell;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use mjsolex::{
-    ByteOrder, ColorMode, DisplayImage, Error, FitsMetadata, PhysicalFlat, Product, SerReader,
-    Spectrum, Trace, reconstruct, reconstruct_offsets, reconstruct_with_stride,
+    ByteOrder, ColorMode, DisplayImage, DisplayTone, Error, FitsMetadata, PhysicalFlat, Product,
+    SerReader, Spectrum, Trace, reconstruct, reconstruct_offsets, reconstruct_with_stride,
 };
 
 fn ser_header(
@@ -58,6 +58,19 @@ fn exports_display_pixels_and_preserves_raw_16_bit_samples() {
         }
         assert_eq!(display.pixel(0), [0; 3]);
         assert_eq!(display.pixel(4).into_iter().max(), Some(255));
+    }
+    for (tone, expected_midpoint) in [(DisplayTone::Darker, 107), (DisplayTone::Brighter, 146)] {
+        let display = DisplayImage::new(&image, None, Product::Gray)
+            .unwrap()
+            .with_tone(tone);
+        let mut encoded = Vec::new();
+        display.write_png(&mut encoded).unwrap();
+        let mut png = png::Decoder::new(Cursor::new(encoded)).read_info().unwrap();
+        let mut pixels = vec![0; png.output_buffer_size().unwrap()];
+        png.next_frame(&mut pixels).unwrap();
+        assert_eq!(pixels[2], expected_midpoint);
+        assert_eq!(pixels[2], display.pixel(2)[0]);
+        assert_eq!([pixels[0], pixels[4]], [0, 255]);
     }
     let mut encoded = Vec::new();
     image.write_png(&mut encoded).unwrap();

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use eframe::egui::{Context, FontData, FontDefinitions};
 
-use super::CorrectionWarnings;
+use super::{CorrectionWarnings, sequence};
 use crate::Error;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -37,7 +37,7 @@ impl Language {
         }
     }
 
-    fn error(self, error: &Error) -> String {
+    pub(super) fn error(self, error: &Error) -> String {
         if self == Self::English {
             return error.to_string();
         }
@@ -69,6 +69,10 @@ impl Language {
             Error::InvalidFraming => "旋转或裁切设置无效。".into(),
             Error::NoFlatSamples => "用于估计合成平场的盘内样本不足。".into(),
             Error::FlatMismatch => "平场 SER 的尺寸、颜色模式和位深必须与扫描文件一致。".into(),
+            Error::SequenceMismatch => {
+                "扫描的尺寸、颜色模式、位深和裁剪格式须与参考 SER 一致。".into()
+            }
+            Error::FlatCoverage => "扫描使用的狭缝列超出了实拍平场的校准范围。".into(),
             Error::InvalidPhysicalFlat => "平场 SER 未能充分照亮整条狭缝。".into(),
             Error::DopplerCoverage => "当前扫描无法覆盖所选偏移处的两侧谱翼。".into(),
             Error::DopplerDispersion => "请先设定波长色散和方向。".into(),
@@ -82,6 +86,18 @@ impl Language {
             Error::Png(error) => format!("PNG 导出失败：{error}"),
         }
     }
+
+    pub(super) fn corrections(self, warnings: &CorrectionWarnings) -> String {
+        warnings
+            .entries()
+            .into_iter()
+            .filter_map(|(error, english, chinese)| {
+                let prefix = self.text(english, chinese);
+                error.as_ref().map(|e| format!("{prefix}{}", self.error(e)))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 pub(super) enum Notice {
@@ -94,11 +110,15 @@ pub(super) enum Notice {
     Corrections(Box<CorrectionWarnings>),
     Saved(String),
     BatchSaved { saved: usize, error: Option<Error> },
+    Sequence(sequence::Summary),
     SaveLanguage(String),
 }
 
 impl Notice {
     pub(super) fn is_error(&self) -> bool {
+        if let Self::Sequence(summary) = self {
+            return !summary.issues.is_empty();
+        }
         !matches!(
             self,
             Self::Saved(_)
@@ -162,17 +182,7 @@ impl Notice {
             Self::IndigoLaunch(detail) => {
                 with_detail("Cannot open Indigo Observatory", "无法打开靛空台", detail)
             }
-            Self::Corrections(warnings) => warnings
-                .entries()
-                .into_iter()
-                .filter_map(|(error, english, chinese)| {
-                    let prefix = language.text(english, chinese);
-                    error
-                        .as_ref()
-                        .map(|e| format!("{prefix}{}", language.error(e)))
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
+            Self::Corrections(warnings) => language.corrections(warnings),
             Self::Saved(name) => {
                 let prefix = language.text("Saved ", "已保存 ");
                 format!("{prefix}{name}")
@@ -189,6 +199,29 @@ impl Notice {
                     language.error(error)
                 ),
             },
+            Self::Sequence(summary) => {
+                let sequence::Summary {
+                    total,
+                    completed,
+                    failed,
+                    saved,
+                    cancelled,
+                    ..
+                } = summary;
+                let status = if *cancelled {
+                    language.text("Sequence cancelled.", "序列已取消。")
+                } else {
+                    language.text("Sequence finished.", "序列处理结束。")
+                };
+                match language {
+                    Language::English => format!(
+                        "{status} {completed}/{total} scans complete, {failed} failed, {saved} files saved."
+                    ),
+                    Language::Chinese => format!(
+                        "{status} 已完成 {completed}/{total} 份扫描，失败 {failed} 份，已保存 {saved} 个文件。"
+                    ),
+                }
+            }
             Self::SaveLanguage(detail) => with_detail(
                 "Could not save language preference",
                 "无法保存语言设置",

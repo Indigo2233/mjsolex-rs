@@ -1,6 +1,7 @@
 package org.mjsolex.mobile;
 
 import android.app.NativeActivity;
+import android.content.ClipData;
 import android.content.Intent;
 import android.database.Cursor;
 import android.net.Uri;
@@ -10,6 +11,7 @@ import android.provider.DocumentsContract;
 import android.provider.OpenableColumns;
 import android.widget.Toast;
 import java.io.FileNotFoundException;
+import java.util.LinkedHashSet;
 import java.util.Locale;
 
 public final class MainActivity extends NativeActivity {
@@ -24,11 +26,14 @@ public final class MainActivity extends NativeActivity {
     private static final int OPEN_FLAT = 14;
     private static final int SAVE_RAW_PNG = 15;
     private static final int SAVE_BATCH = 16;
+    private static final int OPEN_SEQUENCE = 17;
+    private static final int SAVE_SEQUENCE = 18;
     private Uri pendingShared;
 
     private native boolean onDocument(
-        int request, ParcelFileDescriptor document, String name, String error);
-    private native void onExportDirectory(Uri directory);
+        int request, ParcelFileDescriptor document, String name, String error, String source);
+    private native void onExportDirectory(int request, Uri directory);
+    private native void onSequence(Uri[] files);
     private native void onShareAvailable();
 
     public String getUiLanguage() {
@@ -120,6 +125,9 @@ public final class MainActivity extends NativeActivity {
 
     public void pickSer(int request) {
         Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT).setType("*/*");
+        if (request == OPEN_SEQUENCE) {
+            intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+        }
         launchPicker(intent, request);
     }
 
@@ -130,8 +138,16 @@ public final class MainActivity extends NativeActivity {
         launchPicker(intent, request);
     }
 
-    public void pickExportDirectory() {
-        launchPicker(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), SAVE_BATCH);
+    public void pickExportDirectory(int request) {
+        launchPicker(new Intent(Intent.ACTION_OPEN_DOCUMENT_TREE), request);
+    }
+
+    public String sequenceFileName(Uri file) {
+        return displayName(file, OPEN_SEQUENCE);
+    }
+
+    public ParcelFileDescriptor openSequenceFile(Uri file) throws FileNotFoundException {
+        return getContentResolver().openFileDescriptor(file, "r");
     }
 
     public Uri createExportFile(Uri directory, String mimeType, String name)
@@ -150,14 +166,14 @@ public final class MainActivity extends NativeActivity {
     }
 
     private void launchPicker(Intent intent, int request) {
-        if (request != SAVE_BATCH) {
+        if (request != SAVE_BATCH && request != SAVE_SEQUENCE) {
             intent.addCategory(Intent.CATEGORY_OPENABLE);
         }
         runOnUiThread(() -> {
             try {
                 startActivityForResult(intent, request);
             } catch (RuntimeException error) {
-                onDocument(request, null, null, "picker");
+                onDocument(request, null, null, "picker", null);
             }
         });
     }
@@ -165,8 +181,27 @@ public final class MainActivity extends NativeActivity {
     @Override
     protected void onActivityResult(int request, int result, Intent data) {
         super.onActivityResult(request, result, data);
-        if (request == SAVE_BATCH) {
-            onExportDirectory(result == RESULT_OK && data != null ? data.getData() : null);
+        if (request == SAVE_BATCH || request == SAVE_SEQUENCE) {
+            onExportDirectory(request, result == RESULT_OK && data != null ? data.getData() : null);
+            return;
+        }
+        if (request == OPEN_SEQUENCE) {
+            LinkedHashSet<Uri> files = new LinkedHashSet<>();
+            if (result == RESULT_OK && data != null) {
+                ClipData clip = data.getClipData();
+                if (clip != null) {
+                    for (int i = 0; i < clip.getItemCount(); i++) {
+                        Uri file = clip.getItemAt(i).getUri();
+                        if (file != null) {
+                            files.add(file);
+                        }
+                    }
+                }
+                if (data.getData() != null) {
+                    files.add(data.getData());
+                }
+            }
+            onSequence(files.toArray(new Uri[0]));
             return;
         }
         if (request != OPEN_SER && request != OPEN_FLAT
@@ -174,7 +209,7 @@ public final class MainActivity extends NativeActivity {
             return;
         }
         if (result != RESULT_OK || data == null || data.getData() == null) {
-            onDocument(request, null, null, null);
+            onDocument(request, null, null, null, null);
             return;
         }
         Uri uri = data.getData();
@@ -186,21 +221,22 @@ public final class MainActivity extends NativeActivity {
         try {
             String name = displayName(uri, request);
             if (request == OPEN_SHARED_SER && !name.toLowerCase(Locale.ROOT).endsWith(".ser")) {
-                onDocument(request, null, null, "single_ser");
+                onDocument(request, null, null, "single_ser", null);
                 return;
             }
             document = getContentResolver().openFileDescriptor(uri, isInput(request) ? "r" : "wt");
             if (document == null) {
-                onDocument(request, null, null, "unavailable");
+                onDocument(request, null, null, "unavailable", null);
                 return;
             }
-            if (onDocument(request, document, name, null)) {
+            String source = request == OPEN_SER || request == OPEN_SHARED_SER ? uri.toString() : null;
+            if (onDocument(request, document, name, null, source)) {
                 // Native code owns the descriptor and its provider status channel.
                 document = null;
             }
         } catch (Exception error) {
             String detail = error.getLocalizedMessage();
-            onDocument(request, null, null, detail == null ? "access" : "access:" + detail);
+            onDocument(request, null, null, detail == null ? "access" : "access:" + detail, null);
         } finally {
             if (document != null) {
                 try {
@@ -217,7 +253,8 @@ public final class MainActivity extends NativeActivity {
     }
 
     private boolean isInput(int request) {
-        return request == OPEN_SER || request == OPEN_SHARED_SER || request == OPEN_FLAT;
+        return request == OPEN_SER || request == OPEN_SHARED_SER || request == OPEN_FLAT
+            || request == OPEN_SEQUENCE;
     }
 
     private String displayName(Uri uri, int request) {

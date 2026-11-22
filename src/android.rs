@@ -8,7 +8,7 @@ use eframe::egui::{
     self, Align, Color32, ColorImage, Context, RichText, Sense, Stroke, TextureHandle,
     TextureOptions, Ui, Vec2, pos2, vec2,
 };
-use jni::objects::{GlobalRef, JObject, JString, JValue};
+use jni::objects::{GlobalRef, JObject, JObjectArray, JString, JValue};
 use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean};
 use jni::{JNIEnv, JavaVM};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
@@ -19,8 +19,8 @@ use crate::android_document::DocumentFile;
 use crate::reconstruct::{MAX_DOPPLER_WING_PIXELS, MAX_PIXELS};
 use crate::ser::cache_recording;
 use crate::{
-    APP_NAME, BandingAxis, ByteOrder, DiskGeometry, DisplayImage, Error, FitsMetadata, Framing,
-    Header, LineProfile, LocalContrast, Observation, OpticalSetup, PhysicalFlat, Product,
+    APP_NAME, BandingAxis, ByteOrder, DiskGeometry, DisplayImage, DisplayTone, Error, FitsMetadata,
+    Framing, Header, LineProfile, LocalContrast, Observation, OpticalSetup, PhysicalFlat, Product,
     Reconstruction, ScanSettings, SerReader, Spectrum, Stretch, Trace, reconstruct_offsets,
     reconstruct_with_stride,
 };
@@ -28,10 +28,11 @@ use crate::{
 mod language;
 mod postprocess;
 mod results;
+mod sequence;
 mod ui;
 
 use language::{Language, Notice};
-use postprocess::{CorrectionWarnings, ProcessingOptions};
+use postprocess::{CorrectionWarnings, ProcessingOptions, ReconstructionOptions};
 use results::{Export, Images, PALETTES, View};
 
 const OPEN_SER: i32 = 10;
@@ -41,13 +42,19 @@ const OPEN_SHARED: i32 = 13;
 const OPEN_FLAT: i32 = 14;
 const SAVE_RAW_PNG: i32 = 15;
 const SAVE_BATCH: i32 = 16;
+const OPEN_SEQUENCE: i32 = 17;
+const SAVE_SEQUENCE: i32 = 18;
 const BACKGROUND: Color32 = Color32::from_rgb(17, 21, 27);
 const CARD: Color32 = Color32::from_rgb(28, 35, 44);
 const TEXT: Color32 = Color32::from_rgb(240, 243, 247);
 const MUTED: Color32 = Color32::from_rgb(171, 185, 199);
 const AMBER: Color32 = Color32::from_rgb(255, 190, 99);
 
-type Document = Option<(DocumentFile, String)>;
+struct Document {
+    file: DocumentFile,
+    name: String,
+    source: Option<String>,
+}
 
 static PICKER: Mutex<Option<(GlobalRef, Events)>> = Mutex::new(None);
 
@@ -66,8 +73,10 @@ impl Events {
 }
 
 enum Event {
-    Document(i32, Result<Document, String>),
-    Directory(Result<Option<GlobalRef>, String>),
+    Document(i32, Result<Option<Document>, String>),
+    Directory(i32, Result<Option<GlobalRef>, String>),
+    Sequence(Result<Option<sequence::Selection>, String>),
+    SequenceFile(usize, usize, String),
     SharedAvailable,
     Progress(f32),
     Finished(Result<Work, Error>),
@@ -81,17 +90,19 @@ enum Work {
         preview: ColorImage,
         warning: Option<Notice>,
     },
-    Previewed(View, ColorImage),
+    Previewed(View, DisplayTone, ColorImage),
     Exported(String),
     BatchExported {
         saved: usize,
         error: Option<Error>,
     },
+    SequenceFinished(sequence::Summary),
 }
 
 struct Imported {
     file: DocumentFile,
     name: String,
+    source: Option<String>,
     header: Header,
     observation: Observation,
     byte_order: Option<ByteOrder>,
@@ -103,6 +114,7 @@ struct Imported {
 struct Scan {
     file: DocumentFile,
     name: String,
+    source: Option<String>,
     header: Header,
     observation: Observation,
     byte_order: Option<ByteOrder>,
@@ -113,6 +125,7 @@ struct Scan {
 struct Output {
     images: Arc<Images>,
     shown: View,
+    tone: DisplayTone,
     texture: TextureHandle,
 }
 
@@ -121,7 +134,7 @@ impl Output {
         match request {
             SAVE_FITS => Export::Fits,
             SAVE_RAW_PNG => Export::RawPng,
-            _ => Export::Display(self.shown),
+            _ => Export::Display(self.shown, self.tone),
         }
     }
 }
@@ -146,6 +159,7 @@ struct Job {
     cancel: Arc<AtomicBool>,
     progress: Option<f32>,
     cancellable: bool,
+    sequence_file: Option<(usize, usize, String)>,
 }
 
 #[derive(Default)]
@@ -212,8 +226,9 @@ struct Mobile {
     events: Events,
     receiver: mpsc::Receiver<Event>,
     picker: Option<i32>,
+    sequence: Option<sequence::Selection>,
     shared_available: bool,
-    shared_document: Document,
+    shared_document: Option<Document>,
     job: Option<Job>,
     scan: Option<Scan>,
     trace: Option<Trace>,
@@ -326,11 +341,12 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onDocument(
     descriptor: JObject<'_>,
     name: JString<'_>,
     error: JString<'_>,
+    source: JString<'_>,
 ) -> jboolean {
     let Some(events) = activity_events(&env, &activity) else {
         return JNI_FALSE;
     };
-    let document: jni::errors::Result<Result<Document, String>> = if !error.is_null() {
+    let document: jni::errors::Result<Result<Option<Document>, String>> = if !error.is_null() {
         env.get_string(&error).map(|message| Err(message.into()))
     } else if descriptor.is_null() {
         Ok(Ok(None))
@@ -340,14 +356,20 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onDocument(
         } else {
             env.get_string(&name).map(Into::into)
         };
-        name.map(|name| {
-            DocumentFile::from_android(
+        name.and_then(|name| {
+            let source = if source.is_null() {
+                None
+            } else {
+                Some(env.get_string(&source)?.into())
+            };
+            let document = DocumentFile::from_android(
                 &mut env,
                 &descriptor,
                 !matches!(request, OPEN_SER | OPEN_SHARED | OPEN_FLAT),
             )
-            .map(|file| Some((file, name)))
-            .map_err(|error| format!("access:{error}"))
+            .map(|file| Some(Document { file, name, source }))
+            .map_err(|error| format!("access:{error}"));
+            Ok(document)
         })
     };
     let document = document.unwrap_or_else(|error| Err(format!("access:{error}")));
@@ -373,6 +395,7 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onShareAvailable(
 extern "system" fn Java_org_mjsolex_mobile_MainActivity_onExportDirectory(
     env: JNIEnv<'_>,
     activity: JObject<'_>,
+    request: i32,
     uri: JObject<'_>,
 ) {
     if let Some(events) = activity_events(&env, &activity) {
@@ -386,7 +409,31 @@ extern "system" fn Java_org_mjsolex_mobile_MainActivity_onExportDirectory(
         if env.exception_check().unwrap_or(false) {
             let _ = env.exception_clear();
         }
-        events.post(Event::Directory(directory));
+        events.post(Event::Directory(request, directory));
+    }
+}
+
+#[unsafe(no_mangle)]
+extern "system" fn Java_org_mjsolex_mobile_MainActivity_onSequence(
+    env: JNIEnv<'_>,
+    activity: JObject<'_>,
+    files: JObjectArray<'_>,
+) {
+    if let Some(events) = activity_events(&env, &activity) {
+        let selection = env.get_array_length(&files).and_then(|count| {
+            if count == 0 {
+                return Ok(None);
+            }
+            Ok(Some(sequence::Selection {
+                files: env.new_global_ref(files)?,
+                count,
+                format: sequence::Format::default(),
+            }))
+        });
+        results::clear_exception(&env);
+        events.post(Event::Sequence(
+            selection.map_err(|err| format!("access:{err}")),
+        ));
     }
 }
 
@@ -427,6 +474,7 @@ impl Mobile {
             events,
             receiver,
             picker: None,
+            sequence: None,
             shared_available: true,
             shared_document: None,
             job: None,
@@ -475,16 +523,25 @@ impl Mobile {
 
     fn pick(&mut self, request: i32) {
         let output = self.output.as_ref();
-        if !matches!(request, OPEN_SER | OPEN_FLAT) && output.is_none() {
+        if !matches!(
+            request,
+            OPEN_SER | OPEN_FLAT | OPEN_SEQUENCE | SAVE_SEQUENCE
+        ) && output.is_none()
+        {
             return;
         }
         let result = self.vm.attach_current_thread().and_then(|mut env| {
             let result = env.with_local_frame(8, |env| {
                 let activity = self.activity.as_obj();
-                if matches!(request, OPEN_SER | OPEN_FLAT) {
+                if matches!(request, OPEN_SER | OPEN_FLAT | OPEN_SEQUENCE) {
                     env.call_method(activity, "pickSer", "(I)V", &[JValue::Int(request)])?;
-                } else if request == SAVE_BATCH {
-                    env.call_method(activity, "pickExportDirectory", "()V", &[])?;
+                } else if matches!(request, SAVE_BATCH | SAVE_SEQUENCE) {
+                    env.call_method(
+                        activity,
+                        "pickExportDirectory",
+                        "(I)V",
+                        &[JValue::Int(request)],
+                    )?;
                 } else if let Some(output) = output {
                     let name = env.new_string(output.images.file_name(output.export(request)))?;
                     env.call_method(
@@ -525,7 +582,10 @@ impl Mobile {
     }
 
     fn busy(&self) -> bool {
-        self.picker.is_some() || self.job.is_some() || self.shared_document.is_some()
+        self.picker.is_some()
+            || self.job.is_some()
+            || self.shared_document.is_some()
+            || self.sequence.is_some()
     }
 
     fn open_indigo(&mut self) {
@@ -572,6 +632,7 @@ impl Mobile {
                     cancel,
                     progress: None,
                     cancellable,
+                    sequence_file: None,
                 });
                 self.note = None;
             }
@@ -579,7 +640,8 @@ impl Mobile {
         }
     }
 
-    fn import(&mut self, file: DocumentFile, name: String, byte_order: Option<ByteOrder>) {
+    fn import(&mut self, document: Document, byte_order: Option<ByteOrder>) {
+        let Document { file, name, source } = document;
         let cache = self.cache.clone();
         self.start_job(
             ("Reading spectrum", "正在读取光谱"),
@@ -596,6 +658,7 @@ impl Mobile {
                 Ok(Work::Imported(Box::new(Imported {
                     file,
                     name,
+                    source,
                     header,
                     observation,
                     byte_order,
@@ -643,22 +706,19 @@ impl Mobile {
         if !self.doppler {
             return Ok(None);
         }
-        let dispersion = self
-            .calibration
-            .dispersion()
-            .ok_or(Error::DopplerDispersion)?;
         let (scan, trace) = self
             .scan
             .as_ref()
             .zip(self.trace)
             .ok_or(Error::DopplerCoverage)?;
-        if !scan
-            .spectrum
-            .supports_wings(trace, self.shift, self.wing_offset)
-        {
-            return Err(Error::DopplerCoverage);
-        }
-        Ok(Some(self.wing_offset.copysign(dispersion)))
+        postprocess::doppler_shift(
+            &scan.spectrum,
+            trace,
+            self.shift,
+            self.wing_offset,
+            self.calibration.dispersion(),
+        )
+        .map(Some)
     }
 
     fn reload_byte_order(&mut self, order: Option<ByteOrder>) {
@@ -667,27 +727,47 @@ impl Mobile {
             return;
         }
         match scan.file.try_clone() {
-            Ok(file) => self.import(file, scan.name.clone(), order),
+            Ok(file) => self.import(
+                Document {
+                    file,
+                    name: scan.name.clone(),
+                    source: scan.source.clone(),
+                },
+                order,
+            ),
             Err(error) => self.note = Some(Notice::Processing(error.into())),
         }
     }
 
-    fn reconstruct(&mut self) {
-        let (Some(scan), Some(trace)) = (&self.scan, self.trace) else {
-            return;
-        };
-        let Some((wavelength, manual_dispersion)) = self.calibration.edited_numeric_values() else {
-            return;
-        };
+    fn reconstruction_options(&mut self) -> Option<ReconstructionOptions> {
+        let (wavelength, manual_dispersion) = self.calibration.edited_numeric_values()?;
         self.calibration.wavelength = wavelength;
         self.calibration.manual_dispersion = manual_dispersion;
-        let palettes = self.palettes;
-        let wing_offset = self.wing_offset;
-        let shift = self.shift;
-        let dispersion = self.calibration.dispersion();
-        let (wing_shift, doppler_error) = match self.doppler_shift() {
-            Ok(shift) => (shift, None),
-            Err(error) => (None, Some(error)),
+        Some(ReconstructionOptions {
+            wavelength,
+            dispersion: self.calibration.dispersion(),
+            shift: self.shift,
+            stride: self.stride,
+            doppler: self.doppler,
+            wing_offset: self.wing_offset,
+            palettes: self.palettes,
+            processing: self.processing,
+            synthetic_flat: self.flat_mode == FlatMode::Synthetic
+                && self.processing.synthetic_strength > 0,
+            physical_flat: if self.flat_mode == FlatMode::Physical {
+                self.physical_flat.clone()
+            } else {
+                None
+            },
+        })
+    }
+
+    fn reconstruct(&mut self) {
+        let Some(options) = self.reconstruction_options() else {
+            return;
+        };
+        let (Some(scan), Some(trace)) = (&self.scan, self.trace) else {
+            return;
         };
         let file = match scan.file.try_clone() {
             Ok(file) => file,
@@ -698,107 +778,29 @@ impl Mobile {
         };
         let order = scan.byte_order;
         let header = scan.header;
-        let processing = self.processing;
-        let synthetic_flat =
-            self.flat_mode == FlatMode::Synthetic && processing.synthetic_strength > 0;
-        let physical_flat = if self.flat_mode == FlatMode::Physical {
-            self.physical_flat.clone()
-        } else {
-            None
-        };
-        let stride = self.stride.max(self.minimum_stride(header));
-        let mut metadata = FitsMetadata {
-            observation: scan.observation.clone(),
-            source_name: Some(scan.name.clone()),
-            source_header: Some(header),
-            offset_pixels: Some(shift),
-            frame_step: Some(stride),
-            line_center_angstrom: (wavelength > 0.).then_some(wavelength),
-            dispersion_angstrom: dispersion,
-            fwhm_pixels: self.profile.as_ref().and_then(|p| p.fit).map(|f| f.fwhm),
-            ..FitsMetadata::default()
-        };
+        let name = scan.name.clone();
+        let wings = options.wing_shift(&scan.spectrum, trace);
+        let fwhm = self.profile.as_ref().and_then(|p| p.fit).map(|f| f.fwhm);
         self.start_job(
             ("Reconstructing scan", "正在重建图像"),
             true,
             move |events, cancel| {
-                let mut reader = SerReader::open_with_byte_order(&file.file, order)?;
+                let reader = SerReader::open_with_byte_order(&file.file, order)?;
                 if reader.header() != header {
                     return Err(Error::InvalidSer(
                         "recording changed; open the finished file again",
                     ));
                 }
-                metadata.observation = reader.observation().clone();
                 let mut progress = report(events, cancel);
-                let corrections_start = 0.8;
-                let flat_start = if synthetic_flat || physical_flat.is_some() {
-                    corrections_start - 0.10
-                } else {
-                    corrections_start
-                };
-                let (mut raw, mut wings) = if let Some(wing) = wing_shift {
-                    let [center, red, blue] = reconstruct_offsets(
-                        &mut reader,
-                        trace,
-                        [shift, shift + wing, shift - wing],
-                        stride,
-                        |p| progress(p * flat_start),
-                    )?;
-                    (center, Some([red, blue]))
-                } else {
-                    let center = reconstruct_with_stride(&mut reader, trace, shift, stride, |p| {
-                        progress(p * flat_start)
-                    })?;
-                    (center, None)
-                };
-                drop(reader);
-                let mut warnings = CorrectionWarnings {
-                    doppler: doppler_error,
-                    ..CorrectionWarnings::default()
-                };
-                if synthetic_flat {
-                    match raw
-                        .correct_synthetic_flat_at_strength(processing.synthetic_strength, |p| {
-                            progress(flat_start + p * (corrections_start - flat_start))
-                        }) {
-                        Ok(applied) => {
-                            metadata.synthetic_flat_strength =
-                                applied.then_some(processing.synthetic_strength);
-                        }
-                        Err(Error::Cancelled) => return Err(Error::Cancelled),
-                        Err(error) => warnings.flat = Some(error),
-                    }
-                } else if let Some((flat, name)) = physical_flat {
-                    flat.apply(&mut raw)?;
-                    if let Some(wings) = &mut wings {
-                        for wing in wings {
-                            flat.apply(wing)?;
-                        }
-                    }
-                    metadata.flat_file = Some(name);
-                }
-                if !progress(corrections_start) {
-                    return Err(Error::Cancelled);
-                }
-                let mut images = Images {
-                    center: raw,
-                    wings,
-                    palettes,
-                    wing_offset,
-                    metadata,
-                    enhancement: None,
-                };
-                postprocess::finish(&mut images, processing, &mut warnings, |p| {
-                    progress(corrections_start + 0.18 * p)
-                })?;
-                let preview = images.preview(View::GRAY)?;
+                let (images, warnings) =
+                    options.build(reader, name, trace, fwhm, wings, |p| progress(0.98 * p))?;
+                file.check_error()?;
+                let preview = images.preview(View::GRAY, DisplayTone::Standard)?;
                 if !progress(1.) {
                     return Err(Error::Cancelled);
                 }
                 let warning = warnings
-                    .entries()
-                    .iter()
-                    .any(|(error, ..)| error.is_some())
+                    .has_errors()
                     .then(|| Notice::Corrections(Box::new(warnings)));
                 Ok(Work::Reconstructed {
                     images: Arc::new(images),
@@ -809,16 +811,18 @@ impl Mobile {
         );
     }
 
-    fn show_product(&mut self, view: View) {
+    fn show_product(&mut self, view: View, tone: DisplayTone) {
         let Some(output) = &self.output else { return };
-        if output.shown == view || !output.images.views().any(|item| item == view) {
+        if (output.shown == view && output.tone == tone)
+            || !output.images.views().any(|item| item == view)
+        {
             return;
         }
         let images = output.images.clone();
         self.start_job(
             ("Preparing preview", "正在准备预览"),
             false,
-            move |_, _| Ok(Work::Previewed(view, images.preview(view)?)),
+            move |_, _| Ok(Work::Previewed(view, tone, images.preview(view, tone)?)),
         );
     }
 
@@ -844,6 +848,7 @@ impl Mobile {
     fn export_directory(&mut self, directory: GlobalRef) {
         let Some(output) = &self.output else { return };
         let images = output.images.clone();
+        let tone = output.tone;
         let vm = self.vm.clone();
         let activity = self.activity.clone();
         self.start_job(
@@ -851,8 +856,8 @@ impl Mobile {
             false,
             move |events, _| {
                 let mut env = vm.attach_current_thread().map_err(io::Error::other)?;
-                let total = images.exports().count();
-                for (saved, export) in images.exports().enumerate() {
+                let total = images.exports(tone).count();
+                for (saved, export) in images.exports(tone).enumerate() {
                     events.post(Event::Progress(saved as f32 / total as f32));
                     if let Err(error) = results::write_in_directory(
                         &mut env,
@@ -860,6 +865,7 @@ impl Mobile {
                         directory.as_obj(),
                         &images,
                         export,
+                        &images.file_name(export),
                     ) {
                         return Ok(Work::BatchExported {
                             saved,
@@ -879,27 +885,44 @@ impl Mobile {
         while let Ok(event) = self.receiver.try_recv() {
             match event {
                 Event::SharedAvailable => self.shared_available = true,
-                Event::Directory(result) if self.picker == Some(SAVE_BATCH) => {
+                Event::Directory(request, result) if self.picker == Some(request) => {
                     self.picker = None;
                     match result {
+                        Ok(Some(directory)) if request == SAVE_SEQUENCE => {
+                            if let Some(selection) = self.sequence.take() {
+                                self.reconstruct_sequence(selection, directory);
+                            }
+                        }
                         Ok(Some(directory)) => self.export_directory(directory),
                         Ok(None) => {}
                         Err(error) => self.note = Some(Notice::Document(error)),
                     }
                 }
+                Event::Sequence(result) if self.picker == Some(OPEN_SEQUENCE) => {
+                    self.picker = None;
+                    match result {
+                        Ok(selection) => self.sequence = selection,
+                        Err(error) => self.note = Some(Notice::Document(error)),
+                    }
+                }
+                Event::SequenceFile(index, total, name) => {
+                    if let Some(job) = &mut self.job {
+                        job.sequence_file = Some((index, total, name));
+                    }
+                }
                 Event::Document(request, result) if self.picker == Some(request) => {
                     self.picker = None;
                     match result {
-                        Ok(Some((file, name))) if request == OPEN_SHARED && self.scan.is_some() => {
-                            self.shared_document = Some((file, name));
+                        Ok(Some(document)) if request == OPEN_SHARED && self.scan.is_some() => {
+                            self.shared_document = Some(document);
                         }
-                        Ok(Some((file, name))) if matches!(request, OPEN_SER | OPEN_SHARED) => {
-                            self.import(file, name, None)
+                        Ok(Some(document)) if matches!(request, OPEN_SER | OPEN_SHARED) => {
+                            self.import(document, None)
                         }
-                        Ok(Some((file, name))) if request == OPEN_FLAT => {
+                        Ok(Some(Document { file, name, .. })) if request == OPEN_FLAT => {
                             self.import_flat(file, name)
                         }
-                        Ok(Some((file, name))) => self.export(request, file, name),
+                        Ok(Some(Document { file, name, .. })) => self.export(request, file, name),
                         Ok(None) => {}
                         Err(error) => self.note = Some(Notice::Document(error)),
                     }
@@ -916,6 +939,7 @@ impl Mobile {
                             let Imported {
                                 file,
                                 name,
+                                source,
                                 header,
                                 observation,
                                 byte_order,
@@ -926,6 +950,7 @@ impl Mobile {
                             self.scan = Some(Scan {
                                 file,
                                 name,
+                                source,
                                 header,
                                 observation,
                                 byte_order,
@@ -961,6 +986,7 @@ impl Mobile {
                             self.output = Some(Output {
                                 images,
                                 shown: View::GRAY,
+                                tone: DisplayTone::Standard,
                                 texture,
                             });
                             self.page = Page::Result;
@@ -972,19 +998,23 @@ impl Mobile {
                             self.page = Page::Spectrum;
                         }
                         Ok(Work::Exported(name)) => self.note = Some(Notice::Saved(name)),
-                        Ok(Work::Previewed(product, preview)) => {
+                        Ok(Work::Previewed(product, tone, preview)) => {
                             if let Some(output) = &mut self.output {
                                 output.shown = product;
+                                output.tone = tone;
                                 output.texture.set(preview, TextureOptions::LINEAR);
                             }
                         }
                         Ok(Work::BatchExported { saved, error }) => {
                             self.note = Some(Notice::BatchSaved { saved, error });
                         }
+                        Ok(Work::SequenceFinished(summary)) => {
+                            self.note = Some(Notice::Sequence(summary));
+                        }
                         Err(error) => self.note = Some(Notice::Processing(error)),
                     }
                 }
-                Event::Document(..) | Event::Directory(..) => {}
+                Event::Document(..) | Event::Directory(..) | Event::Sequence(..) => {}
             }
         }
         self.read_shared();

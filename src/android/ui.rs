@@ -87,12 +87,63 @@ impl eframe::App for Mobile {
                     });
             });
         self.shared_document_dialog(ui.ctx());
+        self.sequence_dialog(ui.ctx());
     }
 }
 
 impl Mobile {
+    fn sequence_dialog(&mut self, ctx: &Context) {
+        let Some(selection) = &mut self.sequence else {
+            return;
+        };
+        if self.picker.is_some() {
+            return;
+        }
+        let lang = self.language;
+        let dialog = egui::Modal::new(egui::Id::unique("sequence_export")).show(ctx, |ui| {
+            ui.set_max_width((ctx.content_rect().width() - 48.).clamp(0., 340.));
+            heading(ui, lang.text("Reconstruct SER sequence", "重建 SER 序列"));
+            ui.label(match lang {
+                Language::English => format!(
+                    "{} files selected. Processes in filename order.",
+                    selection.count
+                ),
+                Language::Chinese => format!("已选 {} 个文件。按文件名顺序处理。", selection.count),
+            });
+            ui.horizontal_wrapped(|ui| {
+                for (format, label) in [
+                    (sequence::Format::All, lang.text("All images", "全部影像")),
+                    (
+                        sequence::Format::Display,
+                        lang.text("Display PNGs", "显示 PNG"),
+                    ),
+                    (sequence::Format::Raw, lang.text("16-bit PNG", "16 位 PNG")),
+                    (sequence::Format::Fits, "FITS"),
+                ] {
+                    ui.selectable_value(&mut selection.format, format, label);
+                }
+            });
+            if let Some(notice) = &self.note {
+                ui.colored_label(Color32::LIGHT_RED, notice.message(lang));
+            }
+            let start = action(
+                ui,
+                lang.text("Choose output folder", "选择输出目录"),
+                true,
+                true,
+            );
+            let cancel = action(ui, lang.text("Cancel", "取消"), true, false);
+            (start, cancel)
+        });
+        if dialog.inner.0 {
+            self.pick(SAVE_SEQUENCE);
+        } else if dialog.inner.1 || dialog.should_close() {
+            self.sequence = None;
+        }
+    }
+
     fn shared_document_dialog(&mut self, ctx: &Context) {
-        let Some((_, name)) = &self.shared_document else {
+        let Some(Document { name, .. }) = &self.shared_document else {
             return;
         };
         let lang = self.language;
@@ -123,11 +174,11 @@ impl Mobile {
             }
         });
         if let Some(request) = dialog.inner {
-            if let Some((file, name)) = self.shared_document.take() {
+            if let Some(document) = self.shared_document.take() {
                 if request == OPEN_FLAT {
-                    self.import_flat(file, name);
+                    self.import_flat(document.file, document.name);
                 } else {
-                    self.import(file, name, None);
+                    self.import(document, None);
                 }
             }
         } else if dialog.should_close() {
@@ -177,6 +228,9 @@ impl Mobile {
         if let Some(job) = &self.job {
             card(ui, |ui| {
                 ui.label(RichText::new(lang.text(job.label.0, job.label.1)).strong());
+                if let Some((index, total, name)) = &job.sequence_file {
+                    ui.label(format!("{index}/{total} · {name}"));
+                }
                 if let Some(progress) = job.progress {
                     ui.add(
                         egui::ProgressBar::new(progress)
@@ -215,6 +269,30 @@ impl Mobile {
                 )
                 .wrap(),
             );
+            if let Notice::Sequence(summary) = notice
+                && !summary.issues.is_empty()
+            {
+                ui.collapsing(lang.text("Processing details", "处理详情"), |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("sequence_issues")
+                        .max_height(220.)
+                        .show(ui, |ui| {
+                            for (name, issue) in &summary.issues {
+                                let detail = match issue {
+                                    sequence::Issue::Processing(error) => lang.error(error),
+                                    sequence::Issue::Export(file, error) => {
+                                        format!("{file}\n{}", lang.error(error))
+                                    }
+                                    sequence::Issue::Corrections(warnings) => {
+                                        lang.corrections(warnings)
+                                    }
+                                };
+                                ui.label(RichText::new(name).strong());
+                                ui.label(detail);
+                            }
+                        });
+                });
+            }
         }
     }
 
@@ -643,14 +721,15 @@ impl Mobile {
         let lang = self.language;
         let busy = self.busy();
         let images = &output.images;
-        let mut clicked = None;
+        let mut view_to_show = output.shown;
+        let mut tone = output.tone;
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for view in images.views() {
                     let button =
                         egui::Button::new(view_label(view, lang)).selected(output.shown == view);
                     if ui.add_enabled(!busy, button).clicked() {
-                        clicked = Some(view);
+                        view_to_show = view;
                     }
                 }
             });
@@ -711,10 +790,22 @@ impl Mobile {
                     },
                 );
             }
+            ui.label(lang.text("Midtone brightness", "中间调亮度"));
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (value, label) in [
+                        (DisplayTone::Darker, lang.text("Darker", "偏暗")),
+                        (DisplayTone::Standard, lang.text("Standard", "标准")),
+                        (DisplayTone::Brighter, lang.text("Brighter", "偏亮")),
+                    ] {
+                        ui.selectable_value(&mut tone, value, label);
+                    }
+                });
+            });
             picture(ui, &output.texture, w, h, 0. ..=430., Sense::hover());
         });
-        if let Some(product) = clicked {
-            self.show_product(product);
+        if view_to_show != output.shown || tone != output.tone {
+            self.show_product(view_to_show, tone);
         }
     }
 
@@ -723,15 +814,19 @@ impl Mobile {
         let lang = self.language;
         match self.page {
             Page::Spectrum => {
+                let ready = !busy
+                    && self.trace.is_some()
+                    && self.calibration.edited_numeric_values().is_some();
+                if action(ui, lang.text("Reconstruct scan", "重建图像"), ready, true) {
+                    self.reconstruct();
+                }
                 if action(
                     ui,
-                    lang.text("Reconstruct scan", "重建图像"),
-                    !busy
-                        && self.trace.is_some()
-                        && self.calibration.edited_numeric_values().is_some(),
-                    true,
+                    lang.text("Reconstruct sequence", "重建文件序列"),
+                    ready,
+                    false,
                 ) {
-                    self.reconstruct();
+                    self.pick(OPEN_SEQUENCE);
                 }
             }
             Page::Result => {

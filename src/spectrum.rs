@@ -151,6 +151,25 @@ impl Spectrum {
     }
 
     pub fn fit_line(&self, seed: Option<(usize, usize)>) -> Result<Trace, Error> {
+        self.fit_line_with_seed(seed, true)
+    }
+
+    #[cfg(any(target_os = "android", test))]
+    pub(crate) fn track_line(&self, reference: Trace) -> Result<Trace, Error> {
+        let (left, right) = self.illuminated;
+        let x = left.midpoint(right);
+        let row = reference
+            .row(x)
+            .round()
+            .clamp(0., (self.header.height - 1) as f64);
+        self.fit_line_with_seed(Some((x, row as usize)), false)
+    }
+
+    fn fit_line_with_seed(
+        &self,
+        seed: Option<(usize, usize)>,
+        manual: bool,
+    ) -> Result<Trace, Error> {
         let (left, right) = self.illuminated;
         let (width, height) = (self.header.width, self.header.height);
         if let Some((x, y)) = seed
@@ -169,7 +188,7 @@ impl Spectrum {
 
         let center = (left + right) / 2;
         let initial = if let Some((x, y)) = seed {
-            self.nearby_minimum(x.clamp(left, right), y as f64)
+            self.nearby_minimum(x.clamp(left, right), y as f64, manual)
         } else {
             (1..height - 1)
                 .filter_map(|y| self.local_minimum(center, y))
@@ -177,6 +196,7 @@ impl Spectrum {
         };
         let Some(initial) = initial else {
             return seed
+                .filter(|_| manual)
                 .map(|(_, y)| Trace::constant(width, y as f64))
                 .ok_or(Error::NoLine);
         };
@@ -188,7 +208,7 @@ impl Spectrum {
         let mut track = |columns: &mut dyn Iterator<Item = usize>| {
             let mut last = y;
             for x in columns {
-                if let Some(sample) = self.nearby_minimum(x, last) {
+                if let Some(sample) = self.nearby_minimum(x, last, manual) {
                     last = sample.y;
                     samples.push(sample);
                 }
@@ -196,7 +216,11 @@ impl Spectrum {
         };
         track(&mut (left..anchor).rev());
         track(&mut (anchor + 1..=right));
-        let fallback = || seed.map(|_| Trace::constant(width, y)).ok_or(Error::NoLine);
+        let fallback = || {
+            seed.filter(|_| manual)
+                .map(|_| Trace::constant(width, y))
+                .ok_or(Error::NoLine)
+        };
         if samples.len() < 6 || samples.len() * 4 < right - left + 1 {
             return fallback();
         }
@@ -213,14 +237,25 @@ impl Spectrum {
         Ok(fit(&samples, width).unwrap_or(first))
     }
 
-    fn nearby_minimum(&self, x: usize, row: f64) -> Option<Sample> {
+    fn nearby_minimum(&self, x: usize, row: f64, prefer_depth: bool) -> Option<Sample> {
         let center = row.round() as usize;
         let lo = center.saturating_sub(TRACK_RADIUS).max(1);
         let hi = (center + TRACK_RADIUS).min(self.header.height - 2);
-        let score = |p: &Sample| p.depth / (1. + (row - p.y).abs());
+        let score = |p: &Sample| {
+            let distance = (row - p.y).abs();
+            if prefer_depth {
+                p.depth / (1. + distance)
+            } else {
+                -distance
+            }
+        };
         (lo..=hi)
             .filter_map(|y| self.local_minimum(x, y))
-            .max_by(|a, b| score(a).total_cmp(&score(b)))
+            .max_by(|a, b| {
+                score(a)
+                    .total_cmp(&score(b))
+                    .then(a.depth.total_cmp(&b.depth))
+            })
     }
 
     fn local_minimum(&self, x: usize, y: usize) -> Option<Sample> {
@@ -260,4 +295,44 @@ fn fit(samples: &[Sample], width: usize) -> Option<Trace> {
         coefficients,
         width,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn tracks_shifted_reference_line_and_rejects_missing_line() {
+        let (width, height) = (32_u32, 24_u32);
+        let spectrum = |has_reference_line, other_line| {
+            let mut bytes = vec![0; 178];
+            bytes[..14].copy_from_slice(b"LUCAM-RECORDER");
+            for (offset, value) in [(26, width), (30, height), (34, 8), (38, 1)] {
+                bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            for y in 0..height {
+                for x in 0..width {
+                    bytes.push(match y {
+                        9 if has_reference_line && x < width / 2 => 160,
+                        10 if has_reference_line && x >= width / 2 => 160,
+                        y if y == other_line => 40,
+                        _ => 200,
+                    });
+                }
+            }
+            let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+            Spectrum::average(&mut reader, |_| true).unwrap()
+        };
+        let reference = Trace::constant(width as usize, 7.);
+        let with_line = spectrum(true, 12);
+        let tracked = with_line.track_line(reference).unwrap();
+        assert!((tracked.row(0) - 9.).abs() < 0.5);
+        assert!((tracked.row(width as usize - 1) - 10.).abs() < 0.5);
+        assert!(with_line.fit_line(None).unwrap().row(0) > 11.);
+        assert!(matches!(
+            spectrum(false, 18).track_line(reference),
+            Err(Error::NoLine)
+        ));
+    }
 }

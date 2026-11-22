@@ -24,7 +24,7 @@ mod android;
 mod android_document;
 
 pub use contrast::LocalContrast;
-pub use display::{DisplayImage, Product, Stretch};
+pub use display::{DisplayImage, DisplayTone, Product, Stretch};
 pub use fits::FitsMetadata;
 pub use flat::PhysicalFlat;
 pub use framing::Framing;
@@ -59,6 +59,12 @@ pub enum Error {
     NoFlatSamples,
     #[error("The flat SER must match the scan dimensions, color mode and bit depth.")]
     FlatMismatch,
+    #[error(
+        "The scan dimensions, color mode, bit depth and trimming must match the reference SER."
+    )]
+    SequenceMismatch,
+    #[error("The scan uses slit columns outside the captured flat calibration.")]
+    FlatCoverage,
     #[error("The flat SER does not illuminate the full slit reliably.")]
     InvalidPhysicalFlat,
     #[error("The scan must cover both wings at the selected Doppler offset.")]

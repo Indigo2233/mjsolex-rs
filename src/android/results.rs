@@ -26,7 +26,7 @@ impl View {
 
 #[derive(Clone, Copy)]
 pub(super) enum Export {
-    Display(View),
+    Display(View, DisplayTone),
     RawPng,
     Fits,
 }
@@ -68,9 +68,9 @@ impl Images {
             }))
     }
 
-    pub(super) fn exports(&self) -> impl Iterator<Item = Export> + '_ {
+    pub(super) fn exports(&self, tone: DisplayTone) -> impl Iterator<Item = Export> + '_ {
         self.views()
-            .map(Export::Display)
+            .map(move |view| Export::Display(view, tone))
             .chain([Export::RawPng, Export::Fits])
     }
 
@@ -86,8 +86,8 @@ impl Images {
         }
     }
 
-    pub(super) fn preview(&self, view: View) -> Result<ColorImage, Error> {
-        let display = self.display(view)?;
+    pub(super) fn preview(&self, view: View, tone: DisplayTone) -> Result<ColorImage, Error> {
+        let display = self.display(view)?.with_tone(tone);
         Ok(preview_rgb(
             self.center.width(),
             self.center.height(),
@@ -97,7 +97,7 @@ impl Images {
 
     pub(super) fn write(&self, export: Export, output: impl Write) -> Result<(), Error> {
         match export {
-            Export::Display(product) => self.display(product)?.write_png(output),
+            Export::Display(view, tone) => self.display(view)?.with_tone(tone).write_png(output),
             Export::RawPng => self.center.write_png(output),
             Export::Fits => self
                 .center
@@ -116,10 +116,13 @@ impl Images {
             .unwrap_or("scan");
         let synthetic = !matches!(
             export,
-            Export::Display(View {
-                product: Product::Doppler,
-                ..
-            })
+            Export::Display(
+                View {
+                    product: Product::Doppler,
+                    ..
+                },
+                _
+            )
         ) && self.center.has_synthetic_flat();
         let flat = if synthetic || self.metadata.flat_file.is_some() {
             "-flat"
@@ -138,14 +141,17 @@ impl Images {
             .map(|shift| format!("-{shift:+.2}px"))
             .unwrap_or_default();
         let suffix = match export {
-            Export::Display(View {
-                product: Product::Doppler,
-                ..
-            }) => format!("-doppler-w{:.2}px.png", self.wing_offset),
-            Export::Display(view) if view.enhanced => {
+            Export::Display(
+                View {
+                    product: Product::Doppler,
+                    ..
+                },
+                _,
+            ) => format!("-doppler-w{:.2}px.png", self.wing_offset),
+            Export::Display(view, _) if view.enhanced => {
                 format!("{}-enhanced.png", view.product.suffix())
             }
-            Export::Display(view) => format!("{}-display.png", view.product.suffix()),
+            Export::Display(view, _) => format!("{}-display.png", view.product.suffix()),
             Export::RawPng => "-raw.png".into(),
             Export::Fits => ".fits".into(),
         };
@@ -197,9 +203,10 @@ pub(super) fn write_in_directory(
     directory: &JObject<'_>,
     images: &Images,
     export: Export,
+    name: &str,
 ) -> Result<(), Error> {
     let result = env.with_local_frame(10, |env| {
-        let name = env.new_string(images.file_name(export))?;
+        let name = env.new_string(name)?;
         let mime = env.new_string(export.mime())?;
         let uri = env
             .call_method(
@@ -258,7 +265,7 @@ pub(super) fn write_in_directory(
     result.map_err(io::Error::other)?
 }
 
-fn clear_exception(env: &JNIEnv<'_>) {
+pub(super) fn clear_exception(env: &JNIEnv<'_>) {
     if env.exception_check().unwrap_or(false) {
         let _ = env.exception_clear();
     }

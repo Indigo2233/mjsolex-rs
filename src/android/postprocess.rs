@@ -33,6 +33,10 @@ pub(super) struct CorrectionWarnings {
 }
 
 impl CorrectionWarnings {
+    pub(super) fn has_errors(&self) -> bool {
+        self.entries().iter().any(|(error, ..)| error.is_some())
+    }
+
     pub(super) fn entries(&self) -> [(&Option<Error>, &'static str, &'static str); 6] {
         [
             (&self.flat, "Synthetic flat skipped. ", "已跳过虚拟平场。"),
@@ -62,6 +66,145 @@ impl CorrectionWarnings {
                 "已跳过双翼多普勒图。",
             ),
         ]
+    }
+}
+
+pub(super) fn doppler_shift(
+    spectrum: &Spectrum,
+    trace: Trace,
+    shift: f64,
+    wing_offset: f64,
+    dispersion: Option<f64>,
+) -> Result<f64, Error> {
+    let dispersion = dispersion.ok_or(Error::DopplerDispersion)?;
+    if !spectrum.supports_wings(trace, shift, wing_offset) {
+        return Err(Error::DopplerCoverage);
+    }
+    Ok(wing_offset.copysign(dispersion))
+}
+
+pub(super) struct ReconstructionOptions {
+    pub(super) wavelength: f64,
+    pub(super) dispersion: Option<f64>,
+    pub(super) shift: f64,
+    pub(super) stride: u32,
+    pub(super) doppler: bool,
+    pub(super) wing_offset: f64,
+    pub(super) palettes: [bool; 3],
+    pub(super) processing: ProcessingOptions,
+    pub(super) synthetic_flat: bool,
+    pub(super) physical_flat: Option<(Arc<PhysicalFlat>, String)>,
+}
+
+impl ReconstructionOptions {
+    pub(super) fn wing_shift(
+        &self,
+        spectrum: &Spectrum,
+        trace: Trace,
+    ) -> Result<Option<f64>, Error> {
+        self.doppler
+            .then(|| {
+                doppler_shift(
+                    spectrum,
+                    trace,
+                    self.shift,
+                    self.wing_offset,
+                    self.dispersion,
+                )
+            })
+            .transpose()
+    }
+
+    pub(super) fn build(
+        &self,
+        mut reader: SerReader<&File>,
+        name: String,
+        trace: Trace,
+        fwhm: Option<f64>,
+        wing_shift: Result<Option<f64>, Error>,
+        mut progress: impl FnMut(f32) -> bool,
+    ) -> Result<(Images, CorrectionWarnings), Error> {
+        let header = reader.header();
+        let (wing_shift, doppler) = match wing_shift {
+            Ok(offset) => (offset, None),
+            Err(error) => (None, Some(error)),
+        };
+        let stride = self.stride.max(if wing_shift.is_some() {
+            header.minimum_doppler_stride()
+        } else {
+            header.minimum_stride()
+        });
+        let mut metadata = FitsMetadata {
+            observation: reader.observation().clone(),
+            source_name: Some(name),
+            source_header: Some(header),
+            offset_pixels: Some(self.shift),
+            frame_step: Some(stride),
+            line_center_angstrom: (self.wavelength > 0.).then_some(self.wavelength),
+            dispersion_angstrom: self.dispersion,
+            fwhm_pixels: fwhm,
+            ..FitsMetadata::default()
+        };
+        let mut warnings = CorrectionWarnings {
+            doppler,
+            ..CorrectionWarnings::default()
+        };
+        let corrections_start = 0.8;
+        let flat_start = if self.synthetic_flat || self.physical_flat.is_some() {
+            corrections_start - 0.10
+        } else {
+            corrections_start
+        };
+        let shift = self.shift;
+        let (mut center, mut wings) = if let Some(wing) = wing_shift {
+            let [center, red, blue] = reconstruct_offsets(
+                &mut reader,
+                trace,
+                [shift, shift + wing, shift - wing],
+                stride,
+                |p| progress(p * flat_start),
+            )?;
+            (center, Some([red, blue]))
+        } else {
+            let center = reconstruct_with_stride(&mut reader, trace, shift, stride, |p| {
+                progress(p * flat_start)
+            })?;
+            (center, None)
+        };
+        drop(reader);
+        if self.synthetic_flat {
+            let strength = self.processing.synthetic_strength;
+            match center.correct_synthetic_flat_at_strength(strength, |p| {
+                progress(flat_start + p * (corrections_start - flat_start))
+            }) {
+                Ok(applied) => metadata.synthetic_flat_strength = applied.then_some(strength),
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(error) => warnings.flat = Some(error),
+            }
+        } else if let Some((flat, name)) = &self.physical_flat {
+            flat.apply(&mut center)?;
+            if let Some(wings) = &mut wings {
+                for wing in wings {
+                    flat.apply(wing)?;
+                }
+            }
+            metadata.flat_file = Some(name.clone());
+        }
+        if !progress(corrections_start) {
+            return Err(Error::Cancelled);
+        }
+        let mut images = Images {
+            center,
+            wings,
+            palettes: self.palettes,
+            wing_offset: self.wing_offset,
+            metadata,
+            enhancement: None,
+        };
+        finish(&mut images, self.processing, &mut warnings, |p| {
+            progress(corrections_start + (1. - corrections_start) * p)
+        })?;
+        Ok((images, warnings))
     }
 }
 
