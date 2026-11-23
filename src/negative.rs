@@ -15,11 +15,27 @@ const SHARPEN_KERNEL: usize = 7;
 pub(crate) const NEGATIVE_PIXEL_BUDGET: usize = 8 * 1024 * 1024;
 const PROGRESS_CHUNK_PIXELS: usize = 65_536;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NegativeOptions {
+    /// Invert the stretched prominence signal while keeping the sky black.
+    pub invert_prominences: bool,
+    /// Prominence inversion strength, from 0 to 100 percent.
+    pub prominence_strength: u8,
+}
+
 /// Build the negative product used by JSol'Ex. A fitted disk is inverted
 /// independently from prominences. Images without a reliable limb use
 /// JSol'Ex's CLAHE fallback.
 pub fn reconstruct_negative(
     image: &Reconstruction,
+    progress: impl FnMut(f32) -> bool,
+) -> Result<Reconstruction, Error> {
+    reconstruct_negative_with_options(image, NegativeOptions::default(), progress)
+}
+
+pub fn reconstruct_negative_with_options(
+    image: &Reconstruction,
+    options: NegativeOptions,
     mut progress: impl FnMut(f32) -> bool,
 ) -> Result<Reconstruction, Error> {
     let count = image
@@ -37,8 +53,13 @@ pub fn reconstruct_negative(
     }
     let mut data = to_f32(image, &mut progress)?;
     match crate::geometry::DiskGeometry::fit_limb(image) {
-        Ok(disk) => reconstruct_disk_negative(image, &mut data, disk, &mut progress)?,
+        Ok(disk) => {
+            reconstruct_disk_negative(image, &mut data, disk, options, &mut progress)?;
+        }
         Err(Error::NoSolarLimb) => {
+            if options.invert_prominences {
+                return Err(Error::NoSolarLimb);
+            }
             reconstruct_fallback_negative(&mut data, image.width, image.height, &mut progress)?
         }
         Err(error) => return Err(error),
@@ -50,6 +71,7 @@ fn reconstruct_disk_negative(
     source: &Reconstruction,
     data: &mut [f32],
     disk: FittedDisk,
+    options: NegativeOptions,
     progress: &mut impl FnMut(f32) -> bool,
 ) -> Result<(), Error> {
     let width = source.width;
@@ -99,7 +121,14 @@ fn reconstruct_disk_negative(
     auto_stretch(&mut sharpened, &mask, progress)?;
     let black_point =
         estimate_black_point(source, &mask, &mut |p| progress(0.8 + 0.04 * p))? * DISK_BOOST;
-    add_prominences(source, &mask, black_point, &mut sharpened, progress)?;
+    add_prominences(
+        source,
+        &mask,
+        black_point,
+        options,
+        &mut sharpened,
+        progress,
+    )?;
     for (target, source) in data
         .chunks_mut(PROGRESS_CHUNK_PIXELS)
         .zip(sharpened.chunks(PROGRESS_CHUNK_PIXELS))
@@ -498,6 +527,7 @@ fn add_prominences(
     source: &Reconstruction,
     mask: &DiskMask,
     black_point: f64,
+    options: NegativeOptions,
     data: &mut [f32],
     progress: &mut impl FnMut(f32) -> bool,
 ) -> Result<(), Error> {
@@ -539,11 +569,27 @@ fn add_prominences(
         .zip(data.chunks_mut(PROGRESS_CHUNK_PIXELS))
         .enumerate()
     {
+        let inversion_strength = if options.invert_prominences {
+            f64::from(options.prominence_strength.min(100)) / 100.
+        } else {
+            0.
+        };
         for ((&pixel, &coverage), value) in pixels.iter().zip(coverage).zip(values.iter_mut()) {
-            let prominence = (prominence_stretch(pixel, f32::from(coverage) / 16., black_point)
-                - minimum)
-                * scale;
-            *value = (f64::from(*value) + prominence).clamp(0., MAX_PIXEL_VALUE) as f32;
+            let prominence = prominence_stretch(pixel, f32::from(coverage) / 16., black_point);
+            let normal = ((prominence - minimum) * scale).clamp(0., MAX_PIXEL_VALUE);
+            let display = if options.invert_prominences {
+                let inverse = MAX_PIXEL_VALUE - normal;
+                normal + (inverse - normal) * inversion_strength
+            } else {
+                normal
+            };
+            let inside_weight = f64::from(coverage) / 16.;
+            let composited = if options.invert_prominences {
+                f64::from(*value) * inside_weight + display * (1. - inside_weight)
+            } else {
+                f64::from(*value) + display
+            };
+            *value = composited.clamp(0., MAX_PIXEL_VALUE) as f32;
         }
         if !advance_progress(
             progress,
@@ -777,6 +823,67 @@ mod tests {
         assert_ne!(disk_level, original[48 * width + 64]);
         assert!(sky_level > 0);
         assert!(prominence_level > sky_level);
+    }
+
+    #[test]
+    fn inverted_prominences_make_the_limb_feature_darker() {
+        let width = 128;
+        let height = 96;
+        let mut pixels = disk(width, height, 0, (64., 48.), 34.);
+        for y in 40..56 {
+            for x in 97..109 {
+                pixels[y * width + x] = 2_400;
+            }
+        }
+        let source = reconstruction(width, height, pixels);
+        let normal = reconstruct_negative(&source, |_| true).unwrap();
+        let inverted = reconstruct_negative_with_options(
+            &source,
+            NegativeOptions {
+                invert_prominences: true,
+                prominence_strength: 100,
+            },
+            |_| true,
+        )
+        .unwrap();
+        let disk_core = 48 * width + 64;
+        let prominence = 48 * width + 103;
+        assert!(inverted.pixels()[disk_core] > 0);
+        assert!(inverted.pixels()[prominence] < normal.pixels()[prominence]);
+    }
+
+    #[test]
+    fn prominence_inversion_strength_interpolates_between_positive_and_inverted() {
+        let width = 128;
+        let height = 96;
+        let mut pixels = disk(width, height, 0, (64., 48.), 34.);
+        for y in 40..56 {
+            for x in 97..109 {
+                pixels[y * width + x] = 2_400;
+            }
+        }
+        let source = reconstruction(width, height, pixels);
+        let full = reconstruct_negative_with_options(
+            &source,
+            NegativeOptions {
+                invert_prominences: true,
+                prominence_strength: 100,
+            },
+            |_| true,
+        )
+        .unwrap();
+        let half = reconstruct_negative_with_options(
+            &source,
+            NegativeOptions {
+                invert_prominences: true,
+                prominence_strength: 50,
+            },
+            |_| true,
+        )
+        .unwrap();
+        let index = 48 * width + 103;
+        assert!(half.pixels()[index] > full.pixels()[index]);
+        assert!(half.pixels()[index] < MAX_PIXEL_VALUE as u16);
     }
 
     #[test]

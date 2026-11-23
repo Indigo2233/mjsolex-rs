@@ -20,9 +20,10 @@ use crate::reconstruct::{MAX_DOPPLER_WING_PIXELS, MAX_PIXELS};
 use crate::ser::cache_recording;
 use crate::{
     APP_NAME, BandingAxis, ByteOrder, DiskGeometry, DisplayImage, DisplaySettings, DisplayTone,
-    Error, FitsMetadata, Framing, Header, LineProfile, LocalContrast, Observation, OpticalSetup,
-    PhysicalFlat, Product, Reconstruction, ScanSettings, SerReader, Spectrum, Stretch, Trace,
-    reconstruct_negative, reconstruct_offsets, reconstruct_with_stride,
+    Error, FitsMetadata, Framing, Header, LineProfile, LocalContrast, NegativeOptions, Observation,
+    OpticalSetup, PhysicalFlat, Product, Reconstruction, ScanSettings, SerReader, Spectrum,
+    Stretch, Trace, reconstruct_negative_with_options, reconstruct_offsets,
+    reconstruct_with_stride,
 };
 
 mod language;

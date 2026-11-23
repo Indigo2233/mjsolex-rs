@@ -654,6 +654,24 @@ impl Mobile {
                         .color(MUTED),
                     );
                 }
+                if self.processing.negative {
+                    ui.checkbox(
+                        &mut self.processing.invert_prominences,
+                        lang.text("Invert and enhance limb prominences", "反相并增强边缘日珥"),
+                    );
+                    if self.processing.invert_prominences {
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label(lang.text("Prominence inversion strength", "日珥反相强度"));
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.processing.prominence_strength,
+                                    0..=100,
+                                )
+                                .suffix("%"),
+                            );
+                        });
+                    }
+                }
                 ui.checkbox(
                     &mut self.processing.enhance,
                     lang.text("Enhanced images (local contrast)", "增强图（局部对比度）"),

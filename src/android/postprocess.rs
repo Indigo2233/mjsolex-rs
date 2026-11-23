@@ -9,6 +9,8 @@ pub(super) struct ProcessingOptions {
     pub(super) framing: Framing,
     pub(super) enhance: bool,
     pub(super) negative: bool,
+    pub(super) invert_prominences: bool,
+    pub(super) prominence_strength: u8,
 }
 
 impl Default for ProcessingOptions {
@@ -20,6 +22,8 @@ impl Default for ProcessingOptions {
             framing: Framing::default(),
             enhance: true,
             negative: false,
+            invert_prominences: false,
+            prominence_strength: 100,
         }
     }
 }
@@ -319,7 +323,11 @@ pub(super) fn finish(
         }
     }
     if options.negative {
-        match reconstruct_negative(&images.center, |p| {
+        let negative_options = NegativeOptions {
+            invert_prominences: options.invert_prominences,
+            prominence_strength: options.prominence_strength,
+        };
+        match reconstruct_negative_with_options(&images.center, negative_options, |p| {
             progress(negative_start + (negative_end - negative_start) * p)
         }) {
             Ok(negative) => images.negative = Some(negative),

@@ -30,7 +30,7 @@ pub use fits::FitsMetadata;
 pub use flat::PhysicalFlat;
 pub use framing::Framing;
 pub use geometry::DiskGeometry;
-pub use negative::reconstruct_negative;
+pub use negative::{NegativeOptions, reconstruct_negative, reconstruct_negative_with_options};
 pub use observation::Observation;
 pub use optics::OpticalSetup;
 pub use profile::{LineFit, LineProfile};
