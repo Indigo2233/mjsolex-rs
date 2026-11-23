@@ -102,7 +102,8 @@ pub struct DisplayImage<'a> {
     stretch: Stretch,
     local: Option<&'a LocalContrast>,
     palette: [[u8; 3]; 256],
-    tone: [u8; 256],
+    settings: DisplaySettings,
+    levels: [u8; 256],
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -111,6 +112,20 @@ pub enum DisplayTone {
     #[default]
     Standard,
     Brighter,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DisplayInversion {
+    #[default]
+    Off,
+    Linear,
+    Curve,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DisplaySettings {
+    pub tone: DisplayTone,
+    pub inversion: DisplayInversion,
 }
 
 impl<'a> DisplayImage<'a> {
@@ -171,18 +186,41 @@ impl<'a> DisplayImage<'a> {
             stretch,
             local,
             palette,
-            tone: std::array::from_fn(|value| value as u8),
+            settings: DisplaySettings::default(),
+            levels: std::array::from_fn(|value| value as u8),
         })
     }
 
-    pub fn with_tone(mut self, tone: DisplayTone) -> Self {
-        let exponent = match tone {
+    pub fn with_tone(self, tone: DisplayTone) -> Self {
+        let settings = DisplaySettings {
+            tone,
+            ..self.settings
+        };
+        self.with_settings(settings)
+    }
+
+    pub fn with_settings(mut self, settings: DisplaySettings) -> Self {
+        self.settings = settings;
+        let exponent = match settings.tone {
             DisplayTone::Darker => 1.25,
             DisplayTone::Standard => 1.,
             DisplayTone::Brighter => 0.8,
         };
-        self.tone = std::array::from_fn(|value| {
-            (255. * (value as f32 / 255.).powf(exponent)).round() as u8
+        let inversion = if self.product == Product::Doppler {
+            DisplayInversion::Off
+        } else {
+            settings.inversion
+        };
+        self.levels = std::array::from_fn(|value| {
+            let x = value as f32 / 255.;
+            let level = match inversion {
+                DisplayInversion::Off => x,
+                DisplayInversion::Linear => 1. - x,
+                // The complement of the Beta(2, 2) CDF is monotone, with its
+                // steepest slope at the midtone and zero slope at both ends.
+                DisplayInversion::Curve => 1. - x * x * (3. - 2. * x),
+            };
+            (255. * level.powf(exponent)).round() as u8
         });
         self
     }
@@ -197,7 +235,7 @@ impl<'a> DisplayImage<'a> {
             // A redshift deepens the red-wing absorption, giving I_blue > I_red.
             let sum = f32::from(red) + f32::from(blue);
             let signal = (4. * (f32::from(blue) - f32::from(red)) / sum).clamp(-1., 1.);
-            let level = f32::from(self.tone[self.stretch.map(red.midpoint(blue)) as usize]);
+            let level = f32::from(self.levels[self.stretch.map(red.midpoint(blue)) as usize]);
             return [
                 (level * (1. + signal).clamp(0.2, 1.5)).min(255.) as u8,
                 (level * (1. - 0.55 * signal.abs())) as u8,
@@ -207,7 +245,7 @@ impl<'a> DisplayImage<'a> {
         let gray = self
             .local
             .map_or_else(|| self.stretch.map(red), |map| map.map(index, red));
-        self.palette[self.tone[gray as usize] as usize]
+        self.palette[self.levels[gray as usize] as usize]
     }
 
     pub fn write_png(&self, output: impl Write) -> Result<(), Error> {

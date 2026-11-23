@@ -795,7 +795,7 @@ impl Mobile {
         let busy = self.busy();
         let images = &output.images;
         let mut view_to_show = output.shown;
-        let mut tone = output.tone;
+        let mut settings = output.settings;
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for view in images.views() {
@@ -863,22 +863,34 @@ impl Mobile {
                     },
                 );
             }
-            ui.label(lang.text("Midtone brightness", "中间调亮度"));
             ui.add_enabled_ui(!busy, |ui| {
                 ui.horizontal_wrapped(|ui| {
+                    ui.label(lang.text("Midtones", "中间调亮度"));
                     for (value, label) in [
                         (DisplayTone::Darker, lang.text("Darker", "偏暗")),
                         (DisplayTone::Standard, lang.text("Standard", "标准")),
                         (DisplayTone::Brighter, lang.text("Brighter", "偏亮")),
                     ] {
-                        ui.selectable_value(&mut tone, value, label);
+                        ui.selectable_value(&mut settings.tone, value, label);
                     }
                 });
+                if output.shown.product != Product::Doppler {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(lang.text("Inversion", "反相"));
+                        for (value, label) in [
+                            (DisplayInversion::Off, lang.text("Off", "关闭")),
+                            (DisplayInversion::Linear, lang.text("Linear", "线性")),
+                            (DisplayInversion::Curve, lang.text("Curve", "曲线")),
+                        ] {
+                            ui.selectable_value(&mut settings.inversion, value, label);
+                        }
+                    });
+                }
             });
             picture(ui, &output.texture, w, h, 0. ..=430., Sense::hover());
         });
-        if view_to_show != output.shown || tone != output.tone {
-            self.show_product(view_to_show, tone);
+        if view_to_show != output.shown || settings != output.settings {
+            self.show_product(view_to_show, settings);
         }
     }
 

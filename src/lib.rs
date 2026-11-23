@@ -24,7 +24,7 @@ mod android;
 mod android_document;
 
 pub use contrast::LocalContrast;
-pub use display::{DisplayImage, DisplayTone, Product, Stretch};
+pub use display::{DisplayImage, DisplayInversion, DisplaySettings, DisplayTone, Product, Stretch};
 pub use fits::FitsMetadata;
 pub use flat::PhysicalFlat;
 pub use framing::Framing;

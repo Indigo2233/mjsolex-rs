@@ -245,7 +245,7 @@ impl Mobile {
                     }
                     let exports = || {
                         images
-                            .exports(DisplayTone::Standard)
+                            .exports(DisplaySettings::default())
                             .filter(|&export| selection.format.includes(export))
                     };
                     let count = exports().count();

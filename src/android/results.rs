@@ -26,7 +26,7 @@ impl View {
 
 #[derive(Clone, Copy)]
 pub(super) enum Export {
-    Display(View, DisplayTone),
+    Display(View, DisplaySettings),
     RawPng,
     Fits,
 }
@@ -68,14 +68,14 @@ impl Images {
             }))
     }
 
-    pub(super) fn exports(&self, tone: DisplayTone) -> impl Iterator<Item = Export> + '_ {
+    pub(super) fn exports(&self, settings: DisplaySettings) -> impl Iterator<Item = Export> + '_ {
         self.views()
-            .map(move |view| Export::Display(view, tone))
+            .map(move |view| Export::Display(view, settings))
             .chain([Export::RawPng, Export::Fits])
     }
 
-    fn display(&self, view: View) -> Result<DisplayImage<'_>, Error> {
-        if view.enhanced {
+    fn display(&self, view: View, settings: DisplaySettings) -> Result<DisplayImage<'_>, Error> {
+        let image = if view.enhanced {
             let enhancement = self.enhancement.as_ref().ok_or(Error::InvalidTrace)?;
             DisplayImage::enhanced(&self.center, view.product, enhancement)
         } else if view.product == Product::Doppler {
@@ -83,11 +83,16 @@ impl Images {
             DisplayImage::new(red, Some(blue), view.product)
         } else {
             DisplayImage::new(&self.center, None, view.product)
-        }
+        }?;
+        Ok(image.with_settings(settings))
     }
 
-    pub(super) fn preview(&self, view: View, tone: DisplayTone) -> Result<ColorImage, Error> {
-        let display = self.display(view)?.with_tone(tone);
+    pub(super) fn preview(
+        &self,
+        view: View,
+        settings: DisplaySettings,
+    ) -> Result<ColorImage, Error> {
+        let display = self.display(view, settings)?;
         Ok(preview_rgb(
             self.center.width(),
             self.center.height(),
@@ -97,7 +102,7 @@ impl Images {
 
     pub(super) fn write(&self, export: Export, output: impl Write) -> Result<(), Error> {
         match export {
-            Export::Display(view, tone) => self.display(view)?.with_tone(tone).write_png(output),
+            Export::Display(view, settings) => self.display(view, settings)?.write_png(output),
             Export::RawPng => self.center.write_png(output),
             Export::Fits => self
                 .center
@@ -148,10 +153,15 @@ impl Images {
                 },
                 _,
             ) => format!("-doppler-w{:.2}px.png", self.wing_offset),
-            Export::Display(view, _) if view.enhanced => {
-                format!("{}-enhanced.png", view.product.suffix())
+            Export::Display(view, settings) => {
+                let kind = if view.enhanced { "enhanced" } else { "display" };
+                let inversion = match settings.inversion {
+                    DisplayInversion::Off => "",
+                    DisplayInversion::Linear => "-negative",
+                    DisplayInversion::Curve => "-negative-curve",
+                };
+                format!("{}-{kind}{inversion}.png", view.product.suffix())
             }
-            Export::Display(view, _) => format!("{}-display.png", view.product.suffix()),
             Export::RawPng => "-raw.png".into(),
             Export::Fits => ".fits".into(),
         };

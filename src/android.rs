@@ -19,10 +19,10 @@ use crate::android_document::DocumentFile;
 use crate::reconstruct::{MAX_DOPPLER_WING_PIXELS, MAX_PIXELS};
 use crate::ser::cache_recording;
 use crate::{
-    APP_NAME, BandingAxis, ByteOrder, DiskGeometry, DisplayImage, DisplayTone, Error, FitsMetadata,
-    Framing, Header, LineProfile, LocalContrast, Observation, OpticalSetup, PhysicalFlat, Product,
-    Reconstruction, ScanSettings, SerReader, Spectrum, Stretch, Trace, reconstruct_offsets,
-    reconstruct_with_stride,
+    APP_NAME, BandingAxis, ByteOrder, DiskGeometry, DisplayImage, DisplayInversion,
+    DisplaySettings, DisplayTone, Error, FitsMetadata, Framing, Header, LineProfile, LocalContrast,
+    Observation, OpticalSetup, PhysicalFlat, Product, Reconstruction, ScanSettings, SerReader,
+    Spectrum, Stretch, Trace, reconstruct_offsets, reconstruct_with_stride,
 };
 
 mod language;
@@ -96,7 +96,7 @@ enum Work {
         preview: ColorImage,
         warning: Option<Notice>,
     },
-    Previewed(View, DisplayTone, ColorImage),
+    Previewed(View, DisplaySettings, ColorImage),
     Exported(String),
     BatchExported {
         saved: usize,
@@ -131,7 +131,7 @@ struct Scan {
 struct Output {
     images: Arc<Images>,
     shown: View,
-    tone: DisplayTone,
+    settings: DisplaySettings,
     texture: TextureHandle,
 }
 
@@ -140,7 +140,7 @@ impl Output {
         match request {
             SAVE_FITS => Export::Fits,
             SAVE_RAW_PNG => Export::RawPng,
-            _ => Export::Display(self.shown, self.tone),
+            _ => Export::Display(self.shown, self.settings),
         }
     }
 }
@@ -787,7 +787,7 @@ impl Mobile {
                 let (images, warnings) =
                     options.build(reader, name, trace, fwhm, wings, |p| progress(0.98 * p))?;
                 file.check_error()?;
-                let preview = images.preview(View::GRAY, DisplayTone::Standard)?;
+                let preview = images.preview(View::GRAY, DisplaySettings::default())?;
                 if !progress(1.) {
                     return Err(Error::Cancelled);
                 }
@@ -803,9 +803,9 @@ impl Mobile {
         );
     }
 
-    fn show_product(&mut self, view: View, tone: DisplayTone) {
+    fn show_product(&mut self, view: View, settings: DisplaySettings) {
         let Some(output) = &self.output else { return };
-        if (output.shown == view && output.tone == tone)
+        if (output.shown == view && output.settings == settings)
             || !output.images.views().any(|item| item == view)
         {
             return;
@@ -814,7 +814,13 @@ impl Mobile {
         self.start_job(
             ("Preparing preview", "正在准备预览"),
             false,
-            move |_, _| Ok(Work::Previewed(view, tone, images.preview(view, tone)?)),
+            move |_, _| {
+                Ok(Work::Previewed(
+                    view,
+                    settings,
+                    images.preview(view, settings)?,
+                ))
+            },
         );
     }
 
@@ -840,7 +846,7 @@ impl Mobile {
     fn export_directory(&mut self, directory: GlobalRef) {
         let Some(output) = &self.output else { return };
         let images = output.images.clone();
-        let tone = output.tone;
+        let settings = output.settings;
         let vm = self.vm.clone();
         let activity = self.activity.clone();
         self.start_job(
@@ -848,8 +854,8 @@ impl Mobile {
             false,
             move |events, _| {
                 let mut env = vm.attach_current_thread().map_err(io::Error::other)?;
-                let total = images.exports(tone).count();
-                for (saved, export) in images.exports(tone).enumerate() {
+                let total = images.exports(settings).count();
+                for (saved, export) in images.exports(settings).enumerate() {
                     events.post(Event::Progress(saved as f32 / total as f32));
                     if let Err(error) = results::write_in_directory(
                         &mut env,
@@ -993,7 +999,7 @@ impl Mobile {
                             self.output = Some(Output {
                                 images,
                                 shown: View::GRAY,
-                                tone: DisplayTone::Standard,
+                                settings: DisplaySettings::default(),
                                 texture,
                             });
                             self.page = Page::Result;
@@ -1006,10 +1012,10 @@ impl Mobile {
                         }
                         Ok(Work::FolderSelected(selection)) => self.sequence = Some(selection),
                         Ok(Work::Exported(name)) => self.note = Some(Notice::Saved(name)),
-                        Ok(Work::Previewed(product, tone, preview)) => {
+                        Ok(Work::Previewed(product, settings, preview)) => {
                             if let Some(output) = &mut self.output {
                                 output.shown = product;
-                                output.tone = tone;
+                                output.settings = settings;
                                 output.texture.set(preview, TextureOptions::LINEAR);
                             }
                         }
