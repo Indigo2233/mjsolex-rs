@@ -2,9 +2,9 @@ use std::cell::Cell;
 use std::io::{Cursor, Read, Seek, SeekFrom};
 
 use mjsolex::{
-    ByteOrder, ColorMode, DisplayImage, DisplayInversion, DisplaySettings, DisplayTone, Error,
-    FitsMetadata, PhysicalFlat, Product, SerReader, Spectrum, Trace, reconstruct,
-    reconstruct_offsets, reconstruct_with_stride,
+    ByteOrder, ColorMode, DisplayImage, DisplayTone, Error, FitsMetadata, PhysicalFlat, Product,
+    SerReader, Spectrum, Trace, reconstruct, reconstruct_negative, reconstruct_offsets,
+    reconstruct_with_stride,
 };
 
 fn ser_header(
@@ -91,48 +91,6 @@ fn exports_display_pixels_and_preserves_raw_16_bit_samples() {
 }
 
 #[test]
-fn exports_linear_and_beta_curve_negatives() {
-    let mut bytes = mono(5, 1, 16, 1);
-    let samples = [100_u16, 200, 300, 400, 500];
-    bytes.extend(samples.into_iter().flat_map(u16::to_le_bytes));
-    let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
-    let image = reconstruct(&mut reader, Trace::constant(5, 0.), 0., |_| true).unwrap();
-    for (inversion, expected) in [
-        (DisplayInversion::Linear, [255, 192, 128, 64, 0]),
-        (DisplayInversion::Curve, [255, 216, 128, 40, 0]),
-    ] {
-        let settings = DisplaySettings {
-            inversion,
-            ..DisplaySettings::default()
-        };
-        let display = DisplayImage::new(&image, None, Product::Gray)
-            .unwrap()
-            .with_settings(settings);
-        let color = DisplayImage::new(&image, None, Product::Hydrogen)
-            .unwrap()
-            .with_settings(settings);
-        let mut encoded = Vec::new();
-        display.write_png(&mut encoded).unwrap();
-        let mut png = png::Decoder::new(Cursor::new(encoded)).read_info().unwrap();
-        let mut pixels = [0; 5];
-        let info = png.next_frame(&mut pixels).unwrap();
-        assert_eq!(info.bit_depth, png::BitDepth::Eight);
-        assert_eq!(pixels, expected);
-        for (index, level) in expected.into_iter().enumerate() {
-            assert_eq!(display.pixel(index), [level; 3]);
-            assert_eq!(color.pixel(index)[0], level);
-        }
-        assert_eq!(color.pixel(0), [255, 211, 137]);
-        assert_eq!(color.pixel(4), [0; 3]);
-        let brighter = display.with_tone(DisplayTone::Brighter);
-        assert_eq!(brighter.pixel(0), [255; 3]);
-        assert_eq!(brighter.pixel(4), [0; 3]);
-        assert!(brighter.pixel(2)[0] > expected[2]);
-    }
-    assert_eq!(image.pixels(), &samples);
-}
-
-#[test]
 fn verifies_doppler_coverage_and_color_direction() {
     let mut bytes = ser_header(b"JSOLEX-TRIMMED", 4, 7, 16, 1, 0);
     for y in 0..7 {
@@ -158,15 +116,41 @@ fn verifies_doppler_coverage_and_color_direction() {
     assert_eq!(doppler.pixel(3), [255; 3]);
     let reversed = DisplayImage::new(&blue, Some(&red), Product::Doppler).unwrap();
     assert_eq!(reversed.pixel(1), doppler.pixel(2));
-    for inversion in [DisplayInversion::Linear, DisplayInversion::Curve] {
-        let configured = DisplayImage::new(&red, Some(&blue), Product::Doppler)
-            .unwrap()
-            .with_settings(DisplaySettings {
-                inversion,
-                ..DisplaySettings::default()
-            });
-        assert!((0..4).all(|index| configured.pixel(index) == doppler.pixel(index)));
+}
+
+#[test]
+fn negative_product_is_independent_and_renders_as_grayscale() {
+    let (width, height) = (96, 72);
+    let mut bytes = mono(width as u32, 1, 16, height as u32);
+    for frame in 0..height {
+        for x in 0..width {
+            let dx = x as f64 - 47.;
+            let dy = frame as f64 - 35.;
+            bytes.extend(
+                if dx.hypot(dy) <= 25. {
+                    (12_000. + 22_000. * (1. - dx.hypot(dy) / 25.)) as u16
+                } else {
+                    300
+                }
+                .to_le_bytes(),
+            );
+        }
     }
+    let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+    let source = reconstruct(&mut reader, Trace::constant(width, 0.), 0., |_| true).unwrap();
+    let original = source.pixels().to_vec();
+    let negative = reconstruct_negative(&source, |_| true).unwrap();
+    assert_eq!(source.pixels(), original);
+    assert_ne!(negative.pixels(), source.pixels());
+    let display = DisplayImage::new(&negative, None, Product::Negative).unwrap();
+    let mut png = Vec::new();
+    display.write_png(&mut png).unwrap();
+    let mut decoder = png::Decoder::new(Cursor::new(png)).read_info().unwrap();
+    assert_eq!(decoder.info().color_type, png::ColorType::Grayscale);
+    let mut pixels = vec![0; decoder.output_buffer_size().unwrap()];
+    decoder.next_frame(&mut pixels).unwrap();
+    assert_eq!(pixels.len(), width * height);
+    assert!(pixels.iter().any(|&value| value != 0));
 }
 
 #[test]

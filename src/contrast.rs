@@ -58,7 +58,10 @@ impl LocalContrast {
     }
 
     pub(crate) fn map(&self, index: usize, value: u16) -> u8 {
-        let gray = self.stretch.map(value);
+        self.map_level(index, self.stretch.map(value))
+    }
+
+    pub(crate) fn map_level(&self, index: usize, gray: u8) -> u8 {
         if gray <= 3 {
             return gray;
         }

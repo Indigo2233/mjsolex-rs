@@ -6,6 +6,7 @@ use crate::{Error, LocalContrast, Reconstruction};
 pub enum Product {
     #[default]
     Gray,
+    Negative,
     Hydrogen,
     Calcium,
     Helium,
@@ -16,6 +17,7 @@ impl Product {
     pub fn suffix(self) -> &'static str {
         match self {
             Self::Gray => "",
+            Self::Negative => "-negative",
             Self::Hydrogen => "-halpha-color",
             Self::Calcium => "-calcium-color",
             Self::Helium => "-helium-color",
@@ -103,7 +105,6 @@ pub struct DisplayImage<'a> {
     local: Option<&'a LocalContrast>,
     palette: [[u8; 3]; 256],
     settings: DisplaySettings,
-    levels: [u8; 256],
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -115,17 +116,8 @@ pub enum DisplayTone {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum DisplayInversion {
-    #[default]
-    Off,
-    Linear,
-    Curve,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DisplaySettings {
     pub tone: DisplayTone,
-    pub inversion: DisplayInversion,
 }
 
 impl<'a> DisplayImage<'a> {
@@ -173,7 +165,7 @@ impl<'a> DisplayImage<'a> {
             let gray = gray as u8;
             let channel = |exponent, scale| (255. * level.powf(exponent) * scale) as u8;
             match product {
-                Product::Gray | Product::Doppler => [gray; 3],
+                Product::Gray | Product::Negative | Product::Doppler => [gray; 3],
                 Product::Hydrogen => [gray, channel(1.5, 0.83), channel(2.7, 0.54)],
                 Product::Calcium => [channel(2.1, 0.84), channel(1.65, 0.77), gray],
                 Product::Helium => [gray, channel(1.25, 0.96), channel(2.1, 0.62)],
@@ -187,41 +179,16 @@ impl<'a> DisplayImage<'a> {
             local,
             palette,
             settings: DisplaySettings::default(),
-            levels: std::array::from_fn(|value| value as u8),
         })
     }
 
     pub fn with_tone(self, tone: DisplayTone) -> Self {
-        let settings = DisplaySettings {
-            tone,
-            ..self.settings
-        };
+        let settings = DisplaySettings { tone };
         self.with_settings(settings)
     }
 
     pub fn with_settings(mut self, settings: DisplaySettings) -> Self {
         self.settings = settings;
-        let exponent = match settings.tone {
-            DisplayTone::Darker => 1.25,
-            DisplayTone::Standard => 1.,
-            DisplayTone::Brighter => 0.8,
-        };
-        let inversion = if self.product == Product::Doppler {
-            DisplayInversion::Off
-        } else {
-            settings.inversion
-        };
-        self.levels = std::array::from_fn(|value| {
-            let x = value as f32 / 255.;
-            let level = match inversion {
-                DisplayInversion::Off => x,
-                DisplayInversion::Linear => 1. - x,
-                // The complement of the Beta(2, 2) CDF is monotone, with its
-                // steepest slope at the midtone and zero slope at both ends.
-                DisplayInversion::Curve => 1. - x * x * (3. - 2. * x),
-            };
-            (255. * level.powf(exponent)).round() as u8
-        });
         self
     }
 
@@ -235,7 +202,13 @@ impl<'a> DisplayImage<'a> {
             // A redshift deepens the red-wing absorption, giving I_blue > I_red.
             let sum = f32::from(red) + f32::from(blue);
             let signal = (4. * (f32::from(blue) - f32::from(red)) / sum).clamp(-1., 1.);
-            let level = f32::from(self.levels[self.stretch.map(red.midpoint(blue)) as usize]);
+            let exponent = match self.settings.tone {
+                DisplayTone::Darker => 1.25,
+                DisplayTone::Standard => 1.,
+                DisplayTone::Brighter => 0.8,
+            };
+            let level =
+                255. * (f32::from(self.stretch.map(red.midpoint(blue))) / 255.).powf(exponent);
             return [
                 (level * (1. + signal).clamp(0.2, 1.5)).min(255.) as u8,
                 (level * (1. - 0.55 * signal.abs())) as u8,
@@ -245,13 +218,18 @@ impl<'a> DisplayImage<'a> {
         let gray = self
             .local
             .map_or_else(|| self.stretch.map(red), |map| map.map(index, red));
-        self.palette[self.levels[gray as usize] as usize]
+        let exponent = match self.settings.tone {
+            DisplayTone::Darker => 1.25,
+            DisplayTone::Standard => 1.,
+            DisplayTone::Brighter => 0.8,
+        };
+        self.palette[(255. * (f32::from(gray) / 255.).powf(exponent)).round() as u8 as usize]
     }
 
     pub fn write_png(&self, output: impl Write) -> Result<(), Error> {
         let (width, height) = (self.red.width(), self.red.height());
         let mut encoder = png::Encoder::new(output, width as u32, height as u32);
-        let gray = self.product == Product::Gray;
+        let gray = matches!(self.product, Product::Gray | Product::Negative);
         encoder.set_color(if gray {
             png::ColorType::Grayscale
         } else {
@@ -276,5 +254,35 @@ impl<'a> DisplayImage<'a> {
         stream.finish()?;
         writer.finish()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tone_level(level: u8, tone: DisplayTone) -> u8 {
+        let exponent = match tone {
+            DisplayTone::Darker => 1.25,
+            DisplayTone::Standard => 1.,
+            DisplayTone::Brighter => 0.8,
+        };
+        (255. * (f32::from(level) / 255.).powf(exponent)).round() as u8
+    }
+}
+
+#[cfg(test)]
+mod tone_tests {
+    use super::{DisplayImage, DisplayTone};
+
+    #[test]
+    fn tone_levels_preserve_endpoints_and_bracket_standard() {
+        assert_eq!(DisplayImage::tone_level(128, DisplayTone::Standard), 128);
+        assert!(DisplayImage::tone_level(128, DisplayTone::Darker) < 128);
+        assert!(DisplayImage::tone_level(128, DisplayTone::Brighter) > 128);
+        for tone in [
+            DisplayTone::Darker,
+            DisplayTone::Standard,
+            DisplayTone::Brighter,
+        ] {
+            assert_eq!(DisplayImage::tone_level(0, tone), 0);
+            assert_eq!(DisplayImage::tone_level(255, tone), 255);
+        }
     }
 }

@@ -4,6 +4,7 @@ pub(super) const PALETTES: [Product; 3] = [Product::Hydrogen, Product::Calcium, 
 
 pub(super) struct Images {
     pub(super) center: Reconstruction,
+    pub(super) negative: Option<Reconstruction>,
     pub(super) wings: Option<[Reconstruction; 2]>,
     pub(super) palettes: [bool; 3],
     pub(super) wing_offset: f64,
@@ -48,24 +49,27 @@ impl Images {
                 .zip(self.palettes)
                 .filter_map(|(product, selected)| selected.then_some(product)),
         );
-        intensity
-            .clone()
-            .map(|product| View {
-                product,
-                enhanced: false,
-            })
-            .chain(
-                intensity
-                    .filter(|_| self.enhancement.is_some())
-                    .map(|product| View {
-                        product,
-                        enhanced: true,
-                    }),
-            )
-            .chain(self.wings.as_ref().map(|_| View {
-                product: Product::Doppler,
-                enhanced: false,
-            }))
+        std::iter::once(View {
+            product: Product::Negative,
+            enhanced: false,
+        })
+        .filter(|_| self.negative.is_some())
+        .chain(intensity.clone().map(|product| View {
+            product,
+            enhanced: false,
+        }))
+        .chain(
+            intensity
+                .filter(|_| self.enhancement.is_some())
+                .map(|product| View {
+                    product,
+                    enhanced: true,
+                }),
+        )
+        .chain(self.wings.as_ref().map(|_| View {
+            product: Product::Doppler,
+            enhanced: false,
+        }))
     }
 
     pub(super) fn exports(&self, settings: DisplaySettings) -> impl Iterator<Item = Export> + '_ {
@@ -78,6 +82,9 @@ impl Images {
         let image = if view.enhanced {
             let enhancement = self.enhancement.as_ref().ok_or(Error::InvalidTrace)?;
             DisplayImage::enhanced(&self.center, view.product, enhancement)
+        } else if view.product == Product::Negative {
+            let negative = self.negative.as_ref().ok_or(Error::InvalidTrace)?;
+            DisplayImage::new(negative, None, Product::Negative)
         } else if view.product == Product::Doppler {
             let [red, blue] = self.wings.as_ref().ok_or(Error::DopplerCoverage)?;
             DisplayImage::new(red, Some(blue), view.product)
@@ -153,14 +160,16 @@ impl Images {
                 },
                 _,
             ) => format!("-doppler-w{:.2}px.png", self.wing_offset),
-            Export::Display(view, settings) => {
+            Export::Display(
+                View {
+                    product: Product::Negative,
+                    enhanced: false,
+                },
+                _,
+            ) => "-negative.png".into(),
+            Export::Display(view, _) => {
                 let kind = if view.enhanced { "enhanced" } else { "display" };
-                let inversion = match settings.inversion {
-                    DisplayInversion::Off => "",
-                    DisplayInversion::Linear => "-negative",
-                    DisplayInversion::Curve => "-negative-curve",
-                };
-                format!("{}-{kind}{inversion}.png", view.product.suffix())
+                format!("{}-{kind}.png", view.product.suffix())
             }
             Export::RawPng => "-raw.png".into(),
             Export::Fits => ".fits".into(),
@@ -169,7 +178,7 @@ impl Images {
     }
 
     pub(super) fn count(&self) -> usize {
-        if self.wings.is_some() { 3 } else { 1 }
+        crate::reconstruct::transform_image_count(self.wings.is_some())
     }
 
     /// Commit matching geometry to the center and both wings only after all

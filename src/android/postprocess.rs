@@ -8,6 +8,7 @@ pub(super) struct ProcessingOptions {
     pub(super) synthetic_strength: u8,
     pub(super) framing: Framing,
     pub(super) enhance: bool,
+    pub(super) negative: bool,
 }
 
 impl Default for ProcessingOptions {
@@ -18,6 +19,7 @@ impl Default for ProcessingOptions {
             synthetic_strength: 100,
             framing: Framing::default(),
             enhance: true,
+            negative: false,
         }
     }
 }
@@ -29,6 +31,7 @@ pub(super) struct CorrectionWarnings {
     pub(super) disk: Option<Error>,
     pub(super) framing: Option<Error>,
     pub(super) enhancement: Option<Error>,
+    pub(super) negative: Option<Error>,
     pub(super) doppler: Option<Error>,
 }
 
@@ -37,7 +40,7 @@ impl CorrectionWarnings {
         self.entries().iter().any(|(error, ..)| error.is_some())
     }
 
-    pub(super) fn entries(&self) -> [(&Option<Error>, &'static str, &'static str); 6] {
+    pub(super) fn entries(&self) -> [(&Option<Error>, &'static str, &'static str); 7] {
         [
             (&self.flat, "Synthetic flat skipped. ", "已跳过虚拟平场。"),
             (
@@ -64,6 +67,11 @@ impl CorrectionWarnings {
                 &self.doppler,
                 "Doppler image skipped. ",
                 "已跳过双翼多普勒图。",
+            ),
+            (
+                &self.negative,
+                "JSol'Ex negative skipped. ",
+                "已跳过 JSol'Ex 负片。",
             ),
         ]
     }
@@ -201,6 +209,7 @@ impl ReconstructionOptions {
             wing_offset: self.wing_offset,
             metadata,
             enhancement: None,
+            negative: None,
         };
         finish(&mut images, self.processing, &mut warnings, |p| {
             progress(corrections_start + (1. - corrections_start) * p)
@@ -293,11 +302,29 @@ pub(super) fn finish(
             }
         }
     }
+    let (enhancement_start, enhancement_end, negative_start, negative_end) =
+        match (options.enhance, options.negative) {
+            (true, true) => (0.89, 0.94, 0.94, 1.),
+            (true, false) => (0.89, 1., 1., 1.),
+            (false, true) => (1., 1., 0.89, 1.),
+            (false, false) => (1., 1., 1., 1.),
+        };
     if options.enhance {
-        match LocalContrast::prepare(&images.center, |p| progress(0.89 + 0.11 * p)) {
+        match LocalContrast::prepare(&images.center, |p| {
+            progress(enhancement_start + (enhancement_end - enhancement_start) * p)
+        }) {
             Ok(contrast) => images.enhancement = Some(contrast),
             Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(error) => warnings.enhancement = Some(error),
+        }
+    }
+    if options.negative {
+        match reconstruct_negative(&images.center, |p| {
+            progress(negative_start + (negative_end - negative_start) * p)
+        }) {
+            Ok(negative) => images.negative = Some(negative),
+            Err(Error::Cancelled) => return Err(Error::Cancelled),
+            Err(error) => warnings.negative = Some(error),
         }
     }
     Ok(())

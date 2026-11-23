@@ -5,6 +5,23 @@ use crate::{Error, Header, SerReader, Trace};
 pub(crate) const MAX_PIXELS: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_DOPPLER_WING_PIXELS: usize = MAX_PIXELS / 4;
 
+/// Number of images that participate in scan, disk, and framing transforms.
+#[cfg(any(target_os = "android", test))]
+pub(crate) fn transform_image_count(wings: bool) -> usize {
+    1 + 2 * usize::from(wings)
+}
+
+#[cfg(test)]
+mod transform_count_tests {
+    use super::transform_image_count;
+
+    #[test]
+    fn geometry_transforms_center_and_both_wing_images() {
+        assert_eq!(transform_image_count(false), 1);
+        assert_eq!(transform_image_count(true), 3);
+    }
+}
+
 impl Header {
     /// Smallest interval that keeps a reconstruction within the pixel budget.
     pub fn minimum_stride(self) -> u32 {
