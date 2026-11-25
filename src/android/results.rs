@@ -5,6 +5,7 @@ pub(super) const PALETTES: [Product; 3] = [Product::Hydrogen, Product::Calcium, 
 pub(super) struct Images {
     pub(super) center: Reconstruction,
     pub(super) negative: Option<Reconstruction>,
+    pub(super) eclipse: Option<Reconstruction>,
     pub(super) wings: Option<[Reconstruction; 2]>,
     pub(super) palettes: [bool; 3],
     pub(super) wing_offset: f64,
@@ -49,11 +50,17 @@ impl Images {
                 .zip(self.palettes)
                 .filter_map(|(product, selected)| selected.then_some(product)),
         );
-        std::iter::once(View {
-            product: Product::Negative,
-            enhanced: false,
+        [
+            (Product::Negative, &self.negative),
+            (Product::Eclipse, &self.eclipse),
+        ]
+        .into_iter()
+        .filter_map(|(product, image)| {
+            image.as_ref().map(|_| View {
+                product,
+                enhanced: false,
+            })
         })
-        .filter(|_| self.negative.is_some())
         .chain(intensity.clone().map(|product| View {
             product,
             enhanced: false,
@@ -85,6 +92,9 @@ impl Images {
         } else if view.product == Product::Negative {
             let negative = self.negative.as_ref().ok_or(Error::InvalidTrace)?;
             DisplayImage::new(negative, None, Product::Negative)
+        } else if view.product == Product::Eclipse {
+            let eclipse = self.eclipse.as_ref().ok_or(Error::InvalidTrace)?;
+            DisplayImage::new(eclipse, None, Product::Eclipse)
         } else if view.product == Product::Doppler {
             let [red, blue] = self.wings.as_ref().ok_or(Error::DopplerCoverage)?;
             DisplayImage::new(red, Some(blue), view.product)
@@ -162,11 +172,11 @@ impl Images {
             ) => format!("-doppler-w{:.2}px.png", self.wing_offset),
             Export::Display(
                 View {
-                    product: Product::Negative,
+                    product: product @ (Product::Negative | Product::Eclipse),
                     enhanced: false,
                 },
                 _,
-            ) => "-negative.png".into(),
+            ) => format!("{}.png", product.suffix()),
             Export::Display(view, _) => {
                 let kind = if view.enhanced { "enhanced" } else { "display" };
                 format!("{}-{kind}.png", view.product.suffix())

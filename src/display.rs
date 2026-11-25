@@ -7,6 +7,7 @@ pub enum Product {
     #[default]
     Gray,
     Negative,
+    Eclipse,
     Hydrogen,
     Calcium,
     Helium,
@@ -18,6 +19,7 @@ impl Product {
         match self {
             Self::Gray => "",
             Self::Negative => "-negative",
+            Self::Eclipse => "-eclipse",
             Self::Hydrogen => "-halpha-color",
             Self::Calcium => "-calcium-color",
             Self::Helium => "-helium-color",
@@ -34,6 +36,12 @@ pub struct Stretch {
 }
 
 impl Stretch {
+    const LINEAR: Self = Self {
+        low: 0,
+        high: u16::MAX as u32,
+        peak: u16::MAX as u32,
+    };
+
     /// Estimate the display range on a bounded grid. Use the same range for preview and export.
     pub fn estimate(width: usize, height: usize, value: impl Fn(usize) -> u16) -> Self {
         let dx = width.div_ceil(1200).max(1);
@@ -153,6 +161,9 @@ impl<'a> DisplayImage<'a> {
         }
         let stretch = local.map_or_else(
             || {
+                if matches!(product, Product::Negative | Product::Eclipse) {
+                    return Stretch::LINEAR;
+                }
                 Stretch::estimate_with_highlights(image.width(), image.height(), |i| {
                     let red = image.pixels()[i];
                     blue.map_or(red, |wing| red.midpoint(wing.pixels()[i]))
@@ -165,7 +176,9 @@ impl<'a> DisplayImage<'a> {
             let gray = gray as u8;
             let channel = |exponent, scale| (255. * level.powf(exponent) * scale) as u8;
             match product {
-                Product::Gray | Product::Negative | Product::Doppler => [gray; 3],
+                Product::Gray | Product::Negative | Product::Eclipse | Product::Doppler => {
+                    [gray; 3]
+                }
                 Product::Hydrogen => [gray, channel(1.5, 0.83), channel(2.7, 0.54)],
                 Product::Calcium => [channel(2.1, 0.84), channel(1.65, 0.77), gray],
                 Product::Helium => [gray, channel(1.25, 0.96), channel(2.1, 0.62)],
@@ -229,7 +242,10 @@ impl<'a> DisplayImage<'a> {
     pub fn write_png(&self, output: impl Write) -> Result<(), Error> {
         let (width, height) = (self.red.width(), self.red.height());
         let mut encoder = png::Encoder::new(output, width as u32, height as u32);
-        let gray = matches!(self.product, Product::Gray | Product::Negative);
+        let gray = matches!(
+            self.product,
+            Product::Gray | Product::Negative | Product::Eclipse
+        );
         encoder.set_color(if gray {
             png::ColorType::Grayscale
         } else {
@@ -269,7 +285,21 @@ impl<'a> DisplayImage<'a> {
 
 #[cfg(test)]
 mod tone_tests {
-    use super::{DisplayImage, DisplayTone};
+    use super::{DisplayImage, DisplayTone, Product, Reconstruction};
+
+    #[test]
+    fn negative_preview_preserves_the_processed_intensity_scale() {
+        let image = Reconstruction {
+            width: 4,
+            height: 1,
+            pixels: vec![0, 16_384, 16_384, 32_768],
+            synthetic_flat: false,
+        };
+        let negative = DisplayImage::new(&image, None, Product::Negative).unwrap();
+        assert_eq!(negative.pixel(0), [0; 3]);
+        assert_eq!(negative.pixel(1), [63; 3]);
+        assert_eq!(negative.pixel(3), [127; 3]);
+    }
 
     #[test]
     fn tone_levels_preserve_endpoints_and_bracket_standard() {

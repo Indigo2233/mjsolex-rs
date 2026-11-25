@@ -22,7 +22,7 @@ use crate::{
     APP_NAME, BandingAxis, ByteOrder, DiskGeometry, DisplayImage, DisplaySettings, DisplayTone,
     Error, FitsMetadata, Framing, Header, LineProfile, LocalContrast, NegativeOptions, Observation,
     OpticalSetup, PhysicalFlat, Product, Reconstruction, ScanSettings, SerReader, Spectrum,
-    Stretch, Trace, reconstruct_negative_with_options, reconstruct_offsets,
+    Stretch, Trace, reconstruct_eclipse, reconstruct_negative_with_options, reconstruct_offsets,
     reconstruct_with_stride,
 };
 

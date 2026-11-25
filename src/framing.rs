@@ -113,7 +113,7 @@ impl FrameTransform {
             let base_y = self.source_center[1] + d * v;
             for x in 0..self.width {
                 let u = x as f64 - self.output_center[0];
-                pixels.push(sample(image, base_x + a * u, base_y + b * u));
+                pixels.push(sample_bilinear(image, base_x + a * u, base_y + b * u));
             }
         }
         if !progress(1.) {
@@ -128,8 +128,7 @@ impl FrameTransform {
     }
 }
 
-#[cfg(any(target_os = "android", test))]
-fn sample(image: &Reconstruction, x: f64, y: f64) -> u16 {
+pub(crate) fn sample_bilinear(image: &crate::Reconstruction, x: f64, y: f64) -> u16 {
     let max_x = (image.width - 1) as f64;
     let max_y = (image.height - 1) as f64;
     if !(-0.5..=max_x + 0.5).contains(&x) || !(-0.5..=max_y + 0.5).contains(&y) {

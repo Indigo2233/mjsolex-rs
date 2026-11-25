@@ -1,10 +1,13 @@
 use crate::geometry::FittedDisk;
 use crate::{Error, Reconstruction};
 
+mod sky;
+
 const MAX_PIXEL_VALUE: f64 = 65_535.;
-const DISK_BOOST: f64 = 1.2;
-const CONTRAST_EXPONENT: f64 = 3.;
-const PROMINENCE_STRETCH: f64 = 20.;
+const DISK_BOOST: f32 = 1.2;
+const CONTRAST_EXPONENT: i32 = 3;
+const PROMINENCE_STRETCH: f32 = 20.;
+const ECLIPSE_STRETCH: f32 = 50.;
 const AUTO_STRETCH_SHADOWS_CLIP: f64 = -2.8;
 const AUTO_STRETCH_TARGET_BG: f64 = 0.25;
 const MAD_TO_SIGMA: f64 = 1.4826;
@@ -15,15 +18,24 @@ const SHARPEN_KERNEL: usize = 7;
 pub(crate) const NEGATIVE_PIXEL_BUDGET: usize = 8 * 1024 * 1024;
 const PROGRESS_CHUNK_PIXELS: usize = 65_536;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NegativeOptions {
-    /// Invert the stretched prominence signal while keeping the sky black.
+    /// Show prominences as dark features against a white sky.
     pub invert_prominences: bool,
-    /// Prominence inversion strength, from 0 to 100 percent.
+    /// Darkening of the prominence signal, from 0 to 100 percent in inverted mode.
     pub prominence_strength: u8,
 }
 
-/// Build the negative product used by JSol'Ex. A fitted disk is inverted
+impl Default for NegativeOptions {
+    fn default() -> Self {
+        Self {
+            invert_prominences: false,
+            prominence_strength: 100,
+        }
+    }
+}
+
+/// Build a JSol'Ex-style negative. A fitted disk is inverted
 /// independently from prominences. Images without a reliable limb use
 /// JSol'Ex's CLAHE fallback.
 pub fn reconstruct_negative(
@@ -38,23 +50,14 @@ pub fn reconstruct_negative_with_options(
     options: NegativeOptions,
     mut progress: impl FnMut(f32) -> bool,
 ) -> Result<Reconstruction, Error> {
-    let count = image
-        .width
-        .checked_mul(image.height)
-        .ok_or(Error::OutputTooLarge)?;
-    if count > NEGATIVE_PIXEL_BUDGET {
-        return Err(Error::OutputTooLarge);
-    }
-    if image.pixels.len() != count {
-        return Err(Error::InvalidTrace);
-    }
+    checked_pixel_count(image)?;
     if !progress(0.) {
         return Err(Error::Cancelled);
     }
     let mut data = to_f32(image, &mut progress)?;
     match crate::geometry::DiskGeometry::fit_limb(image) {
         Ok(disk) => {
-            reconstruct_disk_negative(image, &mut data, disk, options, &mut progress)?;
+            data = reconstruct_disk_negative(image, data, disk, options, &mut progress)?;
         }
         Err(Error::NoSolarLimb) => {
             if options.invert_prominences {
@@ -67,78 +70,87 @@ pub fn reconstruct_negative_with_options(
     to_u16(image, data, &mut progress)
 }
 
+/// Mask a fitted solar disk and show off-limb prominences in high contrast.
+pub fn reconstruct_eclipse(
+    image: &Reconstruction,
+    mut progress: impl FnMut(f32) -> bool,
+) -> Result<Reconstruction, Error> {
+    let count = checked_pixel_count(image)?;
+    if !progress(0.) {
+        return Err(Error::Cancelled);
+    }
+    let disk = crate::geometry::DiskGeometry::fit_limb(image)?;
+    let sky_level = disk.sky;
+    let mask = DiskMask::new(image, disk, &mut progress)?;
+    let background =
+        sky::SkyProfile::estimate(image, &mask, sky_level, |p| progress(0.03 + 0.82 * p))?;
+    let mut data = try_vec(count)?;
+    data.resize(count, 0.);
+    composite_prominences(
+        image,
+        &mask,
+        &background,
+        ProminenceStyle::Eclipse,
+        &mut data,
+        &mut progress,
+    )?;
+    to_u16(image, data, &mut progress)
+}
+
+fn checked_pixel_count(image: &Reconstruction) -> Result<usize, Error> {
+    let count = image
+        .width
+        .checked_mul(image.height)
+        .ok_or(Error::OutputTooLarge)?;
+    if count > NEGATIVE_PIXEL_BUDGET {
+        return Err(Error::OutputTooLarge);
+    }
+    if count == 0 || image.pixels.len() != count {
+        return Err(Error::InvalidTrace);
+    }
+    Ok(count)
+}
+
 fn reconstruct_disk_negative(
     source: &Reconstruction,
-    data: &mut [f32],
+    mut data: Vec<f32>,
     disk: FittedDisk,
     options: NegativeOptions,
     progress: &mut impl FnMut(f32) -> bool,
-) -> Result<(), Error> {
-    let width = source.width;
+) -> Result<Vec<f32>, Error> {
+    let sky_level = disk.sky;
     let mask = DiskMask::new(source, disk, progress)?;
-    if !progress(0.03) {
-        return Err(Error::Cancelled);
-    }
-    for_each_chunk(data, progress, 0.03, 0.075, |value| {
-        *value = (f64::from(*value) * DISK_BOOST).min(MAX_PIXEL_VALUE) as f32;
+    let boost = |value: f32| (value * DISK_BOOST).min(MAX_PIXEL_VALUE as f32);
+    let peak = disk_bounds(&data, &mask, progress, 0.03, 0.07)?.1;
+    let maximum = boost(peak).max(1.);
+    for_each_chunk(&mut data, progress, 0.07, 0.23, |value| {
+        let inverse = (maximum - boost(*value)).max(0.) / maximum;
+        *value = inverse.powi(CONTRAST_EXPONENT) * MAX_PIXEL_VALUE as f32;
     })?;
-    let maximum = maximum_chunked(data, progress, 0.075, 0.09)?;
-    for_each_chunk(data, progress, 0.09, 0.12, |value| {
-        *value = maximum - *value;
-    })?;
-    for_each_chunk(data, progress, 0.12, 0.14, |value| {
-        *value = f64::from(*value).powf(CONTRAST_EXPONENT) as f32;
-    })?;
-    normalize_to_full_range_chunked(data, progress, 0.14, 0.17)?;
-    if !progress(0.17) {
-        return Err(Error::Cancelled);
-    }
 
     let mut sharpened = try_vec(data.len())?;
-    sharpen_7x7(data, width, &mut sharpened, progress)?;
-    let sharpened_len = sharpened.len();
-    for (index, (chunk, coverage)) in sharpened
-        .chunks_mut(PROGRESS_CHUNK_PIXELS)
-        .zip(mask.coverage.chunks(PROGRESS_CHUNK_PIXELS))
-        .enumerate()
-    {
-        for (value, &coverage) in chunk.iter_mut().zip(coverage) {
-            *value *= f32::from(coverage) / 16.;
-        }
-        let processed = (index + 1) * PROGRESS_CHUNK_PIXELS;
-        if !advance_progress(
-            progress,
-            0.62,
-            0.65,
-            processed.min(sharpened_len),
-            sharpened_len,
-        ) {
-            return Err(Error::Cancelled);
-        }
-    }
-    normalize_to_full_range_chunked(&mut sharpened, progress, 0.65, 0.68)?;
+    sharpen_7x7(&data, source.width, &mask, &mut sharpened, progress)?;
+    drop(data);
 
+    let (minimum, maximum) = disk_bounds(&sharpened, &mask, progress, 0.55, 0.62)?;
+    if maximum > minimum {
+        let scale = MAX_PIXEL_VALUE as f32 / (maximum - minimum);
+        for_each_chunk(&mut sharpened, progress, 0.62, 0.68, |value| {
+            *value = ((*value - minimum) * scale).clamp(0., MAX_PIXEL_VALUE as f32);
+        })?;
+    }
     auto_stretch(&mut sharpened, &mask, progress)?;
-    let black_point =
-        estimate_black_point(source, &mask, &mut |p| progress(0.8 + 0.04 * p))? * DISK_BOOST;
-    add_prominences(
+    let background =
+        sky::SkyProfile::estimate(source, &mask, sky_level, |p| progress(0.8 + 0.05 * p))?;
+    composite_prominences(
         source,
         &mask,
-        black_point,
-        options,
+        &background,
+        ProminenceStyle::Natural(options),
         &mut sharpened,
         progress,
     )?;
-    for (target, source) in data
-        .chunks_mut(PROGRESS_CHUNK_PIXELS)
-        .zip(sharpened.chunks(PROGRESS_CHUNK_PIXELS))
-    {
-        target.copy_from_slice(source);
-    }
-    if !progress(0.9) {
-        return Err(Error::Cancelled);
-    }
-    Ok(())
+    Ok(sharpened)
 }
 
 fn reconstruct_fallback_negative(
@@ -147,10 +159,10 @@ fn reconstruct_fallback_negative(
     height: usize,
     progress: &mut impl FnMut(f32) -> bool,
 ) -> Result<(), Error> {
-    let maximum = maximum_chunked(data, progress, 0., 0.01)?;
+    let maximum = maximum_chunked(data, progress, 0.02, 0.03)?;
     if maximum > 0. {
         let scale = MAX_PIXEL_VALUE / f64::from(maximum);
-        for_each_chunk(data, progress, 0.01, 0.05, |value| {
+        for_each_chunk(data, progress, 0.03, 0.05, |value| {
             *value = (f64::from(*value) * scale) as f32;
         })?;
     }
@@ -313,44 +325,32 @@ fn maximum_chunked(
     Ok(maximum)
 }
 
-fn bounds_chunked(
+fn disk_bounds(
     data: &[f32],
+    mask: &DiskMask,
     progress: &mut impl FnMut(f32) -> bool,
     start: f32,
     end: f32,
-) -> Result<Option<(f32, f32)>, Error> {
+) -> Result<(f32, f32), Error> {
     let mut minimum = f32::INFINITY;
     let mut maximum = f32::NEG_INFINITY;
-    for (index, chunk) in data.chunks(PROGRESS_CHUNK_PIXELS).enumerate() {
-        for &value in chunk {
-            minimum = minimum.min(value);
-            maximum = maximum.max(value);
+    for (index, (chunk, coverages)) in data
+        .chunks(PROGRESS_CHUNK_PIXELS)
+        .zip(mask.coverage.chunks(PROGRESS_CHUNK_PIXELS))
+        .enumerate()
+    {
+        for (&value, &coverage) in chunk.iter().zip(coverages) {
+            if coverage == 16 {
+                minimum = minimum.min(value);
+                maximum = maximum.max(value);
+            }
         }
         let processed = ((index + 1) * PROGRESS_CHUNK_PIXELS).min(data.len());
         if !advance_progress(progress, start, end, processed, data.len()) {
             return Err(Error::Cancelled);
         }
     }
-    Ok(
-        (minimum.is_finite() && maximum.is_finite() && maximum > minimum)
-            .then_some((minimum, maximum)),
-    )
-}
-
-fn normalize_to_full_range_chunked(
-    data: &mut [f32],
-    progress: &mut impl FnMut(f32) -> bool,
-    start: f32,
-    end: f32,
-) -> Result<(), Error> {
-    let midpoint = start + (end - start) / 2.;
-    let Some((minimum, maximum)) = bounds_chunked(data, progress, start, midpoint)? else {
-        return Ok(());
-    };
-    let scale = MAX_PIXEL_VALUE as f32 / (maximum - minimum);
-    for_each_chunk(data, progress, midpoint, end, |value| {
-        *value = (*value - minimum) * scale;
-    })
+    Ok((minimum, maximum))
 }
 
 fn apply_transfer_chunked(
@@ -372,6 +372,7 @@ fn apply_transfer_chunked(
 fn sharpen_7x7(
     source: &[f32],
     width: usize,
+    mask: &DiskMask,
     output: &mut Vec<f32>,
     progress: &mut impl FnMut(f32) -> bool,
 ) -> Result<(), Error> {
@@ -396,13 +397,26 @@ fn sharpen_7x7(
     output.try_reserve_exact(source.len())?;
     output.resize(source.len(), 0.);
     let neighbor_weight = 1. / (SHARPEN_KERNEL * SHARPEN_KERNEL - 1) as f32;
+    // Fade sharpening before the kernel begins to include sky pixels.
+    let limb_margin =
+        radius as f64 * ((1. + mask.shear.abs()) / mask.radius_x).hypot(1. / mask.radius_y);
+    let limit = (1. - limb_margin).max(0.).powi(2);
+    let full = (1. - 2. * limb_margin).max(0.).powi(2);
+    let transition = (limit - full).max(f64::EPSILON);
     let mut first = 0;
     for y in 0..height {
-        for x in 0..width {
-            let center = source[y * width + x];
-            output[y * width + x] = 2. * center - (vertical[x] - center) * neighbor_weight;
+        for (x, &column_sum) in vertical.iter().enumerate() {
+            let i = y * width + x;
+            let center = source[i];
+            output[i] = center;
+            if mask.coverage[i] == 16 {
+                let radius = mask.radius_squared(x as f64, y as f64);
+                let strength = ((limit - radius) / transition).clamp(0., 1.) as f32;
+                let neighbor_average = (column_sum - center) * neighbor_weight;
+                output[i] += strength * (center - neighbor_average);
+            }
         }
-        if y % 16 == 0 && !progress(0.37 + 0.18 * y as f32 / height as f32) {
+        if y % 16 == 0 && !progress(0.23 + 0.32 * y as f32 / height as f32) {
             return Err(Error::Cancelled);
         }
         if y + 1 < height {
@@ -469,32 +483,36 @@ fn median_and_mad(
 ) -> Result<(u16, u16), Error> {
     let mut histogram = try_vec(65_536)?;
     histogram.resize(65_536, 0_u32);
-    for (chunk, coverage) in data
+    for (index, (chunk, coverage)) in data
         .chunks(PROGRESS_CHUNK_PIXELS)
         .zip(mask.coverage.chunks(PROGRESS_CHUNK_PIXELS))
+        .enumerate()
     {
         for (&value, &coverage) in chunk.iter().zip(coverage) {
             if coverage == 16 {
                 histogram[pixel_level(value)] += 1;
             }
         }
-        if !advance_progress(progress, 0.68, 0.7, chunk.len(), data.len()) {
+        let processed = index * PROGRESS_CHUNK_PIXELS + chunk.len();
+        if !advance_progress(progress, 0.68, 0.7, processed, data.len()) {
             return Err(Error::Cancelled);
         }
     }
     let median = histogram_median(&histogram).unwrap_or(0);
     let mut deviations = try_vec(65_536)?;
     deviations.resize(65_536, 0_u32);
-    for (chunk, coverage) in data
+    for (index, (chunk, coverage)) in data
         .chunks(PROGRESS_CHUNK_PIXELS)
         .zip(mask.coverage.chunks(PROGRESS_CHUNK_PIXELS))
+        .enumerate()
     {
         for (&value, &coverage) in chunk.iter().zip(coverage) {
             if coverage == 16 {
                 deviations[pixel_level((f64::from(value) - f64::from(median)).abs() as f32)] += 1;
             }
         }
-        if !advance_progress(progress, 0.7, 0.72, chunk.len(), data.len()) {
+        let processed = index * PROGRESS_CHUNK_PIXELS + chunk.len();
+        if !advance_progress(progress, 0.7, 0.72, processed, data.len()) {
             return Err(Error::Cancelled);
         }
     }
@@ -523,133 +541,114 @@ fn histogram_median(histogram: &[u32]) -> Option<u16> {
     None
 }
 
-fn add_prominences(
+#[derive(Clone, Copy)]
+enum ProminenceStyle {
+    Natural(NegativeOptions),
+    Eclipse,
+}
+
+fn composite_prominences(
     source: &Reconstruction,
     mask: &DiskMask,
-    black_point: f64,
-    options: NegativeOptions,
+    background: &sky::SkyProfile,
+    style: ProminenceStyle,
     data: &mut [f32],
     progress: &mut impl FnMut(f32) -> bool,
 ) -> Result<(), Error> {
-    let mut minimum = f64::INFINITY;
-    let mut maximum = f64::NEG_INFINITY;
-    for (index, pixels) in source.pixels.chunks(PROGRESS_CHUNK_PIXELS).enumerate() {
-        let start = index * PROGRESS_CHUNK_PIXELS;
-        for (offset, &pixel) in pixels.iter().enumerate() {
-            let value = prominence_stretch(
-                pixel,
-                f32::from(mask.coverage[start + offset]) / 16.,
-                black_point,
-            );
-            minimum = minimum.min(value);
-            maximum = maximum.max(value);
+    let max = MAX_PIXEL_VALUE as f32;
+    let eclipse = matches!(style, ProminenceStyle::Eclipse);
+    let stretch = if eclipse {
+        ECLIPSE_STRETCH
+    } else {
+        PROMINENCE_STRETCH
+    };
+    let dn_scale = stretch / max;
+    let stretch_scale = 1. / (background.white * dn_scale).asinh();
+    let (sky, contrast) = match style {
+        ProminenceStyle::Natural(options) if options.invert_prominences => {
+            (1., -f32::from(options.prominence_strength.min(100)) / 100.)
         }
-        if !advance_progress(
-            progress,
-            0.8,
-            0.84,
-            start + pixels.len(),
-            source.pixels.len(),
-        ) {
-            return Err(Error::Cancelled);
-        }
-    }
-    if !progress(0.84) {
-        return Err(Error::Cancelled);
-    }
-    if !minimum.is_finite() || !maximum.is_finite() || maximum <= minimum {
-        return Ok(());
-    }
-    let scale = MAX_PIXEL_VALUE / (maximum - minimum);
+        _ => (0., 1.),
+    };
+    let radius = mask.radius_x.min(mask.radius_y);
+    let feather_width = (0.006 * radius).clamp(2., 8.) / radius;
+    let inner_radius_squared = (1. - feather_width).powi(2);
+    let sample_radius = 1. + 1. / radius;
+    let sample_radius_squared = sample_radius.powi(2);
     let total = data.len();
-    for (index, ((pixels, coverage), values)) in source
+    for (y, ((pixels, coverages), values)) in source
         .pixels
-        .chunks(PROGRESS_CHUNK_PIXELS)
-        .zip(mask.coverage.chunks(PROGRESS_CHUNK_PIXELS))
-        .zip(data.chunks_mut(PROGRESS_CHUNK_PIXELS))
+        .chunks_exact(source.width)
+        .zip(mask.coverage.chunks_exact(source.width))
+        .zip(data.chunks_exact_mut(source.width))
         .enumerate()
     {
-        let inversion_strength = if options.invert_prominences {
-            f64::from(options.prominence_strength.min(100)) / 100.
-        } else {
-            0.
-        };
-        for ((&pixel, &coverage), value) in pixels.iter().zip(coverage).zip(values.iter_mut()) {
-            let prominence = prominence_stretch(pixel, f32::from(coverage) / 16., black_point);
-            let normal = ((prominence - minimum) * scale).clamp(0., MAX_PIXEL_VALUE);
-            let display = if options.invert_prominences {
-                let inverse = MAX_PIXEL_VALUE - normal;
-                normal + (inverse - normal) * inversion_strength
+        for (x, ((&pixel, &coverage), value)) in
+            pixels.iter().zip(coverages).zip(values).enumerate()
+        {
+            if eclipse && coverage == 16 {
+                continue;
+            }
+            let x = x as f64;
+            let radius_squared = mask.radius_squared(x, y as f64);
+            if !eclipse && radius_squared <= inner_radius_squared {
+                continue;
+            }
+            let disk_weight = if eclipse {
+                f32::from(coverage) / 16.
+            } else if radius_squared < 1. {
+                let t = ((1. - radius_squared.sqrt()) / feather_width) as f32;
+                t * t * (3. - 2. * t)
             } else {
-                normal
+                0.
             };
-            let inside_weight = f64::from(coverage) / 16.;
-            let composited = if options.invert_prominences {
-                f64::from(*value) * inside_weight + display * (1. - inside_weight)
+            // Use a sample from just outside the limb on both sides of the
+            // boundary. Otherwise disk light would create a false bright ring.
+            let (sample, sky_radius_squared) = if radius_squared < sample_radius_squared {
+                let scale = sample_radius / radius_squared.sqrt();
+                let sample_x = mask.center_x + (x - mask.center_x) * scale;
+                let sample_y = mask.center_y + (y as f64 - mask.center_y) * scale;
+                (
+                    crate::framing::sample_bilinear(source, sample_x, sample_y),
+                    sample_radius_squared,
+                )
             } else {
-                f64::from(*value) + display
+                (pixel, radius_squared)
             };
-            *value = composited.clamp(0., MAX_PIXEL_VALUE) as f32;
+            let residual = if sample > 0 {
+                background.residual(sample, sky_radius_squared)
+            } else {
+                0.
+            };
+            let response = if residual > 0. {
+                (residual * dn_scale).asinh() * stretch_scale
+            } else {
+                0.
+            };
+            let signal = if eclipse {
+                response.min(1.)
+            } else {
+                prominence_shoulder(response)
+            };
+            let sky_pixel = (sky + contrast * signal) * max;
+            *value = lerp(sky_pixel, *value, disk_weight);
         }
-        if !advance_progress(
-            progress,
-            0.85,
-            0.9,
-            ((index + 1) * PROGRESS_CHUNK_PIXELS).min(total),
-            total,
-        ) {
+        if !advance_progress(progress, 0.85, 0.9, (y + 1) * source.width, total) {
             return Err(Error::Cancelled);
         }
-    }
-    if !progress(0.88) {
-        return Err(Error::Cancelled);
     }
     Ok(())
 }
 
-fn prominence_stretch(pixel: u16, coverage: f32, black_point: f64) -> f64 {
-    let source = f64::from(pixel);
-    let original = match coverage {
-        coverage if coverage > 0.999 => black_point,
-        coverage if coverage > 0.001 => {
-            black_point * f64::from(coverage) + source * (1. - f64::from(coverage))
-        }
-        _ => source,
-    };
-    if original <= 0. {
-        return 0.;
+fn prominence_shoulder(signal: f32) -> f32 {
+    const KNEE: f32 = 0.65;
+    const HEADROOM: f32 = 0.29;
+    if signal <= KNEE {
+        return signal;
     }
-    (original * PROMINENCE_STRETCH).asinh() / PROMINENCE_STRETCH.asinh() * MAX_PIXEL_VALUE
-}
-
-fn estimate_black_point(
-    image: &Reconstruction,
-    mask: &DiskMask,
-    progress: &mut impl FnMut(f32) -> bool,
-) -> Result<f64, Error> {
-    let mut estimate = 0.;
-    let mut count = 0_u64;
-    for (row, pixels) in image.pixels.chunks(image.width).enumerate() {
-        for (x, &pixel) in pixels.iter().enumerate() {
-            if mask.contains(x, row) || pixel == 0 {
-                continue;
-            }
-            let off_center = 2. * (x as f64 - mask.center_x).hypot(row as f64 - mask.center_y)
-                / (image.width + image.height) as f64;
-            count += 1;
-            estimate += (off_center * f64::from(pixel) - estimate) / count as f64;
-        }
-        if !advance_progress(
-            progress,
-            0.,
-            1.,
-            (row + 1) * image.width,
-            image.pixels.len(),
-        ) {
-            return Err(Error::Cancelled);
-        }
-    }
-    Ok(estimate)
+    // Match the linear slope at the knee and approach 94% without clipping.
+    let excess = signal - KNEE;
+    KNEE + HEADROOM * excess / (HEADROOM + excess)
 }
 
 fn transfer(value: f64, midtones: f64) -> Option<f64> {
@@ -742,12 +741,23 @@ impl DiskMask {
             coverage: try_vec(image.pixels.len())?,
         };
         mask.coverage.resize(image.pixels.len(), 0);
+        // Only pixels whose subpixel samples may cross the limb need supersampling.
+        let margin = 0.375 * ((1. + mask.shear.abs()) / mask.radius_x).hypot(1. / mask.radius_y);
+        let full_coverage = (1. - margin).max(0.).powi(2);
+        let no_coverage = (1. + margin).powi(2);
         for y in 0..image.height {
-            if !progress(0.025 * (y + 1) as f32 / image.height.max(1) as f32) {
+            if !advance_progress(progress, 0.02, 0.03, y, image.height) {
                 return Err(Error::Cancelled);
             }
             for x in 0..image.width {
-                mask.coverage[y * image.width + x] = mask.coverage_at(x as f64, y as f64);
+                let radius = mask.radius_squared(x as f64, y as f64);
+                mask.coverage[y * image.width + x] = if radius < full_coverage {
+                    16
+                } else if radius > no_coverage {
+                    0
+                } else {
+                    mask.coverage_at(x as f64, y as f64)
+                };
             }
         }
         Ok(mask)
@@ -759,19 +769,17 @@ impl DiskMask {
             for sample_x in 0..4 {
                 let px = x - 0.5 + (sample_x as f64 + 0.5) / 4.;
                 let py = y - 0.5 + (sample_y as f64 + 0.5) / 4.;
-                let dy = (py - self.center_y) / self.radius_y;
-                let dx = (px - self.center_x - self.shear * (py - self.center_y)) / self.radius_x;
-                inside += usize::from(dx * dx + dy * dy <= 1.);
+                inside += usize::from(self.radius_squared(px, py) <= 1.);
             }
         }
         inside as u8
     }
 
-    fn contains(&self, x: usize, y: usize) -> bool {
-        let dy = (y as f64 - self.center_y) / self.radius_y;
-        let dx =
-            (x as f64 - self.center_x - self.shear * (y as f64 - self.center_y)) / self.radius_x;
-        dx * dx + dy * dy <= 1.
+    fn radius_squared(&self, x: f64, y: f64) -> f64 {
+        let y = y - self.center_y;
+        let dy = y / self.radius_y;
+        let dx = (x - self.center_x - self.shear * y) / self.radius_x;
+        dx * dx + dy * dy
     }
 }
 
@@ -821,7 +829,7 @@ mod tests {
         let sky_level = negative.pixels()[2 * width + 2];
         let prominence_level = negative.pixels()[48 * width + 103];
         assert_ne!(disk_level, original[48 * width + 64]);
-        assert!(sky_level > 0);
+        assert_eq!(sky_level, 0);
         assert!(prominence_level > sky_level);
     }
 
@@ -853,13 +861,13 @@ mod tests {
     }
 
     #[test]
-    fn prominence_inversion_strength_interpolates_between_positive_and_inverted() {
+    fn prominence_inversion_strength_preserves_polarity() {
         let width = 128;
         let height = 96;
         let mut pixels = disk(width, height, 0, (64., 48.), 34.);
         for y in 40..56 {
             for x in 97..109 {
-                pixels[y * width + x] = 2_400;
+                pixels[y * width + x] = if x < 104 { 2_400 } else { 1_200 };
             }
         }
         let source = reconstruction(width, height, pixels);
@@ -882,8 +890,106 @@ mod tests {
         )
         .unwrap();
         let index = 48 * width + 103;
+        let fainter_prominence = 48 * width + 107;
         assert!(half.pixels()[index] > full.pixels()[index]);
-        assert!(half.pixels()[index] < MAX_PIXEL_VALUE as u16);
+        assert!(half.pixels()[index] < half.pixels()[fainter_prominence]);
+        assert!(half.pixels()[fainter_prominence] < u16::MAX);
+        assert_eq!(half.pixels()[0], u16::MAX);
+    }
+
+    #[test]
+    fn low_dn_negative_separates_scattered_light_from_prominences() {
+        let (width, height) = (220, 220);
+        let pixels = (0..width * height)
+            .map(|i| {
+                let (x, y) = (i % width, i / width);
+                let radius = (x as f64 - 110.).hypot(y as f64 - 110.);
+                if radius <= 74. {
+                    (120. + 130. * (1. - radius / 74.)).round() as u16
+                } else if !(68..=365).contains(&(x + y)) {
+                    0
+                } else {
+                    let sky = (24. - (radius - 74.) / 2.5).max(2.) as u16;
+                    let prominence = (187..=191).contains(&x) && (107..=113).contains(&y);
+                    sky + ((x + y) % 4) as u16 + if prominence { 14 } else { 0 }
+                }
+            })
+            .collect();
+        let source = reconstruction(width, height, pixels);
+        let normal = reconstruct_negative(&source, |_| true).unwrap();
+        let inverted = reconstruct_negative_with_options(
+            &source,
+            NegativeOptions {
+                invert_prominences: true,
+                prominence_strength: 100,
+            },
+            |_| true,
+        )
+        .unwrap();
+        let at = |x, y| y * width + x;
+        let disk = at(70, 130);
+        let limb = at(178, 110);
+        let sky = at(31, 110);
+        let prominence = at(189, 110);
+        assert_eq!(normal.pixels()[disk], inverted.pixels()[disk]);
+        assert!(normal.pixels()[limb] < 60_000);
+        assert_eq!(normal.pixels()[sky], 0);
+        assert_eq!(inverted.pixels()[sky], u16::MAX);
+        assert!(normal.pixels()[prominence] > 10_000);
+        assert!(inverted.pixels()[prominence] < 55_535);
+    }
+
+    #[test]
+    fn natural_negatives_preserve_distinct_tones_in_strong_prominences() {
+        let (width, height) = (128, 96);
+        let mut pixels = disk(width, height, 200, (64., 48.), 34.);
+        let fainter = 48 * width + 106;
+        let brighter = 48 * width + 110;
+        pixels[fainter] = 6_000;
+        pixels[brighter] = 14_000;
+        let source = reconstruction(width, height, pixels);
+        let normal = reconstruct_negative(&source, |_| true).unwrap();
+        let inverted = reconstruct_negative_with_options(
+            &source,
+            NegativeOptions {
+                invert_prominences: true,
+                prominence_strength: 100,
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert!(0 < normal.pixels()[fainter]);
+        assert!(normal.pixels()[fainter] < normal.pixels()[brighter]);
+        assert!(normal.pixels()[brighter] < u16::MAX);
+        assert!(0 < inverted.pixels()[brighter]);
+        assert!(inverted.pixels()[brighter] < inverted.pixels()[fainter]);
+        assert!(inverted.pixels()[fainter] < u16::MAX);
+        let eclipse = reconstruct_eclipse(&source, |_| true).unwrap();
+        assert!(normal.pixels()[48 * width + 84] > 0);
+        assert_eq!(eclipse.pixels()[48 * width + 84], 0);
+        assert_eq!(eclipse.pixels()[fainter], u16::MAX);
+        assert_eq!(eclipse.pixels()[brighter], u16::MAX);
+    }
+
+    #[test]
+    fn negative_smooths_the_transition_to_quiet_sky_at_the_limb() {
+        let (width, height) = (128, 96);
+        let source = reconstruction(width, height, disk(width, height, 200, (64., 48.), 34.));
+        let negative = reconstruct_negative(&source, |_| true).unwrap();
+        let pixels = &negative.pixels()[48 * width..49 * width];
+        let limb = crate::DiskGeometry::fit_limb(&source).unwrap();
+        let dy = 48. - limb.center_y;
+        let right_edge = limb.center_x
+            + limb.geometry.shear * dy
+            + limb.geometry.slit_radius * (1. - (dy / limb.geometry.scan_radius).powi(2)).sqrt();
+        let edge = right_edge.floor() as usize;
+        let transition = &pixels[edge - 1..=edge + 1];
+        assert_eq!(transition[2], 0);
+        assert!(
+            0 < transition[1] && transition[1] < transition[0],
+            "{transition:?}"
+        );
+        assert!(transition[0] < u16::MAX);
     }
 
     #[test]

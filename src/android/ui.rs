@@ -15,6 +15,7 @@ fn product_label(product: Product, lang: Language) -> &'static str {
     match product {
         Product::Gray => lang.text("Grayscale", "灰度图"),
         Product::Negative => lang.text("JSol'Ex negative", "JSol'Ex 负片"),
+        Product::Eclipse => lang.text("Simulated eclipse", "模拟日食"),
         Product::Hydrogen => lang.text("Hα false color", "Hα 假彩色"),
         Product::Calcium => lang.text("Ca II false color", "Ca II 假彩色"),
         Product::Helium => lang.text("He I false color", "He I 假彩色"),
@@ -28,11 +29,12 @@ fn view_label(view: View, lang: Language) -> &'static str {
     }
     match view.product {
         Product::Gray => lang.text("Enhanced grayscale", "增强灰度"),
-        Product::Negative => product_label(view.product, lang),
+        Product::Negative | Product::Eclipse | Product::Doppler => {
+            product_label(view.product, lang)
+        }
         Product::Hydrogen => lang.text("Enhanced Hα", "增强 Hα 假彩色"),
         Product::Calcium => lang.text("Enhanced Ca II", "增强 Ca II 假彩色"),
         Product::Helium => lang.text("Enhanced He I", "增强 He I 假彩色"),
-        Product::Doppler => product_label(view.product, lang),
     }
 }
 
@@ -629,14 +631,17 @@ impl Mobile {
             ui.add_enabled_ui(!busy, |ui| {
                 ui.label(lang.text("Additional images", "附加图像"));
                 let reconstructed_rows = header.frames.div_ceil(self.stride.max(1));
-                let negative_may_exceed_budget = (header.width as u64 * reconstructed_rows as u64)
+                let may_exceed_budget = (header.width as u64 * reconstructed_rows as u64)
                     > crate::negative::NEGATIVE_PIXEL_BUDGET as u64;
                 ui.horizontal_wrapped(|ui| {
                     for (product, selected) in PALETTES
                         .into_iter()
                         .zip(&mut self.palettes)
                         .chain([(Product::Doppler, &mut self.doppler)])
-                        .chain([(Product::Negative, &mut self.processing.negative)])
+                        .chain([
+                            (Product::Negative, &mut self.processing.negative),
+                            (Product::Eclipse, &mut self.processing.eclipse),
+                        ])
                     {
                         let button =
                             egui::Button::new(product_label(product, lang)).selected(*selected);
@@ -645,11 +650,11 @@ impl Mobile {
                         }
                     }
                 });
-                if negative_may_exceed_budget {
+                if may_exceed_budget && (self.processing.negative || self.processing.eclipse) {
                     ui.label(
                         RichText::new(lang.text(
-                            "The negative is skipped if the corrected image exceeds 8 Mi pixels.",
-                            "校正后图像超过 838 万像素时，将跳过负片。",
+                            "Negative and eclipse images need at most 8 Mi corrected pixels.",
+                            "校正后图像超过 838 万像素时，将跳过负片和模拟日食。",
                         ))
                         .color(MUTED),
                     );
