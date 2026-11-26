@@ -36,7 +36,6 @@ pub struct ScanReport {
     pub oscillation: Option<(f64, f64)>,
 }
 
-#[cfg(any(target_os = "android", test))]
 mod model {
     use super::*;
     use crate::geometry::{DiskGeometry, FittedDisk, chord_edges, limb_levels};
@@ -455,7 +454,9 @@ mod model {
             (0.10 * disk.geometry.slit_radius).clamp(3., if settings.jagged { 128. } else { 32. });
         let sky = f64::from(sky);
         let contrast = (threshold - sky) / 0.20;
-        let thresholds = [0.16, 0.23, 0.30, 0.37, 0.44, 0.50].map(|level| sky + level * contrast);
+        // Faint prominences can move the weakest crossing tens of pixels
+        // between rows. Use the middle of the disk transition to align rows.
+        let thresholds = [0.23, 0.30, 0.37, 0.44].map(|level| sky + level * contrast);
         let mut edges = Vec::with_capacity(range.len());
         for y in range.clone() {
             checkpoint(progress(
@@ -464,8 +465,7 @@ mod model {
             let row = &image.pixels[y * image.width..(y + 1) * image.width];
             let (mid, half) = disk.chord(y as f64);
             let measured = if settings.jagged && half >= 12. {
-                // A range of brightness levels follows the limb transition and
-                // reduces shifts caused by a single noisy intensity crossing.
+                // Average several crossings to avoid tracking a single intensity level.
                 thresholds
                     .iter()
                     .try_fold((0., 0.), |(left, right), &level| {
@@ -625,7 +625,6 @@ mod model {
     }
 }
 
-#[cfg(any(target_os = "android", test))]
 pub(crate) use model::ScanPlan;
 
 #[cfg(test)]
@@ -758,6 +757,46 @@ mod tests {
         assert!(!plan.report.jagged);
         plan.apply(&mut image, |_| true).unwrap();
         assert_eq!(image.pixels, original);
+    }
+
+    #[test]
+    fn faint_prominence_does_not_break_rows_in_a_scan_with_real_motion() {
+        let mut reference = disk(|y| [0., 1.6, -1.4, 1.1, -0.8][y % 5], |_, _| 1.);
+        let mut image = Reconstruction {
+            width: reference.width,
+            height: reference.height,
+            pixels: reference.pixels.clone(),
+            synthetic_flat: false,
+        };
+        for y in 114..126 {
+            let row = &mut image.pixels[y * image.width..(y + 1) * image.width];
+            for value in &mut row[210..244] {
+                *value = (*value).max(6_000);
+            }
+        }
+        let settings = ScanSettings {
+            jagged: true,
+            ..Default::default()
+        };
+        for scan in [&mut reference, &mut image] {
+            let plan = ScanPlan::prepare(scan, settings, |_| true).unwrap();
+            assert!(plan.report.jagged);
+            plan.apply(scan, |_| true).unwrap();
+        }
+        let worst = (111..129)
+            .map(|y| {
+                let right = |scan: &Reconstruction| {
+                    chord_edges(&scan.pixels[y * scan.width..(y + 1) * scan.width], 10_000.)
+                        .unwrap()
+                        .1
+                };
+                (right(&image) - right(&reference)).abs()
+            })
+            .fold(0., f64::max);
+        assert!(
+            worst < 0.4,
+            "faint prominence displaced a disk row by {worst} px"
+        );
     }
 
     #[test]

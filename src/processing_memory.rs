@@ -7,9 +7,14 @@ const SCRATCH_BYTES: u64 = 16 * MIB;
 /// Available system memory above Android's low-memory threshold, sampled with
 /// any existing result still resident. Missing readings use the legacy limits.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct ProcessingMemory(pub(crate) Option<u64>);
+pub struct ProcessingMemory(pub(crate) Option<u64>);
 
 impl ProcessingMemory {
+    /// Memory available above the system's low-memory threshold, in bytes.
+    pub fn with_headroom(bytes: u64) -> Self {
+        Self(Some(bytes))
+    }
+
     pub(crate) fn image_pixels(self, header: Header, wings: bool, products: usize) -> usize {
         let Some(headroom) = self.0 else {
             return if wings {

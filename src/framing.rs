@@ -1,4 +1,3 @@
-#[cfg(any(target_os = "android", test))]
 use crate::{DiskGeometry, Error, Reconstruction};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -11,7 +10,6 @@ pub struct Framing {
     pub crop_factor: Option<f64>,
 }
 
-#[cfg(any(target_os = "android", test))]
 pub(crate) struct FrameTransform {
     width: usize,
     height: usize,
@@ -21,7 +19,6 @@ pub(crate) struct FrameTransform {
     basis: [[f64; 2]; 2],
 }
 
-#[cfg(any(target_os = "android", test))]
 impl Framing {
     pub(crate) fn prepare(
         self,
@@ -91,7 +88,6 @@ impl Framing {
     }
 }
 
-#[cfg(any(target_os = "android", test))]
 impl FrameTransform {
     pub(crate) fn apply(
         &self,

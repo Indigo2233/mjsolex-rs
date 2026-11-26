@@ -34,6 +34,125 @@ fn mono(width: u32, height: u32, depth: u32, count: u32) -> Vec<u8> {
 }
 
 #[test]
+fn desktop_reconstruction_exports_the_shared_pipeline_products() {
+    use mjsolex::pipeline::{ProcessingMemory, ProcessingOptions, ReconstructionOptions};
+    use mjsolex::{BandingAxis, DisplaySettings, Framing, ScanSettings};
+    use std::fs;
+    use std::process::Command;
+
+    let (width, spectral_rows, frames) = (112, 15, 96);
+    let mut bytes = mono(width, spectral_rows, 16, frames);
+    for frame in 0..frames {
+        let y = (f64::from(frame) - 47.5) / 31.;
+        for row in 0..spectral_rows {
+            let line = [
+                1., 1., 1., 1., 0.9, 0.74, 0.51, 0.39, 0.48, 0.69, 0.9, 1., 1., 1., 1.,
+            ][row as usize];
+            for col in 0..width {
+                let x = (f64::from(col) - 55.5) / 39.;
+                let mu = 1. - x * x - y * y;
+                let signal = if mu > 0. {
+                    18_000. + 6_000. * mu.sqrt()
+                } else {
+                    0.
+                };
+                let band = [0.95, 1.04, 0.97, 1.04][col as usize % 4];
+                bytes.extend(((300. + signal * line * band) as u16).to_le_bytes());
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let input = dir.path().join("fixture.ser");
+    let out = dir.path().join("outputs");
+    fs::write(&input, &bytes).unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_mjsolex-desktop"))
+        .arg(&input)
+        .arg(&out)
+        .args([
+            "--trace-row=7",
+            "--banding=vertical",
+            "--crop=1.4",
+            "--negative",
+            "--eclipse",
+            "--doppler=2",
+            "--dispersion=0.04",
+            "--palette=none",
+            "--no-enhance",
+            "--strict",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    let mut reader = SerReader::open(Cursor::new(bytes)).unwrap();
+    let spectrum = Spectrum::average(&mut reader, |_| true).unwrap();
+    let trace = Trace::constant(width as usize, 7.);
+    let options = ReconstructionOptions {
+        wavelength: 0.,
+        dispersion: Some(0.04),
+        shift: 0.,
+        stride: 1,
+        memory: ProcessingMemory::default(),
+        doppler: true,
+        wing_offset: 2.,
+        palettes: [false; 3],
+        processing: ProcessingOptions {
+            scan: ScanSettings {
+                banding: BandingAxis::Slit,
+                ..Default::default()
+            },
+            framing: Framing {
+                crop_factor: Some(1.4),
+                ..Default::default()
+            },
+            negative: true,
+            eclipse: true,
+            enhance: false,
+            ..Default::default()
+        },
+        synthetic_flat: false,
+        physical_flat: None,
+    };
+    let wing_shift = options.wing_shift(&spectrum, trace);
+    let fwhm = spectrum.line_profile(trace).fit.map(|fit| fit.fwhm);
+    let (images, warnings) = options
+        .build(
+            reader,
+            "fixture.ser".into(),
+            trace,
+            fwhm,
+            wing_shift,
+            |_| true,
+        )
+        .unwrap();
+    assert!(!warnings.has_errors());
+    assert!(images.metadata().geometry.is_some());
+    assert_eq!(
+        images.metadata().scan_corrections.banding,
+        BandingAxis::Slit
+    );
+    assert_eq!(images.exports(DisplaySettings::default()).count(), 6);
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 7);
+    assert!(
+        fs::read_to_string(out.join("run.log"))
+            .unwrap()
+            .contains("banding: Slit")
+    );
+    for export in images.exports(DisplaySettings::default()) {
+        let mut expected = Vec::new();
+        images.write(export, &mut expected).unwrap();
+        assert_eq!(
+            fs::read(out.join(images.file_name(export))).unwrap(),
+            expected
+        );
+    }
+}
+
+#[test]
 fn exports_display_pixels_and_preserves_raw_16_bit_samples() {
     let mut bytes = mono(5, 1, 16, 1);
     let samples = [100_u16, 200, 300, 400, 500];

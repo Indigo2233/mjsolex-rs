@@ -6,7 +6,6 @@ pub(crate) const MAX_PIXELS: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_DOPPLER_WING_PIXELS: usize = MAX_PIXELS / 4;
 
 /// Number of images that participate in scan, disk, and framing transforms.
-#[cfg(any(target_os = "android", test))]
 pub(crate) fn transform_image_count(wings: bool) -> usize {
     1 + 2 * usize::from(wings)
 }

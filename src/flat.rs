@@ -1,6 +1,6 @@
 use crate::geometry::FittedDisk;
 use crate::regression::weighted_fit;
-use crate::{DiskGeometry, Error, Reconstruction, SerReader, Spectrum};
+use crate::{ByteOrder, DiskGeometry, Error, Observation, Reconstruction, SerReader, Spectrum};
 use std::io::{Read, Seek};
 
 const FIT_RADIUS: f64 = 0.85;
@@ -16,6 +16,18 @@ pub struct PhysicalFlat {
 }
 
 impl PhysicalFlat {
+    pub fn from_recording<R: Read + Seek>(
+        input: R,
+        scan: &Spectrum,
+        observation: &Observation,
+        order: Option<ByteOrder>,
+        progress: impl FnMut(f32) -> bool,
+    ) -> Result<Self, Error> {
+        let mut reader =
+            SerReader::open_with_byte_order_hint(input, order, Some((scan.slit().0, observation)))?;
+        Self::from_ser(&mut reader, scan, progress)
+    }
+
     pub fn from_ser<R: Read + Seek>(
         reader: &mut SerReader<R>,
         scan: &Spectrum,

@@ -69,6 +69,18 @@ adb install -r target/apk/mjsolex-debug.apk
 
 ## 测试
 
+### 电脑端完整重建
+
+`mjsolex-desktop` 与 Android 使用同一套重建和导出代码。电脑上只需 Rust 和原始 SER。在 PowerShell 指定一个新的输出目录即可生成显示图、线性 PNG 和 FITS。终端和输出目录中的 `run.log` 记录采样间隔、实际应用的校正、处理时间及跳过原因。`--strict` 让有警告的任务返回失败状态，供回归验证使用。
+
+```powershell
+cargo run --release --locked --bin mjsolex-desktop -- 'D:/data/scan.ser' target/verify/scan --synthetic-flat --banding=auto --align --negative --eclipse --strict
+```
+
+对比盘缘处理时使用不同输出目录复跑。省略 `--align` 可对照扫描行对齐的效果。`--no-geometry` 关闭盘面几何重采样。需要双翼多普勒时增加 `--doppler=2 --dispersion=0.02`，色散按实际光路填写。`--headroom-mib=4096` 让预算计算使用 4 GiB 可用内存余量。完整参数见 `mjsolex-desktop --help`。
+
+### 自动化和 Android 冒烟测试
+
 ```powershell
 cargo fmt --all --check
 cargo test --locked

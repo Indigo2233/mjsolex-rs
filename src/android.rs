@@ -18,24 +18,23 @@ use rustix::io::Errno;
 use winit::platform::android::activity::AndroidApp;
 
 use crate::android_document::DocumentFile;
-use crate::processing_memory::ProcessingMemory;
+use crate::pipeline::{
+    CorrectionWarnings, Export, Images, PALETTES, ProcessingMemory, ProcessingOptions,
+    ReconstructionOptions, View, doppler_shift,
+};
 use crate::ser::cache_recording;
 use crate::{
-    APP_NAME, BandingAxis, ByteOrder, DiskGeometry, DisplayImage, DisplaySettings, DisplayTone,
-    Error, FitsMetadata, Framing, Header, LineProfile, LocalContrast, NegativeOptions, Observation,
-    OpticalSetup, PhysicalFlat, Product, Reconstruction, ScanSettings, SerReader, Spectrum,
-    Stretch, Trace,
+    APP_NAME, BandingAxis, ByteOrder, DisplaySettings, DisplayTone, Error, Framing, Header,
+    LineProfile, Observation, OpticalSetup, PhysicalFlat, Product, ScanSettings, SerReader,
+    Spectrum, Stretch, Trace,
 };
 
 mod language;
-mod postprocess;
 mod results;
 mod sequence;
 mod ui;
 
 use language::{Language, Notice};
-use postprocess::{CorrectionWarnings, ProcessingOptions, ReconstructionOptions};
-use results::{Export, Images, PALETTES, View};
 
 const OPEN_SER: i32 = 10;
 const SAVE_PNG: i32 = 11;
@@ -715,19 +714,19 @@ impl Mobile {
         let cache = self.cache.clone();
         let spectrum = scan.spectrum.clone();
         let byte_order = scan.byte_order;
-        let scan_header = scan.header;
         let scan_observation = scan.observation.clone();
         self.start_job(
             ("Reading flat SER", "正在读取平场 SER"),
             true,
             move |events, cancel| {
                 let file = seekable_document(file, &cache, cancel)?;
-                let mut reader = SerReader::open_with_byte_order_hint(
+                let flat = PhysicalFlat::from_recording(
                     &file.file,
+                    &spectrum,
+                    &scan_observation,
                     byte_order,
-                    Some((scan_header, &scan_observation)),
+                    report(events, cancel),
                 )?;
-                let flat = PhysicalFlat::from_ser(&mut reader, &spectrum, report(events, cancel))?;
                 file.check_error()?;
                 Ok(Work::FlatImported(flat, name))
             },
@@ -758,7 +757,7 @@ impl Mobile {
             .as_ref()
             .zip(self.trace)
             .ok_or(Error::DopplerCoverage)?;
-        postprocess::doppler_shift(
+        doppler_shift(
             &scan.spectrum,
             trace,
             self.shift,

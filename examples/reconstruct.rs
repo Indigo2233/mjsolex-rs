@@ -1,4 +1,4 @@
-//! Run the same processing pipeline as the Android app on a local test file.
+//! Export a single linear reconstruction. Use mjsolex-desktop for all app products.
 
 use std::error::Error;
 use std::fs::File;

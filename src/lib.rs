@@ -9,7 +9,7 @@ mod geometry;
 mod negative;
 mod observation;
 mod optics;
-#[cfg(any(target_os = "android", test))]
+pub mod pipeline;
 mod processing_memory;
 mod profile;
 mod reconstruct;

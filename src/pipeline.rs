@@ -1,19 +1,29 @@
-use super::*;
+use std::io::{Read, Seek};
+use std::sync::Arc;
+
+pub use crate::processing_memory::ProcessingMemory;
+use crate::{
+    BandingAxis, DiskGeometry, Error, FitsMetadata, Framing, Header, LocalContrast,
+    NegativeOptions, PhysicalFlat, ScanSettings, SerReader, Spectrum, Trace,
+};
+
+mod products;
 use crate::negative::{reconstruct_eclipse_with_budget, reconstruct_negative_with_budget};
 use crate::reconstruct::{reconstruct_offsets_with_budget, transform_image_count};
 use crate::scan_correction::ScanPlan;
+pub use products::{Export, Images, PALETTES, View};
 
 #[derive(Clone, Copy)]
-pub(super) struct ProcessingOptions {
-    pub(super) scan: ScanSettings,
-    pub(super) correct_disk: bool,
-    pub(super) synthetic_strength: u8,
-    pub(super) framing: Framing,
-    pub(super) enhance: bool,
-    pub(super) negative: bool,
-    pub(super) eclipse: bool,
-    pub(super) invert_prominences: bool,
-    pub(super) prominence_strength: u8,
+pub struct ProcessingOptions {
+    pub scan: ScanSettings,
+    pub correct_disk: bool,
+    pub synthetic_strength: u8,
+    pub framing: Framing,
+    pub enhance: bool,
+    pub negative: bool,
+    pub eclipse: bool,
+    pub invert_prominences: bool,
+    pub prominence_strength: u8,
 }
 
 impl Default for ProcessingOptions {
@@ -33,12 +43,7 @@ impl Default for ProcessingOptions {
 }
 
 impl ProcessingOptions {
-    pub(super) fn image_budget(
-        self,
-        memory: ProcessingMemory,
-        header: Header,
-        wings: bool,
-    ) -> usize {
+    pub fn image_budget(self, memory: ProcessingMemory, header: Header, wings: bool) -> usize {
         memory.image_pixels(
             header,
             wings,
@@ -48,23 +53,23 @@ impl ProcessingOptions {
 }
 
 #[derive(Default)]
-pub(super) struct CorrectionWarnings {
-    pub(super) flat: Option<Error>,
-    pub(super) scan: Option<Error>,
-    pub(super) disk: Option<Error>,
-    pub(super) framing: Option<Error>,
-    pub(super) enhancement: Option<Error>,
-    pub(super) negative: Option<Error>,
-    pub(super) eclipse: Option<Error>,
-    pub(super) doppler: Option<Error>,
+pub struct CorrectionWarnings {
+    pub flat: Option<Error>,
+    pub scan: Option<Error>,
+    pub disk: Option<Error>,
+    pub framing: Option<Error>,
+    pub enhancement: Option<Error>,
+    pub negative: Option<Error>,
+    pub eclipse: Option<Error>,
+    pub doppler: Option<Error>,
 }
 
 impl CorrectionWarnings {
-    pub(super) fn has_errors(&self) -> bool {
+    pub fn has_errors(&self) -> bool {
         self.entries().iter().any(|(error, ..)| error.is_some())
     }
 
-    pub(super) fn entries(&self) -> [(&Option<Error>, &'static str, &'static str); 8] {
+    pub fn entries(&self) -> [(&Option<Error>, &'static str, &'static str); 8] {
         [
             (&self.flat, "Synthetic flat skipped. ", "已跳过虚拟平场。"),
             (
@@ -106,7 +111,7 @@ impl CorrectionWarnings {
     }
 }
 
-pub(super) fn doppler_shift(
+pub fn doppler_shift(
     spectrum: &Spectrum,
     trace: Trace,
     shift: f64,
@@ -121,26 +126,22 @@ pub(super) fn doppler_shift(
 }
 
 #[derive(Clone)]
-pub(super) struct ReconstructionOptions {
-    pub(super) wavelength: f64,
-    pub(super) dispersion: Option<f64>,
-    pub(super) shift: f64,
-    pub(super) stride: u32,
-    pub(super) memory: ProcessingMemory,
-    pub(super) doppler: bool,
-    pub(super) wing_offset: f64,
-    pub(super) palettes: [bool; 3],
-    pub(super) processing: ProcessingOptions,
-    pub(super) synthetic_flat: bool,
-    pub(super) physical_flat: Option<(Arc<PhysicalFlat>, String)>,
+pub struct ReconstructionOptions {
+    pub wavelength: f64,
+    pub dispersion: Option<f64>,
+    pub shift: f64,
+    pub stride: u32,
+    pub memory: ProcessingMemory,
+    pub doppler: bool,
+    pub wing_offset: f64,
+    pub palettes: [bool; 3],
+    pub processing: ProcessingOptions,
+    pub synthetic_flat: bool,
+    pub physical_flat: Option<(Arc<PhysicalFlat>, String)>,
 }
 
 impl ReconstructionOptions {
-    pub(super) fn wing_shift(
-        &self,
-        spectrum: &Spectrum,
-        trace: Trace,
-    ) -> Result<Option<f64>, Error> {
+    pub fn wing_shift(&self, spectrum: &Spectrum, trace: Trace) -> Result<Option<f64>, Error> {
         self.doppler
             .then(|| {
                 doppler_shift(
@@ -154,9 +155,9 @@ impl ReconstructionOptions {
             .transpose()
     }
 
-    pub(super) fn build(
+    pub fn build<R: Read + Seek>(
         &self,
-        mut reader: SerReader<&File>,
+        mut reader: SerReader<R>,
         name: String,
         trace: Trace,
         fwhm: Option<f64>,
