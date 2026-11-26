@@ -203,12 +203,12 @@ impl ReconstructionOptions {
                 Err(error) => warnings.flat = Some(error),
             }
         } else if let Some((flat, name)) = &self.physical_flat {
-            flat.apply(&mut center)?;
-            if let Some(wings) = &mut wings {
-                for wing in wings {
-                    flat.apply(wing)?;
-                }
-            }
+            let scale = if let Some([red, blue]) = &mut wings {
+                flat.apply_to(&mut [&mut center, red, blue])?
+            } else {
+                flat.apply_to(&mut [&mut center])?
+            };
+            metadata.physical_flat_scale = (scale < 1.).then_some(scale);
             metadata.flat_file = Some(name.clone());
         }
         if !progress(corrections_start) {

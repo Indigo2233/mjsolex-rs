@@ -209,7 +209,7 @@ fn captured_flat_corrects_slit_response_and_rejects_invalid_inputs() {
     assert!(
         pixels[1..WIDTH as usize - 1]
             .iter()
-            .all(|&sample| sample == 3000)
+            .all(|&sample| sample == 4500)
     );
     let metadata = FitsMetadata {
         flat_file: Some("slit-flat.ser".to_owned()),
@@ -222,6 +222,41 @@ fn captured_flat_corrects_slit_response_and_rejects_invalid_inputs() {
     let cards = str::from_utf8(&fits[..2880]).unwrap();
     assert!(cards.contains("FLATCORR= 'PHYSICAL'"));
     assert!(cards.contains("FLATFILE= 'slit-flat.ser'"));
+}
+
+#[test]
+fn captured_flat_brightens_narrow_dust_shadows() {
+    const WIDTH: u32 = 32;
+    const HEIGHT: u32 = 7;
+    let mut flat_ser = mono(WIDTH, HEIGHT, 16, 1);
+    let mut scan_ser = mono(WIDTH, HEIGHT, 16, 1);
+    for y in 0..HEIGHT as u16 {
+        for x in 0..WIDTH {
+            let throughput = match x {
+                13 => 6,
+                19..=21 => 5,
+                _ => 8,
+            };
+            let level = 1200 + 120 * y;
+            let flat = if x == 27 && y == 2 {
+                23_000
+            } else {
+                level * throughput
+            };
+            flat_ser.extend(flat.to_le_bytes());
+            scan_ser.extend((4000_u16 * throughput).to_le_bytes());
+        }
+    }
+    let mut scan = SerReader::open(Cursor::new(scan_ser)).unwrap();
+    let spectrum = Spectrum::average(&mut scan, |_| true).unwrap();
+    let mut flat = SerReader::open(Cursor::new(flat_ser)).unwrap();
+    let flat = PhysicalFlat::from_ser(&mut flat, &spectrum, |_| true).unwrap();
+    let mut image =
+        reconstruct(&mut scan, Trace::constant(WIDTH as usize, 3.), 0., |_| true).unwrap();
+    assert_eq!(image.pixels()[13], 24_000);
+    flat.apply(&mut image).unwrap();
+    assert_eq!(image.pixels()[13], 32_000);
+    assert!(image.pixels().iter().all(|&sample| sample == 32_000));
 }
 
 #[test]
@@ -257,7 +292,7 @@ fn captured_flat_accepts_the_scan_byte_order_override() {
         .unwrap()
         .apply(&mut raw)
         .unwrap();
-    assert!(raw.pixels().iter().all(|&sample| sample == 3000));
+    assert!(raw.pixels().iter().all(|&sample| sample == 4500));
 }
 
 #[test]

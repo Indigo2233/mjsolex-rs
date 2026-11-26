@@ -10,7 +10,7 @@ const MIN_RESPONSE_CHANGE: f64 = 0.04;
 // Exclude near-white samples, including an 8-bit SER expanded into 16 bits.
 const SATURATION_CUTOFF: u16 = 65_280;
 
-/// Smooth slit throughput estimated from an independently captured flat SER.
+/// Per-column slit throughput correction estimated from a captured flat SER.
 pub struct PhysicalFlat {
     gains: Vec<f32>,
 }
@@ -30,10 +30,9 @@ impl PhysicalFlat {
         }
         let spectrum = Spectrum::average(reader, |p| progress(p * 0.9))?;
         let slit_width = right - left + 1;
-        let mut response = vec![0.; slit_width];
-        let mut counts = vec![0_u32; slit_width];
+        let usable = |value: f32| (4. ..f32::from(SATURATION_CUTOFF)).contains(&value);
         let mut row_samples = Vec::with_capacity(slit_width);
-        let mut usable_rows = 0_u32;
+        let mut rows = Vec::new();
         for row in spectrum
             .pixels()
             .chunks_exact(flat.width)
@@ -41,36 +40,35 @@ impl PhysicalFlat {
         {
             let row = &row[left..=right];
             row_samples.clear();
-            let usable = |value: f32| (4. ..f32::from(SATURATION_CUTOFF)).contains(&value);
             row_samples.extend(row.iter().copied().filter(|&v| usable(v)));
             if row_samples.len() < slit_width * 3 / 4 || row_samples.is_empty() {
                 continue;
             }
-            let mid = row_samples.len() / 2;
-            let level = *row_samples.select_nth_unstable_by(mid, f32::total_cmp).1;
-            usable_rows += 1;
-            for (x, &value) in row.iter().enumerate() {
-                if usable(value) && value >= level / 8. {
-                    response[x] += value / level;
-                    counts[x] += 1;
-                }
-            }
+            rows.push((row, median(&mut row_samples)));
         }
-        if usable_rows == 0 || counts.iter().any(|&count| count < usable_rows.div_ceil(2)) {
+        if rows.is_empty() {
             return Err(Error::InvalidPhysicalFlat);
         }
-        for (value, count) in response.iter_mut().zip(counts) {
-            *value /= count as f32;
-        }
+        // Normalize each wavelength independently. The median across wavelengths
+        // rejects isolated defective samples while retaining narrow slit shadows.
         let mut gains = vec![1.; flat.width];
         let slit_gains = &mut gains[left..=right];
+        let mut column_samples = Vec::with_capacity(rows.len());
         for (x, gain) in slit_gains.iter_mut().enumerate() {
-            let local = &response[x.saturating_sub(4)..(x + 5).min(slit_width)];
-            let mut median = [0.; 9];
-            median[..local.len()].copy_from_slice(local);
-            *gain = *median[..local.len()]
-                .select_nth_unstable_by(local.len() / 2, f32::total_cmp)
-                .1;
+            if x % 256 == 0 && !progress(0.9 + 0.1 * x as f32 / slit_width as f32) {
+                return Err(Error::Cancelled);
+            }
+            column_samples.clear();
+            for (row, level) in &rows {
+                let value = row[x];
+                if usable(value) && value >= level / 8. {
+                    column_samples.push(value / level);
+                }
+            }
+            if column_samples.len() < rows.len().div_ceil(2) {
+                return Err(Error::InvalidPhysicalFlat);
+            }
+            *gain = median(&mut column_samples);
         }
         let (low, high) = slit_gains
             .iter()
@@ -80,8 +78,11 @@ impl PhysicalFlat {
         if low < high * 0.25 {
             return Err(Error::InvalidPhysicalFlat);
         }
+        row_samples.clear();
+        row_samples.extend_from_slice(slit_gains);
+        let reference = median(&mut row_samples);
         for gain in slit_gains {
-            *gain = low / *gain;
+            *gain = reference / *gain;
         }
         if !progress(1.) {
             return Err(Error::Cancelled);
@@ -90,15 +91,42 @@ impl PhysicalFlat {
     }
 
     pub fn apply(&self, image: &mut Reconstruction) -> Result<(), Error> {
-        if image.width != self.gains.len() {
+        self.apply_to(&mut [image]).map(|_| ())
+    }
+
+    /// Correct all products with one headroom scale so that wing ratios remain comparable.
+    pub(crate) fn apply_to(&self, images: &mut [&mut Reconstruction]) -> Result<f64, Error> {
+        if images.iter().any(|image| image.width != self.gains.len()) {
             return Err(Error::FlatMismatch);
         }
-        for row in image.pixels.chunks_exact_mut(image.width) {
-            for (pixel, gain) in row.iter_mut().zip(&self.gains) {
-                *pixel = (f32::from(*pixel) * gain).round() as u16;
+        let limit = f32::from(u16::MAX);
+        let mut peak = limit;
+        for image in images.iter() {
+            for row in image.pixels.chunks_exact(image.width) {
+                for (&pixel, &gain) in row.iter().zip(&self.gains) {
+                    peak = peak.max(f32::from(pixel) * gain);
+                }
             }
         }
-        Ok(())
+        let scale = limit / peak;
+        for image in images {
+            for row in image.pixels.chunks_exact_mut(image.width) {
+                for (pixel, &gain) in row.iter_mut().zip(&self.gains) {
+                    *pixel = (f32::from(*pixel) * gain * scale).round() as u16;
+                }
+            }
+        }
+        Ok(f64::from(scale))
+    }
+}
+
+fn median(samples: &mut [f32]) -> f32 {
+    let even = samples.len().is_multiple_of(2);
+    let (left, middle, _) = samples.select_nth_unstable_by(samples.len() / 2, f32::total_cmp);
+    if even {
+        middle.midpoint(left.iter().copied().fold(f32::NEG_INFINITY, f32::max))
+    } else {
+        *middle
     }
 }
 
@@ -280,6 +308,46 @@ fn predicted(basis: [f64; 6], coefficients: [f64; 6]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn physical_flat_preserves_wing_ratios_with_shared_headroom() {
+        let flat = PhysicalFlat {
+            gains: vec![1., 2.],
+        };
+        let image = |signal| Reconstruction {
+            width: 2,
+            height: 1,
+            pixels: vec![12_000, signal],
+            synthetic_flat: false,
+        };
+        let mut center = image(20_000);
+        let mut red = image(40_000);
+        let mut blue = image(10_000);
+        let scale = flat
+            .apply_to(&mut [&mut center, &mut red, &mut blue])
+            .unwrap();
+        assert!((scale - 65_535. / 80_000.).abs() < 1e-7);
+        assert_eq!(red.pixels[1], 65_535);
+        assert!(center.pixels[1].abs_diff(32_768) <= 1);
+        assert!(blue.pixels[1].abs_diff(16_384) <= 1);
+        assert_eq!(center.pixels[0], red.pixels[0]);
+        assert_eq!(red.pixels[0], blue.pixels[0]);
+
+        let metadata = crate::FitsMetadata {
+            flat_file: Some("test-flat.ser".to_owned()),
+            physical_flat_scale: Some(scale),
+            ..crate::FitsMetadata::default()
+        };
+        let mut fits = Vec::new();
+        center
+            .write_fits_with_metadata(&mut fits, &metadata)
+            .unwrap();
+        assert!(
+            std::str::from_utf8(&fits[..2880])
+                .unwrap()
+                .contains("FLATSCL =")
+        );
+    }
 
     fn disk(cx: f64, vignette: bool) -> Reconstruction {
         let (width, height) = (256, 232);

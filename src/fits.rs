@@ -13,6 +13,7 @@ pub struct FitsMetadata {
     pub source_name: Option<String>,
     pub source_header: Option<Header>,
     pub flat_file: Option<String>,
+    pub physical_flat_scale: Option<f64>,
     pub synthetic_flat_strength: Option<u8>,
     pub frame_step: Option<u32>,
     pub offset_pixels: Option<f64>,
@@ -159,6 +160,7 @@ impl FitsMetadata {
                 (self.framing.rotation_deg != 0.).then_some(self.framing.rotation_deg),
             ),
             ("CROPFACT", self.framing.crop_factor),
+            ("FLATSCL", self.physical_flat_scale),
             ("BANDSCL", self.scan_corrections.banding_scale),
             (
                 "OSCPER",
