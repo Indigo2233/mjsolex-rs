@@ -6,6 +6,8 @@ pub enum BandingAxis {
     Slit,
     /// Normalize brightness between successive scan rows.
     Scan,
+    /// Test both directions and apply each supported correction.
+    Both,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -41,10 +43,12 @@ mod model {
     use crate::regression::weighted_fit;
     use crate::{Error, Reconstruction};
 
+    const MAX_BAND_HALF_WINDOW: usize = 25;
+
     pub(crate) struct ScanPlan {
         size: [usize; 2],
         sky: u16,
-        banding: Option<BandCorrection>,
+        banding: [Option<BandCorrection>; 2],
         motion: Option<Motion>,
         pub(crate) report: ScanReport,
     }
@@ -53,7 +57,6 @@ mod model {
         start: usize,
         gains: Vec<f64>,
         scale: f64,
-        width: u8,
     }
 
     impl BandCorrection {
@@ -94,10 +97,35 @@ mod model {
             checkpoint(progress(0.))?;
             let disk = DiskGeometry::fit_limb(image)?;
             let sky = disk.sky;
-            let banding = if settings.banding != BandingAxis::Off {
-                banding_model(image, &disk, settings, |p| progress(p * 0.25))?
-            } else {
-                None
+            let half_window = settings.banding_width.map_or_else(
+                || {
+                    ((disk.geometry.slit_radius.min(disk.geometry.scan_radius) / 7.).round()
+                        as usize)
+                        .clamp(3, MAX_BAND_HALF_WINDOW)
+                },
+                |width| usize::from(width.clamp(7, 51)) / 2,
+            );
+            let mut banding = [None, None];
+            for (i, axis) in [BandingAxis::Slit, BandingAxis::Scan]
+                .into_iter()
+                .enumerate()
+            {
+                if settings.banding == axis || settings.banding == BandingAxis::Both {
+                    banding[i] = banding_model(
+                        image,
+                        &disk,
+                        axis,
+                        half_window,
+                        settings.banding == BandingAxis::Both,
+                        |p| progress((i as f32 + p) * 0.125),
+                    )?;
+                }
+            }
+            let banding_axis = match (banding[0].is_some(), banding[1].is_some()) {
+                (true, true) => BandingAxis::Both,
+                (true, false) => BandingAxis::Slit,
+                (false, true) => BandingAxis::Scan,
+                (false, false) => BandingAxis::Off,
             };
             let motion = if settings.oscillation || settings.jagged {
                 motion_model(image, disk, settings, |p| progress(0.25 + 0.75 * p))?
@@ -106,13 +134,11 @@ mod model {
             };
             checkpoint(progress(1.))?;
             let report = ScanReport {
-                banding: if banding.is_some() {
-                    settings.banding
-                } else {
-                    BandingAxis::Off
-                },
-                banding_scale: banding.as_ref().map(|model| model.scale),
-                banding_width: banding.as_ref().map(|model| model.width),
+                banding: banding_axis,
+                banding_scale: (banding_axis != BandingAxis::Off)
+                    .then(|| banding.iter().flatten().map(|model| model.scale).product()),
+                banding_width: (banding_axis != BandingAxis::Off)
+                    .then_some((2 * half_window + 1) as u8),
                 jagged: motion.as_ref().is_some_and(|m| !m.rows.is_empty()),
                 oscillation: motion.as_ref().and_then(|m| m.wave).map(|wave| {
                     (
@@ -145,16 +171,14 @@ mod model {
             };
             for (y, row) in image.pixels.chunks_exact_mut(image.width).enumerate() {
                 checkpoint(progress(y as f32 / image.height as f32))?;
-                if let Some(model) = &self.banding {
-                    if self.report.banding == BandingAxis::Slit {
-                        for (x, sample) in row.iter_mut().enumerate() {
-                            apply_gain(sample, self.sky, model.gain(x));
-                        }
-                    } else {
-                        let gain = model.gain(y);
-                        for sample in &mut *row {
-                            apply_gain(sample, self.sky, gain);
-                        }
+                let row_gain = self.banding[1].as_ref().map_or(1., |model| model.gain(y));
+                if let Some(model) = &self.banding[0] {
+                    for (x, sample) in row.iter_mut().enumerate() {
+                        apply_gain(sample, self.sky, row_gain * model.gain(x));
+                    }
+                } else if row_gain != 1. {
+                    for sample in &mut *row {
+                        apply_gain(sample, self.sky, row_gain);
                     }
                 }
                 if let Some(motion) = &self.motion {
@@ -230,10 +254,12 @@ mod model {
     fn banding_model(
         image: &Reconstruction,
         disk: &FittedDisk,
-        settings: ScanSettings,
+        axis: BandingAxis,
+        half_window: usize,
+        automatic: bool,
         mut progress: impl FnMut(f32) -> bool,
     ) -> Result<Option<BandCorrection>, Error> {
-        let vertical = settings.banding == BandingAxis::Slit;
+        let vertical = axis == BandingAxis::Slit;
         let g = disk.geometry;
         let tilted = g.shear * g.scan_radius;
         let projected_x = g.slit_radius.hypot(tilted);
@@ -258,11 +284,7 @@ mod model {
                 image.width,
             )
         };
-        let range = disk_range(center, 0.85 * radius, size);
-        let half_window = settings.banding_width.map_or_else(
-            || (radius / 12.).round().clamp(3., 12.) as usize,
-            |width| usize::from(width.clamp(7, 51)) / 2,
-        );
+        let range = disk_range(center, 0.91 * radius, size);
         let signal_at = |index: usize, across: usize| {
             let pixel = if vertical {
                 image.pixels[across * image.width + index]
@@ -272,73 +294,108 @@ mod model {
             let signal = pixel.saturating_sub(disk.sky);
             (signal > 4 && pixel < 65_280).then_some(u64::from(signal))
         };
-        let mut gains = vec![1.; range.len()];
-        let mut applied = false;
-        for (i, gain) in gains
+        let mut measurements = vec![None; range.len()];
+        for (i, measurement) in measurements
             .iter_mut()
             .enumerate()
             .take(range.len().saturating_sub(half_window))
             .skip(half_window)
         {
-            checkpoint(progress(i as f32 / range.len() as f32))?;
+            checkpoint(progress(0.85 * i as f32 / range.len() as f32))?;
             let index = range.start + i;
             let t = (index as f64 - center) / radius;
             let mid = cross_center + shear * t;
-            let half = cross_radius * (0.92_f64.powi(2) - t * t).sqrt();
+            let half = cross_radius * (0.96_f64.powi(2) - t * t).sqrt();
             if half < 18. {
                 continue;
             }
-            let mut residual = [0.; 3];
+            let mut residual = [None; 3];
             for (sector, delta) in residual.iter_mut().enumerate() {
                 let left = mid + half * (-0.75 + 0.5 * sector as f64);
                 let right = left + 0.5 * half;
                 let bounds = |value: f64| (value.round().max(0.) as usize).min(cross_size);
                 let span = bounds(left)..bounds(right);
                 let stride = span.len().div_ceil(96).max(1);
-                let mut observed = 0;
-                let mut reference = 0;
-                let mut probes = 0;
+                let mut pairs = [[0_u64; 3]; MAX_BAND_HALF_WINDOW];
                 // Match the sample positions across lines so changing the sample grid
                 // cannot turn solar texture into a band correction.
                 for across in span.step_by(stride) {
                     let Some(current) = signal_at(index, across) else {
                         continue;
                     };
-                    let mut sum = 0;
-                    let mut pairs = 0;
-                    for step in 1..=half_window {
+                    for (step, pair) in pairs[..half_window].iter_mut().enumerate() {
+                        let distance = step + 1;
                         if let (Some(a), Some(b)) = (
-                            signal_at(index - step, across),
-                            signal_at(index + step, across),
+                            signal_at(index - distance, across),
+                            signal_at(index + distance, across),
                         ) {
-                            sum += a + b;
-                            pairs += 1;
+                            pair[0] += 2 * current;
+                            pair[1] += a + b;
+                            pair[2] += 1;
                         }
                     }
-                    if pairs * 2 >= half_window as u64 {
-                        observed += 2 * pairs * current;
-                        reference += sum;
-                        probes += 1;
+                }
+                // Use the median of symmetric reference pairs. A neighboring
+                // stripe then has limited influence on the gain of a clean line.
+                let mut ratios = [0.; MAX_BAND_HALF_WINDOW];
+                let mut count = 0;
+                for &[current, reference, probes] in &pairs[..half_window] {
+                    if probes >= 8 {
+                        ratios[count] = reference as f64 / current as f64;
+                        count += 1;
                     }
                 }
-                if probes >= 8 {
-                    *delta = (reference as f64 / observed as f64).ln();
+                if count >= half_window.div_ceil(2) {
+                    let median = *ratios[..count]
+                        .select_nth_unstable_by(count / 2, f64::total_cmp)
+                        .1;
+                    *delta = Some(median.ln());
                 }
             }
-            residual.sort_by(f64::total_cmp);
-            let median = residual[1];
-            if median.abs() >= 0.003
-                && residual[0] * residual[2] > 0.
-                && residual[2] - residual[0] <= median.abs() * 1.3 + 0.002
-            {
-                let taper = (i.min(range.len() - 1 - i).saturating_sub(half_window) as f64
-                    / half_window as f64)
-                    .min(1.);
-                *gain = (taper * median.clamp(-0.14, 0.14)).exp();
-                applied |= *gain != 1.;
+            if let [Some(a), Some(b), Some(c)] = residual {
+                *measurement = Some([a, b, c]);
             }
         }
-        if !applied {
+
+        let mut gains = vec![1.; range.len()];
+        let mut applied = false;
+        let mut detected = false;
+        let mut energy = [0_f64; 3];
+        let mut covariance = [0_f64; 3];
+        for (i, &measurement) in measurements.iter().enumerate() {
+            checkpoint(progress(0.85 + 0.15 * i as f32 / range.len() as f32))?;
+            let Some(measured) = measurement else {
+                continue;
+            };
+            let at_edge = i.min(range.len() - 1 - i).saturating_sub(half_window);
+            if automatic && at_edge > 0 {
+                let detrend = (2 * half_window).min(at_edge);
+                let baseline = &measurements[i - detrend..=i + detrend];
+                // Remove smooth curvature in the evidence used to select an axis.
+                let residual = std::array::from_fn(|sector| {
+                    measured[sector] - sector_baseline(baseline, sector)
+                });
+                detected |= shared_band(residual).is_some();
+                for (sector, &value) in residual.iter().enumerate() {
+                    let current = value.clamp(-0.14, 0.14);
+                    let next = residual[(sector + 1) % 3].clamp(-0.14, 0.14);
+                    energy[sector] += current * current;
+                    covariance[sector] += current * next;
+                }
+            }
+            if let Some(median) = shared_band(measured) {
+                let taper = (at_edge as f64 / half_window as f64).min(1.);
+                gains[i] = (taper * median.clamp(-0.14, 0.14)).exp();
+                applied |= gains[i] != 1.;
+            }
+        }
+        // Automatic mode requires shared signal across all sectors. This avoids
+        // selecting an axis for isolated coincident changes in solar detail.
+        let coherent = covariance
+            .iter()
+            .enumerate()
+            .all(|(i, &sum)| sum >= 0.28 * (energy[i] * energy[(i + 1) % 3]).sqrt());
+        if !applied || (automatic && !(detected && coherent)) {
             return Ok(None);
         }
         // Keep the correction proportional above the sky level everywhere,
@@ -351,8 +408,32 @@ mod model {
             start: range.start,
             gains,
             scale: maximum.recip(),
-            width: (2 * half_window + 1) as u8,
         }))
+    }
+
+    fn sector_baseline(neighbors: &[Option<[f64; 3]>], sector: usize) -> f64 {
+        let mut nearby = [0.; 4 * MAX_BAND_HALF_WINDOW + 1];
+        let mut count = 0;
+        for other in neighbors.iter().flatten() {
+            nearby[count] = other[sector];
+            count += 1;
+        }
+        // The center is present. Both quartiles preserve alternating bands and
+        // limit the influence of isolated stripes on the baseline.
+        let quartile = (count - 1) / 4;
+        let upper = count - 1 - quartile;
+        let (_, lower, above) = nearby[..count].select_nth_unstable_by(quartile, f64::total_cmp);
+        let higher = upper.checked_sub(quartile + 1).map_or(*lower, |position| {
+            *above.select_nth_unstable_by(position, f64::total_cmp).1
+        });
+        (*lower + higher) / 2.
+    }
+
+    fn shared_band(mut sectors: [f64; 3]) -> Option<f64> {
+        sectors.sort_by(f64::total_cmp);
+        let [low, median, high] = sectors;
+        (median.abs() >= 0.002 && low * high > 0. && high - low <= median.abs() * 1.3 + 0.002)
+            .then_some(median)
     }
 
     fn motion_model(
@@ -413,7 +494,8 @@ mod model {
         let mut rows = Vec::new();
         if settings.jagged {
             const MIN_SHIFT: f64 = 0.45;
-            let neighbor_radius = (disk.geometry.scan_radius / 90.).round().clamp(8., 16.) as usize;
+            let neighbor_radius =
+                (disk.geometry.scan_radius / 24.).round().clamp(24., 72.) as usize;
             let neighbor_scale = (neighbor_radius + 1) as f64;
             let max_shift = (0.008 * disk.geometry.slit_radius).clamp(2., 12.);
             rows.resize(edges.len(), [0.; 2]);
@@ -451,7 +533,7 @@ mod model {
                 let supported = (1.5 + 2. * shared).min(max_shift).min(0.25 * half);
                 let strength = (supported / peak.max(supported)).powi(2);
                 let distance = (range.start as f64 + i as f64 - disk.center_y).abs();
-                let taper = ((scan_extent - distance) / neighbor_radius as f64).clamp(0., 1.);
+                let taper = ((scan_extent - distance) / 16.).clamp(0., 1.);
                 rows[i] = offsets.map(|offset| offset * strength * taper);
             }
             // Require repeatable variation on both limbs before changing the image.
@@ -624,6 +706,30 @@ mod tests {
     }
 
     #[test]
+    fn reduces_longer_nonrepeating_limb_waves() {
+        let mut image = disk(
+            |y| {
+                let x = y as f64 - 120.;
+                3.5 * (x * (0.129 + 0.00036 * x)).sin()
+            },
+            |_, _| 1.,
+        );
+        let before = edge_error(&image);
+        let plan = ScanPlan::prepare(
+            &image,
+            ScanSettings {
+                jagged: true,
+                ..Default::default()
+            },
+            |_| true,
+        )
+        .unwrap();
+        plan.apply(&mut image, |_| true).unwrap();
+        let after = edge_error(&image);
+        assert!(after < 0.65 * before, "edge RMS {before} -> {after}");
+    }
+
+    #[test]
     fn one_sided_prominence_does_not_move_scan_rows() {
         let mut image = disk(|_| 0., |_, _| 1.);
         for y in 113..126 {
@@ -732,6 +838,63 @@ mod tests {
                 "{axis:?}: {before} -> {}",
                 banding_error(&clean, &striped)
             );
+        }
+    }
+
+    #[test]
+    fn avoids_dark_and_bright_halos_next_to_slit_bands() {
+        let clean = disk(|_| 0., |_, _| 1.);
+        let mut image = disk(
+            |_| 0.,
+            |x, _| match x {
+                104..=110 => 0.91,
+                140..=146 => 1.08,
+                _ => 1.,
+            },
+        );
+        let before = banding_error(&clean, &image);
+        let plan = ScanPlan::prepare(
+            &image,
+            ScanSettings {
+                banding: BandingAxis::Slit,
+                banding_width: Some(49),
+                ..Default::default()
+            },
+            |_| true,
+        )
+        .unwrap();
+        plan.apply(&mut image, |_| true).unwrap();
+        let after = banding_error(&clean, &image);
+        assert!(after < 0.3 * before, "banding error {before} -> {after}");
+    }
+
+    #[test]
+    fn auto_corrects_crossed_bands_and_reports_the_supported_directions() {
+        let clean = disk(|_| 0., |_, _| 1.);
+        let slit = |x| [0.92, 1.06, 1.08, 0.98][x % 4];
+        let scan = |y| [1.07, 0.95, 0.94, 1.04][y % 4];
+        for (expected, mut image) in [
+            (BandingAxis::Slit, disk(|_| 0., |x, _| slit(x))),
+            (BandingAxis::Both, disk(|_| 0., |x, y| slit(x) * scan(y))),
+        ] {
+            let before = banding_error(&clean, &image);
+            let plan = ScanPlan::prepare(
+                &image,
+                ScanSettings {
+                    banding: BandingAxis::Both,
+                    ..Default::default()
+                },
+                |_| true,
+            )
+            .unwrap();
+            assert_eq!(plan.report.banding, expected);
+            plan.apply(&mut image, |_| true).unwrap();
+            let after = banding_error(&clean, &image);
+            assert!(
+                after < 0.35 * before,
+                "{expected:?} banding error {before} -> {after}"
+            );
+            assert_eq!(image.pixels[0], 300);
         }
     }
 

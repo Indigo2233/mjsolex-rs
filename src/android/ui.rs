@@ -891,8 +891,17 @@ impl Mobile {
                 ui.collapsing(
                     lang.text("Applied scan corrections", "已应用的扫描校正"),
                     |ui| {
-                        if report.banding != BandingAxis::Off {
-                            let label = lang.text("Banding correction", "条带校正");
+                        let label = match report.banding {
+                            BandingAxis::Slit => Some(lang.text("Vertical bands", "竖向条带校正")),
+                            BandingAxis::Scan => {
+                                Some(lang.text("Horizontal bands", "横向条带校正"))
+                            }
+                            BandingAxis::Both => {
+                                Some(lang.text("Vertical and horizontal bands", "横竖条带校正"))
+                            }
+                            BandingAxis::Off => None,
+                        };
+                        if let Some(label) = label {
                             if let Some(width) = report.banding_width {
                                 ui.label(format!("{label} · {width} px"));
                             } else {
@@ -1009,6 +1018,7 @@ fn scan_options(ui: &mut Ui, scan: &mut ScanSettings, lang: Language) {
         ui.horizontal_wrapped(|ui| {
             for (axis, label) in [
                 (BandingAxis::Off, lang.text("Off", "关闭")),
+                (BandingAxis::Both, lang.text("Auto (both)", "自动（横竖）")),
                 (BandingAxis::Slit, lang.text("Vertical", "竖条")),
                 (BandingAxis::Scan, lang.text("Horizontal", "横条")),
             ] {
@@ -1049,8 +1059,8 @@ fn scan_options(ui: &mut Ui, scan: &mut ScanSettings, lang: Language) {
         if scan.jagged {
             ui.label(
                 RichText::new(lang.text(
-                    "Uses both limbs to correct local row shifts and changes in disk width.",
-                    "根据两侧盘缘校正扫描行的局部横移和宽度变化。",
+                    "Uses both limbs to reduce waves, row shifts and changes in disk width.",
+                    "根据两侧盘缘校正波浪、扫描行横移和宽度变化。",
                 ))
                 .color(MUTED),
             );

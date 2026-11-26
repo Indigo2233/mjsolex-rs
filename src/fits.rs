@@ -115,6 +115,7 @@ impl FitsMetadata {
             BandingAxis::Off => {}
             BandingAxis::Slit => cards.push(text_card("BANDCORR", "SLIT")),
             BandingAxis::Scan => cards.push(text_card("BANDCORR", "SCAN")),
+            BandingAxis::Both => cards.push(text_card("BANDCORR", "BOTH")),
         }
         if let Some(width) = self.scan_corrections.banding_width {
             cards.push(format!("BANDWID = {width:>20}"));
