@@ -1,5 +1,6 @@
 package org.mjsolex.mobile;
 
+import android.app.ActivityManager;
 import android.app.NativeActivity;
 import android.content.ClipData;
 import android.content.Intent;
@@ -51,6 +52,16 @@ public final class MainActivity extends NativeActivity {
     public void setUiLanguage(String language) {
         getSharedPreferences("appearance", MODE_PRIVATE).edit()
             .putString("language", language).apply();
+    }
+
+    public long reconstructionMemoryHeadroom() {
+        ActivityManager manager = getSystemService(ActivityManager.class);
+        if (manager == null) {
+            return -1L;
+        }
+        ActivityManager.MemoryInfo memory = new ActivityManager.MemoryInfo();
+        manager.getMemoryInfo(memory);
+        return Math.max(0L, memory.availMem - memory.threshold);
     }
 
     private String uiText(String english, String chinese) {

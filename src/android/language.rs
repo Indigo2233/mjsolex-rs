@@ -79,6 +79,7 @@ impl Language {
             Error::DopplerCoverage => "当前扫描无法覆盖所选偏移处的两侧谱翼。".into(),
             Error::DopplerDispersion => "请先设定波长色散和方向。".into(),
             Error::OutputTooLarge => "重建图像的像素数超过上限。".into(),
+            Error::InsufficientMemory => "当前可用内存不足，暂时无法重建此扫描。".into(),
             Error::InvalidStride => "帧间距至少为 1。".into(),
             Error::Allocation(_) => "可用内存不足，无法处理此录制。".into(),
             Error::Cancelled => "处理已取消。".into(),

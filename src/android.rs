@@ -4,6 +4,7 @@ use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align, Color32, ColorImage, Context, RichText, Sense, Stroke, TextureHandle,
@@ -17,14 +18,13 @@ use rustix::io::Errno;
 use winit::platform::android::activity::AndroidApp;
 
 use crate::android_document::DocumentFile;
-use crate::reconstruct::{MAX_DOPPLER_WING_PIXELS, MAX_PIXELS};
+use crate::processing_memory::ProcessingMemory;
 use crate::ser::cache_recording;
 use crate::{
     APP_NAME, BandingAxis, ByteOrder, DiskGeometry, DisplayImage, DisplaySettings, DisplayTone,
     Error, FitsMetadata, Framing, Header, LineProfile, LocalContrast, NegativeOptions, Observation,
     OpticalSetup, PhysicalFlat, Product, Reconstruction, ScanSettings, SerReader, Spectrum,
-    Stretch, Trace, reconstruct_eclipse, reconstruct_negative_with_options, reconstruct_offsets,
-    reconstruct_with_stride,
+    Stretch, Trace,
 };
 
 mod language;
@@ -272,6 +272,8 @@ struct Mobile {
     shift: f64,
     calibration: Calibration,
     stride: u32,
+    processing_memory: ProcessingMemory,
+    memory_checked_at: Option<Instant>,
     processing: ProcessingOptions,
     flat_mode: FlatMode,
     physical_flat: Option<(Arc<PhysicalFlat>, String)>,
@@ -480,6 +482,22 @@ fn activity_events(env: &JNIEnv<'_>, activity: &JObject<'_>) -> Option<Events> {
     matches!(env.is_same_object(activity, owner.as_obj()), Ok(true)).then_some(events)
 }
 
+fn read_processing_memory(env: &mut JNIEnv<'_>, activity: &JObject<'_>) -> ProcessingMemory {
+    let reading = env.with_local_frame(4, |env| {
+        env.call_method(activity, "reconstructionMemoryHeadroom", "()J", &[])?
+            .j()
+    });
+    match reading {
+        Ok(bytes) => ProcessingMemory(u64::try_from(bytes).ok()),
+        Err(error) => {
+            if matches!(error, jni::errors::Error::JavaException) {
+                let _ = env.exception_clear();
+            }
+            ProcessingMemory::default()
+        }
+    }
+}
+
 impl Mobile {
     fn new(
         vm: JavaVM,
@@ -523,6 +541,8 @@ impl Mobile {
             shift: 0.,
             calibration: Calibration::default(),
             stride: 1,
+            processing_memory: ProcessingMemory::default(),
+            memory_checked_at: None,
             processing: ProcessingOptions::default(),
             flat_mode: FlatMode::default(),
             physical_flat: None,
@@ -714,11 +734,18 @@ impl Mobile {
         );
     }
 
-    fn minimum_stride(&self, header: Header) -> u32 {
-        if self.doppler_shift().is_ok_and(|shift| shift.is_some()) {
-            header.minimum_doppler_stride()
-        } else {
-            header.minimum_stride()
+    fn refresh_processing_memory(&mut self, force: bool) {
+        let now = Instant::now();
+        if force
+            || self
+                .memory_checked_at
+                .is_none_or(|checked| now - checked >= Duration::from_secs(10))
+        {
+            self.processing_memory = self.vm.attach_current_thread().map_or_else(
+                |_| ProcessingMemory::default(),
+                |mut env| read_processing_memory(&mut env, self.activity.as_obj()),
+            );
+            self.memory_checked_at = Some(now);
         }
     }
 
@@ -764,11 +791,13 @@ impl Mobile {
         let (wavelength, manual_dispersion) = self.calibration.edited_numeric_values()?;
         self.calibration.wavelength = wavelength;
         self.calibration.manual_dispersion = manual_dispersion;
+        self.refresh_processing_memory(true);
         Some(ReconstructionOptions {
             wavelength,
             dispersion: self.calibration.dispersion(),
             shift: self.shift,
             stride: self.stride,
+            memory: self.processing_memory,
             doppler: self.doppler,
             wing_offset: self.wing_offset,
             palettes: self.palettes,
@@ -1030,7 +1059,7 @@ impl Mobile {
                             self.calibration.clear_line();
                             self.calibration.manual_dispersion = 0.;
                             self.calibration.dispersion_input.clear();
-                            self.stride = header.minimum_stride();
+                            self.stride = 1;
                             self.physical_flat = None;
                             if self.flat_mode == FlatMode::Physical {
                                 self.flat_mode = FlatMode::Off;

@@ -222,6 +222,7 @@ impl Mobile {
                     )
                     .and_then(|(file, _, order)| {
                         let file = seekable_document(file, &cache, cancel)?;
+                        scan_options.memory = read_processing_memory(&mut env, activity.as_obj());
                         reconstruct_scan(&file, name, order, &reference, &scan_options, |p| {
                             scan_progress(p * 0.85)
                         })

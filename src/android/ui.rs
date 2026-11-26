@@ -475,6 +475,9 @@ impl Mobile {
     }
 
     fn spectrum_page(&mut self, ui: &mut Ui) {
+        if !self.busy() {
+            self.refresh_processing_memory(false);
+        }
         let Some(scan) = &self.scan else { return };
         let header = scan.header;
         let busy = self.busy();
@@ -784,7 +787,15 @@ impl Mobile {
                 scan_options(ui, &mut self.processing.scan, lang);
                 framing_options(ui, &mut self.processing.framing, lang);
             });
-            let minimum = self.minimum_stride(header);
+            let wings = self.doppler_shift().is_ok_and(|shift| shift.is_some());
+            let budget = self
+                .processing
+                .image_budget(self.processing_memory, header, wings);
+            if budget < header.width {
+                ui.label(RichText::new(lang.error(&Error::InsufficientMemory)).color(MUTED));
+                return;
+            }
+            let minimum = header.stride_for_budget(budget);
             let mut stride = self.stride.max(minimum);
             if minimum > 1 || stride > 1 {
                 let summary = match lang {
@@ -818,6 +829,14 @@ impl Mobile {
                     Language::Chinese => format!("校正前尺寸为 {width} × {height} px"),
                 };
                 ui.label(RichText::new(size).color(MUTED));
+                let megapixels = budget as f64 / 1_000_000.;
+                let limit = match lang {
+                    Language::English => {
+                        format!("Current processing limit · {megapixels:.1} MP per image")
+                    }
+                    Language::Chinese => format!("当前处理上限 · 每张 {megapixels:.1} 百万像素"),
+                };
+                ui.label(RichText::new(limit).color(MUTED));
             });
         });
     }

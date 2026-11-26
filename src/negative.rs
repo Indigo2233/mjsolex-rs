@@ -48,9 +48,18 @@ pub fn reconstruct_negative(
 pub fn reconstruct_negative_with_options(
     image: &Reconstruction,
     options: NegativeOptions,
+    progress: impl FnMut(f32) -> bool,
+) -> Result<Reconstruction, Error> {
+    reconstruct_negative_with_budget(image, options, MAX_PIXELS, progress)
+}
+
+pub(crate) fn reconstruct_negative_with_budget(
+    image: &Reconstruction,
+    options: NegativeOptions,
+    max_pixels: usize,
     mut progress: impl FnMut(f32) -> bool,
 ) -> Result<Reconstruction, Error> {
-    checked_pixel_count(image)?;
+    checked_pixel_count(image, max_pixels)?;
     if !progress(0.) {
         return Err(Error::Cancelled);
     }
@@ -73,9 +82,17 @@ pub fn reconstruct_negative_with_options(
 /// Mask a fitted solar disk and show off-limb prominences in high contrast.
 pub fn reconstruct_eclipse(
     image: &Reconstruction,
+    progress: impl FnMut(f32) -> bool,
+) -> Result<Reconstruction, Error> {
+    reconstruct_eclipse_with_budget(image, MAX_PIXELS, progress)
+}
+
+pub(crate) fn reconstruct_eclipse_with_budget(
+    image: &Reconstruction,
+    max_pixels: usize,
     mut progress: impl FnMut(f32) -> bool,
 ) -> Result<Reconstruction, Error> {
-    let count = checked_pixel_count(image)?;
+    let count = checked_pixel_count(image, max_pixels)?;
     if !progress(0.) {
         return Err(Error::Cancelled);
     }
@@ -98,12 +115,12 @@ pub fn reconstruct_eclipse(
     to_u16(image, data, &mut progress)
 }
 
-fn checked_pixel_count(image: &Reconstruction) -> Result<usize, Error> {
+fn checked_pixel_count(image: &Reconstruction, max_pixels: usize) -> Result<usize, Error> {
     let count = image
         .width
         .checked_mul(image.height)
         .ok_or(Error::OutputTooLarge)?;
-    if count > MAX_PIXELS {
+    if count > max_pixels {
         return Err(Error::OutputTooLarge);
     }
     if count == 0 || image.pixels.len() != count {
@@ -169,7 +186,7 @@ fn reconstruct_fallback_negative(
         data,
         width,
         height,
-        FALLBACK_TILE_SIZE,
+        FALLBACK_TILE_SIZE.max(width.max(height).div_ceil(256)),
         FALLBACK_BINS,
         FALLBACK_CLIP,
         &mut |p| progress(0.05 + 0.75 * p),

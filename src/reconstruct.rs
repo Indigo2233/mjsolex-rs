@@ -32,8 +32,8 @@ impl Header {
         self.stride_for_budget(MAX_DOPPLER_WING_PIXELS)
     }
 
-    fn stride_for_budget(self, budget: usize) -> u32 {
-        let rows = (budget / self.width.max(1)).max(1) as u32;
+    pub(crate) fn stride_for_budget(self, budget: usize) -> u32 {
+        let rows = u32::try_from((budget / self.width.max(1)).max(1)).unwrap_or(u32::MAX);
         self.frames.div_ceil(rows).max(1)
     }
 }
@@ -121,6 +121,17 @@ pub fn reconstruct_offsets<R: Read + Seek, const N: usize>(
     trace: Trace,
     shifts: [f64; N],
     stride: u32,
+    progress: impl FnMut(f32) -> bool,
+) -> Result<[Reconstruction; N], Error> {
+    reconstruct_offsets_with_budget(reader, trace, shifts, stride, MAX_PIXELS, progress)
+}
+
+pub(crate) fn reconstruct_offsets_with_budget<R: Read + Seek, const N: usize>(
+    reader: &mut SerReader<R>,
+    trace: Trace,
+    shifts: [f64; N],
+    stride: u32,
+    total_pixels: usize,
     mut progress: impl FnMut(f32) -> bool,
 ) -> Result<[Reconstruction; N], Error> {
     let header = reader.header();
@@ -131,7 +142,7 @@ pub fn reconstruct_offsets<R: Read + Seek, const N: usize>(
     let frames = header.frames.div_ceil(stride);
     let height = frames as usize;
     let size = width.checked_mul(height).ok_or(Error::OutputTooLarge)?;
-    if size.checked_mul(N).is_none_or(|count| count > MAX_PIXELS) {
+    if size.checked_mul(N).is_none_or(|count| count > total_pixels) {
         return Err(Error::OutputTooLarge);
     }
     if N == 0 || shifts.iter().any(|shift| !shift.is_finite()) || trace.width() != width {

@@ -9,6 +9,8 @@ mod geometry;
 mod negative;
 mod observation;
 mod optics;
+#[cfg(any(target_os = "android", test))]
+mod processing_memory;
 mod profile;
 mod reconstruct;
 mod regression;
@@ -81,6 +83,8 @@ pub enum Error {
     DopplerDispersion,
     #[error("The reconstruction exceeds the supported pixel budget.")]
     OutputTooLarge,
+    #[error("Available memory is too low to reconstruct this scan.")]
+    InsufficientMemory,
     #[error("The frame interval must be at least one.")]
     InvalidStride,
     #[error("Insufficient memory for this scan.")]

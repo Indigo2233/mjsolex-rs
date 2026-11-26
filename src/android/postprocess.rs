@@ -1,4 +1,6 @@
 use super::*;
+use crate::negative::{reconstruct_eclipse_with_budget, reconstruct_negative_with_budget};
+use crate::reconstruct::{reconstruct_offsets_with_budget, transform_image_count};
 use crate::scan_correction::ScanPlan;
 
 #[derive(Clone, Copy)]
@@ -27,6 +29,21 @@ impl Default for ProcessingOptions {
             invert_prominences: false,
             prominence_strength: 100,
         }
+    }
+}
+
+impl ProcessingOptions {
+    pub(super) fn image_budget(
+        self,
+        memory: ProcessingMemory,
+        header: Header,
+        wings: bool,
+    ) -> usize {
+        memory.image_pixels(
+            header,
+            wings,
+            usize::from(self.negative) + usize::from(self.eclipse),
+        )
     }
 }
 
@@ -109,6 +126,7 @@ pub(super) struct ReconstructionOptions {
     pub(super) dispersion: Option<f64>,
     pub(super) shift: f64,
     pub(super) stride: u32,
+    pub(super) memory: ProcessingMemory,
     pub(super) doppler: bool,
     pub(super) wing_offset: f64,
     pub(super) palettes: [bool; 3],
@@ -150,11 +168,15 @@ impl ReconstructionOptions {
             Ok(offset) => (offset, None),
             Err(error) => (None, Some(error)),
         };
-        let stride = self.stride.max(if wing_shift.is_some() {
-            header.minimum_doppler_stride()
-        } else {
-            header.minimum_stride()
-        });
+        let wings_enabled = wing_shift.is_some();
+        let budget = self
+            .processing
+            .image_budget(self.memory, header, wings_enabled);
+        if budget < header.width {
+            return Err(Error::InsufficientMemory);
+        }
+        let stride = self.stride.max(header.stride_for_budget(budget));
+        let total_pixels = budget * transform_image_count(wings_enabled);
         let mut metadata = FitsMetadata {
             observation: reader.observation().clone(),
             source_name: Some(name),
@@ -178,18 +200,24 @@ impl ReconstructionOptions {
         };
         let shift = self.shift;
         let (mut center, mut wings) = if let Some(wing) = wing_shift {
-            let [center, red, blue] = reconstruct_offsets(
+            let [center, red, blue] = reconstruct_offsets_with_budget(
                 &mut reader,
                 trace,
                 [shift, shift + wing, shift - wing],
                 stride,
+                total_pixels,
                 |p| progress(p * flat_start),
             )?;
             (center, Some([red, blue]))
         } else {
-            let center = reconstruct_with_stride(&mut reader, trace, shift, stride, |p| {
-                progress(p * flat_start)
-            })?;
+            let [center] = reconstruct_offsets_with_budget(
+                &mut reader,
+                trace,
+                [shift],
+                stride,
+                total_pixels,
+                |p| progress(p * flat_start),
+            )?;
             (center, None)
         };
         drop(reader);
@@ -224,25 +252,21 @@ impl ReconstructionOptions {
             negative: None,
             eclipse: None,
         };
-        finish(&mut images, self.processing, &mut warnings, |p| {
+        finish(&mut images, self.processing, budget, &mut warnings, |p| {
             progress(corrections_start + (1. - corrections_start) * p)
         })?;
         Ok((images, warnings))
     }
 }
 
-pub(super) fn finish(
+fn finish(
     images: &mut Images,
     options: ProcessingOptions,
+    budget: usize,
     warnings: &mut CorrectionWarnings,
     mut progress: impl FnMut(f32) -> bool,
 ) -> Result<(), Error> {
     let count = images.count() as f32;
-    let budget = if images.wings.is_some() {
-        MAX_DOPPLER_WING_PIXELS
-    } else {
-        MAX_PIXELS
-    };
     if options.scan.enabled() {
         match ScanPlan::prepare(&images.center, options.scan, |p| progress(0.18 * p)) {
             Ok(plan) => {
@@ -332,7 +356,7 @@ pub(super) fn finish(
             invert_prominences: options.invert_prominences,
             prominence_strength: options.prominence_strength,
         };
-        match reconstruct_negative_with_options(&images.center, negative_options, |p| {
+        match reconstruct_negative_with_budget(&images.center, negative_options, budget, |p| {
             progress(start + step * p)
         }) {
             Ok(negative) => images.negative = Some(negative),
@@ -342,7 +366,9 @@ pub(super) fn finish(
         start += step;
     }
     if options.eclipse {
-        match reconstruct_eclipse(&images.center, |p| progress(start + step * p)) {
+        match reconstruct_eclipse_with_budget(&images.center, budget, |p| {
+            progress(start + step * p)
+        }) {
             Ok(eclipse) => images.eclipse = Some(eclipse),
             Err(Error::Cancelled) => return Err(Error::Cancelled),
             Err(error) => warnings.eclipse = Some(error),
