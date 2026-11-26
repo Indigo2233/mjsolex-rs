@@ -637,9 +637,6 @@ impl Mobile {
             }
             ui.add_enabled_ui(!busy, |ui| {
                 ui.label(lang.text("Additional images", "附加图像"));
-                let reconstructed_rows = header.frames.div_ceil(self.stride.max(1));
-                let may_exceed_budget = (header.width as u64 * reconstructed_rows as u64)
-                    > crate::negative::NEGATIVE_PIXEL_BUDGET as u64;
                 ui.horizontal_wrapped(|ui| {
                     for (product, selected) in PALETTES
                         .into_iter()
@@ -657,15 +654,6 @@ impl Mobile {
                         }
                     }
                 });
-                if may_exceed_budget && (self.processing.negative || self.processing.eclipse) {
-                    ui.label(
-                        RichText::new(lang.text(
-                            "Negative and eclipse images need at most 8 Mi corrected pixels.",
-                            "校正后图像超过 838 万像素时，将跳过负片和模拟日食。",
-                        ))
-                        .color(MUTED),
-                    );
-                }
                 if self.processing.negative {
                     ui.checkbox(
                         &mut self.processing.invert_prominences,
@@ -1042,8 +1030,8 @@ fn scan_options(ui: &mut Ui, scan: &mut ScanSettings, lang: Language) {
         if scan.jagged {
             ui.label(
                 RichText::new(lang.text(
-                    "Rows are shifted when both limbs show a consistent displacement.",
-                    "两侧盘缘显示一致位移时，才对齐扫描行。",
+                    "Uses both limbs to correct local row shifts and changes in disk width.",
+                    "根据两侧盘缘校正扫描行的局部横移和宽度变化。",
                 ))
                 .color(MUTED),
             );

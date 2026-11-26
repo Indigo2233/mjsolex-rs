@@ -68,7 +68,8 @@ mod model {
     struct Motion {
         wave: Option<Wave>,
         start: usize,
-        rows: Vec<f64>,
+        rows: Vec<[f64; 2]>,
+        disk: FittedDisk,
     }
 
     #[derive(Clone, Copy)]
@@ -158,18 +159,24 @@ mod model {
                 }
                 if let Some(motion) = &self.motion {
                     let periodic = motion.wave.map_or(0., |wave| wave.shift(y));
-                    let local = motion
+                    let [left, right] = motion
                         .rows
                         .get(y.wrapping_sub(motion.start))
                         .copied()
-                        .unwrap_or(0.);
-                    let shift = periodic + local;
-                    if shift.abs() < 0.01 {
+                        .unwrap_or([0.; 2]);
+                    let shift = periodic + (left + right) / 2.;
+                    let half_width_change = (right - left) / 2.;
+                    if shift.abs() + half_width_change.abs() < 0.01 {
                         continue;
                     }
                     source.copy_from_slice(row);
+                    let (center, half) = motion.disk.chord(y as f64);
+                    let slope = half_width_change / half.max(1.);
                     for (x, target) in row.iter_mut().enumerate() {
-                        *target = sample_line(&source, x as f64 + shift);
+                        // Outside the measured chord, carry the nearer limb's displacement.
+                        let x = x as f64;
+                        let stretch = slope * (x - center).clamp(-half, half);
+                        *target = sample_line(&source, x + shift + stretch);
                     }
                 }
             }
@@ -354,13 +361,14 @@ mod model {
         settings: ScanSettings,
         mut progress: impl FnMut(f32) -> bool,
     ) -> Result<Option<Motion>, Error> {
-        let (_, threshold) = limb_levels(&image.pixels).ok_or(Error::NoSolarLimb)?;
-        let range = disk_range(
-            disk.center_y,
-            disk.geometry.scan_radius * 0.90,
-            image.height,
-        );
-        let limit = (0.10 * disk.geometry.slit_radius).clamp(3., 32.);
+        let (sky, threshold) = limb_levels(&image.pixels).ok_or(Error::NoSolarLimb)?;
+        let scan_extent = disk.geometry.scan_radius * if settings.jagged { 0.985 } else { 0.90 };
+        let range = disk_range(disk.center_y, scan_extent, image.height);
+        let limit =
+            (0.10 * disk.geometry.slit_radius).clamp(3., if settings.jagged { 128. } else { 32. });
+        let sky = f64::from(sky);
+        let contrast = (threshold - sky) / 0.20;
+        let thresholds = [0.16, 0.23, 0.30, 0.37, 0.44, 0.50].map(|level| sky + level * contrast);
         let mut edges = Vec::with_capacity(range.len());
         for y in range.clone() {
             checkpoint(progress(
@@ -368,7 +376,22 @@ mod model {
             ))?;
             let row = &image.pixels[y * image.width..(y + 1) * image.width];
             let (mid, half) = disk.chord(y as f64);
-            let offsets = chord_edges(row, threshold).and_then(|(left, right)| {
+            let measured = if settings.jagged && half >= 12. {
+                // A range of brightness levels follows the limb transition and
+                // reduces shifts caused by a single noisy intensity crossing.
+                thresholds
+                    .iter()
+                    .try_fold((0., 0.), |(left, right), &level| {
+                        let (a, b) = chord_edges(row, level)?;
+                        Some((
+                            left + a / thresholds.len() as f64,
+                            right + b / thresholds.len() as f64,
+                        ))
+                    })
+            } else {
+                chord_edges(row, threshold)
+            };
+            let offsets = measured.and_then(|(left, right)| {
                 let offsets = [left - (mid - half), right - (mid + half)];
                 (half >= 12. && offsets.iter().all(|v| v.abs() <= limit)).then_some(offsets)
             });
@@ -389,47 +412,49 @@ mod model {
         }
         let mut rows = Vec::new();
         if settings.jagged {
-            const NEIGHBOR_RADIUS: usize = 8;
-            const MIN_SHIFT: f64 = 0.55;
-            rows.resize(edges.len(), 0.);
+            const MIN_SHIFT: f64 = 0.45;
+            let neighbor_radius = (disk.geometry.scan_radius / 90.).round().clamp(8., 16.) as usize;
+            let neighbor_scale = (neighbor_radius + 1) as f64;
+            let max_shift = (0.008 * disk.geometry.slit_radius).clamp(2., 12.);
+            rows.resize(edges.len(), [0.; 2]);
             let mut candidates = 0;
             let mut coherent = 0;
             for (i, &edge) in edges.iter().enumerate() {
                 checkpoint(progress(0.85 + 0.15 * i as f32 / edges.len() as f32))?;
                 let Some(edge) = edge else { continue };
-                let neighbors = &edges
-                    [i.saturating_sub(NEIGHBOR_RADIUS)..(i + NEIGHBOR_RADIUS + 1).min(edges.len())];
-                let mut samples = [[0.; 2 * NEIGHBOR_RADIUS + 1]; 2];
-                let mut count = 0;
-                for &[left, right] in neighbors.iter().flatten() {
-                    samples[0][count] = left;
-                    samples[1][count] = right;
-                    count += 1;
-                }
-                if count < 7 {
+                let start = i.saturating_sub(neighbor_radius);
+                let neighbors = &edges[start..(i + neighbor_radius + 1).min(edges.len())];
+                if neighbors.iter().flatten().count() < 7 {
                     continue;
                 }
-                let [left, right] = std::array::from_fn(|side| {
-                    let median = *samples[side][..count]
-                        .select_nth_unstable_by(count / 2, f64::total_cmp)
-                        .1;
-                    edge[side] - median
+                // Smooth deviations from the ellipse so its sharp curvature near
+                // the poles does not get mistaken for scan motion.
+                let offsets = std::array::from_fn(|side| {
+                    let samples = neighbors.iter().enumerate().filter_map(|(j, pair)| {
+                        let x = (start as f64 + j as f64 - i as f64) / neighbor_scale;
+                        Some(([1., x], (*pair)?[side], (1. - x * x).powi(2)))
+                    });
+                    weighted_fit(samples).map_or(0., |[baseline, _]| edge[side] - baseline)
                 });
-                if left.abs().max(right.abs()) >= MIN_SHIFT {
+                let [left, right] = offsets.map(f64::abs);
+                let peak = left.max(right);
+                let shared = left.min(right);
+                if peak >= MIN_SHIFT {
                     candidates += 1;
                 }
-                let shared = left.abs().min(right.abs());
-                // A true scan displacement moves both limbs together. A prominence can
-                // extend a single threshold crossing and bias an independent edge fit.
-                if left * right > 0.
-                    && shared >= MIN_SHIFT
-                    && (left - right).abs() <= 0.45 + 0.65 * shared
-                {
-                    rows[i] = shared.min(limit / 2.).copysign(left);
+                if shared >= MIN_SHIFT && peak <= 0.65 + 1.8 * shared {
                     coherent += 1;
                 }
+                // Unequal limb shifts can change the chord width. Suppress large
+                // changes that have little support on the opposite limb.
+                let (_, half) = disk.chord((range.start + i) as f64);
+                let supported = (1.5 + 2. * shared).min(max_shift).min(0.25 * half);
+                let strength = (supported / peak.max(supported)).powi(2);
+                let distance = (range.start as f64 + i as f64 - disk.center_y).abs();
+                let taper = ((scan_extent - distance) / neighbor_radius as f64).clamp(0., 1.);
+                rows[i] = offsets.map(|offset| offset * strength * taper);
             }
-            // Require repeatable evidence when most apparent shifts disagree across the disk.
+            // Require repeatable variation on both limbs before changing the image.
             if coherent < 4 || 8 * coherent < candidates {
                 rows.clear();
             }
@@ -438,6 +463,7 @@ mod model {
             wave,
             start: range.start,
             rows,
+            disk,
         }))
     }
 
@@ -524,13 +550,21 @@ mod tests {
         shift: impl Fn(usize) -> f64,
         response: impl Fn(usize, usize) -> f64,
     ) -> Reconstruction {
+        distorted_disk(|y| [shift(y), 0.], response)
+    }
+
+    fn distorted_disk(
+        distortion: impl Fn(usize) -> [f64; 2],
+        response: impl Fn(usize, usize) -> f64,
+    ) -> Reconstruction {
         let (width, height) = (256, 240);
         let pixels = (0..width * height)
             .map(|i| {
                 let (x, y) = (i % width, i / width);
                 let dy = (y as f64 - 119.5) / 86.;
-                let half = 88. * (1. - dy * dy).max(0.).sqrt();
-                let lx = x as f64 - 127.5 - shift(y);
+                let [shift, expansion] = distortion(y);
+                let half = 88. * (1. - dy * dy).max(0.).sqrt() + expansion;
+                let lx = x as f64 - 127.5 - shift;
                 let coverage = if dy.abs() < 1. {
                     (half - lx.abs() + 0.5).clamp(0., 1.)
                 } else {
@@ -612,6 +646,49 @@ mod tests {
         assert!(!plan.report.jagged);
         plan.apply(&mut image, |_| true).unwrap();
         assert_eq!(image.pixels, original);
+    }
+
+    #[test]
+    fn corrects_chord_width_changes_without_shifting_the_scan_center() {
+        let clean = disk(|_| 0., |_, _| 1.);
+        let mut image = distorted_disk(
+            |y| [0., [0., 2.1, -1.8, 0., 1.3, -2.5, 0.][y % 7]],
+            |_, _| 1.,
+        );
+        let width_error = |image: &Reconstruction| {
+            let (_, threshold) = limb_levels(&image.pixels).unwrap();
+            image
+                .pixels
+                .chunks_exact(image.width)
+                .zip(clean.pixels.chunks_exact(clean.width))
+                .skip(57)
+                .take(126)
+                .map(|(row, reference)| {
+                    let (left, right) = chord_edges(row, threshold).unwrap();
+                    let (ref_left, ref_right) = chord_edges(reference, threshold).unwrap();
+                    ((right - left) - (ref_right - ref_left)).abs()
+                })
+                .sum::<f64>()
+                / 126.
+        };
+        let before = width_error(&image);
+        let plan = ScanPlan::prepare(
+            &image,
+            ScanSettings {
+                jagged: true,
+                ..Default::default()
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert!(plan.report.jagged);
+        plan.apply(&mut image, |_| true).unwrap();
+        let after = width_error(&image);
+        assert!(
+            after < 0.55 * before,
+            "mean chord width error {before} -> {after}"
+        );
+        assert!(edge_error(&image) < 0.1);
     }
 
     fn banding_error(clean: &Reconstruction, image: &Reconstruction) -> f64 {

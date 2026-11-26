@@ -1,4 +1,5 @@
 use crate::geometry::FittedDisk;
+use crate::reconstruct::MAX_PIXELS;
 use crate::{Error, Reconstruction};
 
 mod sky;
@@ -15,7 +16,6 @@ const FALLBACK_TILE_SIZE: usize = 128;
 const FALLBACK_BINS: usize = 512;
 const FALLBACK_CLIP: f64 = 0.8;
 const SHARPEN_KERNEL: usize = 7;
-pub(crate) const NEGATIVE_PIXEL_BUDGET: usize = 8 * 1024 * 1024;
 const PROGRESS_CHUNK_PIXELS: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +94,7 @@ pub fn reconstruct_eclipse(
         &mut data,
         &mut progress,
     )?;
+    drop(mask);
     to_u16(image, data, &mut progress)
 }
 
@@ -102,7 +103,7 @@ fn checked_pixel_count(image: &Reconstruction) -> Result<usize, Error> {
         .width
         .checked_mul(image.height)
         .ok_or(Error::OutputTooLarge)?;
-    if count > NEGATIVE_PIXEL_BUDGET {
+    if count > MAX_PIXELS {
         return Err(Error::OutputTooLarge);
     }
     if count == 0 || image.pixels.len() != count {
@@ -128,18 +129,16 @@ fn reconstruct_disk_negative(
         *value = inverse.powi(CONTRAST_EXPONENT) * MAX_PIXEL_VALUE as f32;
     })?;
 
-    let mut sharpened = try_vec(data.len())?;
-    sharpen_7x7(&data, source.width, &mask, &mut sharpened, progress)?;
-    drop(data);
+    sharpen_7x7(&mut data, source.width, &mask, progress)?;
 
-    let (minimum, maximum) = disk_bounds(&sharpened, &mask, progress, 0.55, 0.62)?;
+    let (minimum, maximum) = disk_bounds(&data, &mask, progress, 0.55, 0.62)?;
     if maximum > minimum {
         let scale = MAX_PIXEL_VALUE as f32 / (maximum - minimum);
-        for_each_chunk(&mut sharpened, progress, 0.62, 0.68, |value| {
+        for_each_chunk(&mut data, progress, 0.62, 0.68, |value| {
             *value = ((*value - minimum) * scale).clamp(0., MAX_PIXEL_VALUE as f32);
         })?;
     }
-    auto_stretch(&mut sharpened, &mask, progress)?;
+    auto_stretch(&mut data, &mask, progress)?;
     let background =
         sky::SkyProfile::estimate(source, &mask, sky_level, |p| progress(0.8 + 0.05 * p))?;
     composite_prominences(
@@ -147,10 +146,10 @@ fn reconstruct_disk_negative(
         &mask,
         &background,
         ProminenceStyle::Natural(options),
-        &mut sharpened,
+        &mut data,
         progress,
     )?;
-    Ok(sharpened)
+    Ok(data)
 }
 
 fn reconstruct_fallback_negative(
@@ -370,16 +369,12 @@ fn apply_transfer_chunked(
 }
 
 fn sharpen_7x7(
-    source: &[f32],
+    data: &mut [f32],
     width: usize,
     mask: &DiskMask,
-    output: &mut Vec<f32>,
     progress: &mut impl FnMut(f32) -> bool,
 ) -> Result<(), Error> {
-    if width == 0 || !source.len().is_multiple_of(width) {
-        return Err(Error::InvalidTrace);
-    }
-    let height = source.len() / width;
+    let height = data.len() / width;
     let radius = SHARPEN_KERNEL / 2;
     let mut rows = try_vec(SHARPEN_KERNEL * width)?;
     rows.resize(SHARPEN_KERNEL * width, 0.);
@@ -388,14 +383,12 @@ fn sharpen_7x7(
     for slot in 0..SHARPEN_KERNEL {
         let source_y = slot.saturating_sub(radius).min(height - 1);
         let values = &mut rows[slot * width..(slot + 1) * width];
-        horizontal_row(source, source_y, width, radius, values);
+        horizontal_row(data, source_y, width, radius, values);
         for (sum, value) in vertical.iter_mut().zip(values.iter()) {
             *sum += value;
         }
     }
 
-    output.try_reserve_exact(source.len())?;
-    output.resize(source.len(), 0.);
     let neighbor_weight = 1. / (SHARPEN_KERNEL * SHARPEN_KERNEL - 1) as f32;
     // Fade sharpening before the kernel begins to include sky pixels.
     let limb_margin =
@@ -407,13 +400,12 @@ fn sharpen_7x7(
     for y in 0..height {
         for (x, &column_sum) in vertical.iter().enumerate() {
             let i = y * width + x;
-            let center = source[i];
-            output[i] = center;
             if mask.coverage[i] == 16 {
+                let center = data[i];
                 let radius = mask.radius_squared(x as f64, y as f64);
                 let strength = ((limit - radius) / transition).clamp(0., 1.) as f32;
                 let neighbor_average = (column_sum - center) * neighbor_weight;
-                output[i] += strength * (center - neighbor_average);
+                data[i] += strength * (center - neighbor_average);
             }
         }
         if y % 16 == 0 && !progress(0.23 + 0.32 * y as f32 / height as f32) {
@@ -424,8 +416,10 @@ fn sharpen_7x7(
             for (sum, value) in vertical.iter_mut().zip(values.iter()) {
                 *sum -= value;
             }
+            // The rolling buffer keeps the original sums for the rows already sharpened.
+            // The next input row is always below the row just written, even at the border.
             let incoming = (y + radius + 1).min(height - 1);
-            horizontal_row(source, incoming, width, radius, values);
+            horizontal_row(data, incoming, width, radius, values);
             for (sum, value) in vertical.iter_mut().zip(values.iter()) {
                 *sum += value;
             }
@@ -1015,7 +1009,7 @@ mod tests {
             Err(Error::Cancelled)
         ));
         let oversized = Reconstruction {
-            width: NEGATIVE_PIXEL_BUDGET + 1,
+            width: MAX_PIXELS + 1,
             height: 1,
             pixels: Vec::new(),
             synthetic_flat: false,
@@ -1029,10 +1023,24 @@ mod tests {
     }
 
     #[test]
+    fn postprocessing_accepts_images_above_eight_mipixels() {
+        let (width, height) = (4096, 2049);
+        let source = reconstruction(width, height, vec![0; width * height]);
+        assert!(matches!(
+            reconstruct_negative(&source, |_| false),
+            Err(Error::Cancelled)
+        ));
+        assert!(matches!(
+            reconstruct_eclipse(&source, |_| false),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
     fn disk_mask_cancels_during_a_full_budget_build() {
         let width = 4096;
-        let height = NEGATIVE_PIXEL_BUDGET / width;
-        assert_eq!(width * height, NEGATIVE_PIXEL_BUDGET);
+        let height = MAX_PIXELS / width;
+        assert_eq!(width * height, MAX_PIXELS);
         let source = reconstruction(width, height, vec![0; width * height]);
         let disk = FittedDisk {
             geometry: crate::DiskGeometry {
