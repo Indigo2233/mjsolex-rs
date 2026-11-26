@@ -31,6 +31,8 @@ pub struct ScanReport {
     /// Global attenuation of the signal above the sky pedestal during banding correction.
     pub banding_scale: Option<f64>,
     pub banding_width: Option<u8>,
+    /// Number of slit columns that received an additional bright-band correction.
+    pub bright_columns: usize,
     pub jagged: bool,
     /// Fitted period in reconstructed scan rows and amplitude in slit pixels.
     pub oscillation: Option<(f64, f64)>,
@@ -57,6 +59,7 @@ mod model {
         start: usize,
         gains: Vec<f64>,
         scale: f64,
+        bright_columns: usize,
     }
 
     impl BandCorrection {
@@ -111,14 +114,9 @@ mod model {
                 .enumerate()
             {
                 if settings.banding == axis || settings.banding == BandingAxis::Both {
-                    banding[i] = banding_model(
-                        image,
-                        &disk,
-                        axis,
-                        half_window,
-                        settings.banding == BandingAxis::Both,
-                        |p| progress((i as f32 + p) * 0.125),
-                    )?;
+                    banding[i] = banding_model(image, &disk, axis, half_window, settings, |p| {
+                        progress((i as f32 + p) * 0.125)
+                    })?;
                 }
             }
             let banding_axis = match (banding[0].is_some(), banding[1].is_some()) {
@@ -139,6 +137,7 @@ mod model {
                     .then(|| banding.iter().flatten().map(|model| model.scale).product()),
                 banding_width: (banding_axis != BandingAxis::Off)
                     .then_some((2 * half_window + 1) as u8),
+                bright_columns: banding[0].as_ref().map_or(0, |model| model.bright_columns),
                 jagged: motion.as_ref().is_some_and(|m| !m.rows.is_empty()),
                 oscillation: motion.as_ref().and_then(|m| m.wave).map(|wave| {
                     (
@@ -256,10 +255,11 @@ mod model {
         disk: &FittedDisk,
         axis: BandingAxis,
         half_window: usize,
-        automatic: bool,
+        settings: ScanSettings,
         mut progress: impl FnMut(f32) -> bool,
     ) -> Result<Option<BandCorrection>, Error> {
         let vertical = axis == BandingAxis::Slit;
+        let automatic = settings.banding == BandingAxis::Both;
         let g = disk.geometry;
         let tilted = g.shear * g.scan_radius;
         let projected_x = g.slit_radius.hypot(tilted);
@@ -368,7 +368,7 @@ mod model {
         let mut energy = [0_f64; 3];
         let mut covariance = [0_f64; 3];
         for (i, &measurement) in measurements.iter().enumerate() {
-            checkpoint(progress(0.85 + 0.15 * i as f32 / range.len() as f32))?;
+            checkpoint(progress(0.85 + 0.10 * i as f32 / range.len() as f32))?;
             let Some(measured) = measurement else {
                 continue;
             };
@@ -403,6 +403,13 @@ mod model {
         if !applied || (automatic && !(detected && coherent)) {
             return Ok(None);
         }
+        let bright_columns = if vertical && settings.banding_width.is_none() && half_window >= 24 {
+            refine_bright_columns(image, disk, range.clone(), &mut gains, half_window, |p| {
+                progress(0.95 + 0.05 * p)
+            })?
+        } else {
+            0
+        };
         // Keep the correction proportional above the sky level everywhere,
         // including the unmeasured rows or columns and all spectral offsets.
         let maximum = gains.iter().copied().fold(1., f64::max);
@@ -413,7 +420,120 @@ mod model {
             start: range.start,
             gains,
             scale: maximum.recip(),
+            bright_columns,
         }))
+    }
+
+    fn refine_bright_columns(
+        image: &Reconstruction,
+        disk: &FittedDisk,
+        range: std::ops::Range<usize>,
+        gains: &mut [f64],
+        half_window: usize,
+        mut progress: impl FnMut(f32) -> bool,
+    ) -> Result<usize, Error> {
+        // Use the same scan rows for every measured column. Keep the sample
+        // rectangle inside the limb even when the scan shears the image.
+        let g = disk.geometry;
+        let row_radius = 0.52 * g.scan_radius;
+        let limb_clearance = 0.85 * g.slit_radius - (g.shear * row_radius).abs();
+        let column_radius = (0.78 * g.slit_radius).min(limb_clearance).max(0.);
+        let core = disk_range(disk.center_x, column_radius, image.width);
+        let columns = core.start.max(range.start)..core.end.min(range.end);
+        let rows = disk_range(disk.center_y, row_radius, image.height);
+        let kernel_radius = 2 * half_window;
+        if columns.len() <= 2 * kernel_radius {
+            return Ok(0);
+        }
+        let mut profiles = Vec::with_capacity(columns.len());
+        const SECTOR_SAMPLES: usize = 64;
+        for x in columns.clone() {
+            checkpoint(progress(
+                0.5 * (x - columns.start) as f32 / columns.len() as f32,
+            ))?;
+            let gain = gains[x - range.start].ln();
+            let profile = |sector: usize| {
+                let y0 = rows.start + sector * rows.len() / 3;
+                let y1 = rows.start + (sector + 1) * rows.len() / 3;
+                let step = (y1 - y0).div_ceil(SECTOR_SAMPLES).max(1);
+                let mut values = [0; SECTOR_SAMPLES];
+                let mut count = 0;
+                for y in (y0..y1).step_by(step) {
+                    let sample = image.pixels[y * image.width + x];
+                    let signal = sample.saturating_sub(disk.sky);
+                    if signal > 4 && sample < 65_280 {
+                        values[count] = signal;
+                        count += 1;
+                    }
+                }
+                (count >= 8).then(|| {
+                    let median = *values[..count].select_nth_unstable(count / 2).1;
+                    f64::from(median).ln() + gain
+                })
+            };
+            profiles.push(
+                profile(0)
+                    .zip(profile(1))
+                    .zip(profile(2))
+                    .map(|((a, b), c)| [a, b, c]),
+            );
+        }
+        let sigma = 0.65 * half_window as f64;
+        let weights: Vec<_> = (-(kernel_radius as isize)..=kernel_radius as isize)
+            .map(|offset| (-0.5 * (offset as f64 / sigma).powi(2)).exp())
+            .collect();
+        let mut residuals = vec![(0., false); profiles.len()];
+        for i in kernel_radius..profiles.len() - kernel_radius {
+            checkpoint(progress(0.5 + 0.5 * i as f32 / profiles.len() as f32))?;
+            let Some(observed) = profiles[i] else {
+                continue;
+            };
+            let mut baseline = [0.; 3];
+            let mut total = 0.;
+            for (sample, &weight) in profiles[i - kernel_radius..=i + kernel_radius]
+                .iter()
+                .zip(&weights)
+            {
+                if let Some(sample) = sample {
+                    for (sum, value) in baseline.iter_mut().zip(sample) {
+                        *sum += weight * value;
+                    }
+                    total += weight;
+                }
+            }
+            let mut residual =
+                std::array::from_fn(|sector| observed[sector] - baseline[sector] / total);
+            residual.sort_by(f64::total_cmp);
+            let [low, median, high] = residual;
+            if low > 0.001 && low >= 0.22 * median && high - low <= 1.3 * median + 0.004 {
+                let strong =
+                    low > 0.0025 && low >= 0.4 * median && high - low <= 0.8 * median + 0.003;
+                residuals[i] = (
+                    (median - 0.001).clamp(0., if strong { 0.025 } else { 0.015 }),
+                    strong,
+                );
+            }
+        }
+        // A compact run needs a strongly supported core. Include its weaker
+        // shoulders so correction does not leave a bright edge beside it.
+        let offset = columns.start - range.start;
+        let mut refined = 0;
+        let mut start = 0;
+        for run in residuals.chunk_by(|a, b| (a.0 > 0.) == (b.0 > 0.)) {
+            if run[0].0 > 0.
+                && run.len() <= half_window
+                && run.iter().filter(|(_, strong)| *strong).take(2).count() == 2
+            {
+                for (gain, &(residual, _)) in
+                    gains[offset + start..][..run.len()].iter_mut().zip(run)
+                {
+                    *gain *= (-residual).exp();
+                }
+                refined += run.len();
+            }
+            start += run.len();
+        }
+        Ok(refined)
     }
 
     fn sector_baseline(neighbors: &[Option<[f64; 3]>], sector: usize) -> f64 {
@@ -432,6 +552,52 @@ mod model {
             *above.select_nth_unstable_by(position, f64::total_cmp).1
         });
         (*lower + higher) / 2.
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn bright_refinement_requires_a_compact_band_shared_by_all_sectors() {
+        let (width, height) = (640, 480);
+        let disk = FittedDisk {
+            geometry: DiskGeometry {
+                slit_radius: 270.,
+                scan_radius: 195.,
+                shear: 0.,
+            },
+            center_x: 319.5,
+            center_y: 239.5,
+            sky: 300,
+        };
+        let pixels = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    let band = (365..375).contains(&x);
+                    let local_feature = (285..295).contains(&x) && (140..200).contains(&y);
+                    20_300 + u16::from(band) * 400 + u16::from(local_feature) * 800
+                })
+            })
+            .collect();
+        let image = Reconstruction {
+            width,
+            height,
+            pixels,
+            synthetic_flat: false,
+        };
+        let mut gains = vec![1.; width];
+        let refined =
+            refine_bright_columns(&image, &disk, 0..width, &mut gains, 48, |_| true).unwrap();
+        assert_eq!(refined, 10);
+        assert!(
+            gains[365..375]
+                .iter()
+                .all(|&gain| (0.980..0.985).contains(&gain))
+        );
+        assert!(
+            gains[..365]
+                .iter()
+                .chain(&gains[375..])
+                .all(|&gain| gain == 1.)
+        );
     }
 
     fn shared_band(mut sectors: [f64; 3]) -> Option<f64> {

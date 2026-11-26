@@ -120,6 +120,10 @@ impl FitsMetadata {
         if let Some(width) = self.scan_corrections.banding_width {
             cards.push(format!("BANDWID = {width:>20}"));
         }
+        let bright_columns = self.scan_corrections.bright_columns;
+        if bright_columns > 0 {
+            cards.push(format!("BRGTCOLS= {bright_columns:>20}"));
+        }
         for (key, applied) in [
             ("JAGGCOR", self.scan_corrections.jagged),
             ("FLIPX", self.framing.flip_x),

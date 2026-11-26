@@ -908,6 +908,15 @@ impl Mobile {
                                 ui.label(label);
                             }
                         }
+                        if report.bright_columns > 0 {
+                            let count = report.bright_columns;
+                            ui.label(match lang {
+                                Language::English => {
+                                    format!("Bright-band refinement · {count} columns")
+                                }
+                                Language::Chinese => format!("亮带细调 · {count} 列"),
+                            });
+                        }
                         if report.jagged {
                             ui.label(lang.text("Scan row alignment", "扫描行对齐"));
                         }
