@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -134,9 +135,36 @@ struct Output {
     shown: View,
     settings: DisplaySettings,
     texture: TextureHandle,
+    recent_previews: VecDeque<(View, DisplaySettings, TextureHandle)>,
+    pending_preview: Option<(View, DisplaySettings)>,
 }
 
 impl Output {
+    fn show_cached_preview(&mut self, view: View, settings: DisplaySettings) -> bool {
+        let index = self
+            .recent_previews
+            .iter()
+            .position(|(cached_view, cached_settings, _)| {
+                (*cached_view, *cached_settings) == (view, settings)
+            });
+        if let Some((_, _, texture)) = index.and_then(|index| self.recent_previews.remove(index)) {
+            self.show_preview(view, settings, texture);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn show_preview(&mut self, view: View, settings: DisplaySettings, texture: TextureHandle) {
+        let previous = std::mem::replace(&mut self.texture, texture);
+        self.recent_previews
+            .push_front((self.shown, self.settings, previous));
+        // Keep at most three GPU textures, including the one on screen.
+        self.recent_previews.truncate(2);
+        self.shown = view;
+        self.settings = settings;
+    }
+
     fn export(&self, request: i32) -> Export {
         match request {
             SAVE_FITS => Export::Fits,
@@ -805,13 +833,23 @@ impl Mobile {
     }
 
     fn show_product(&mut self, view: View, settings: DisplaySettings) {
-        let Some(output) = &self.output else { return };
+        if self.busy() {
+            return;
+        }
+        let Some(output) = &mut self.output else {
+            return;
+        };
         if (output.shown == view && output.settings == settings)
             || !output.images.views().any(|item| item == view)
         {
             return;
         }
+        if output.show_cached_preview(view, settings) {
+            self.events.context.request_repaint();
+            return;
+        }
         let images = output.images.clone();
+        let notice = self.note.take();
         self.start_job(
             ("Preparing preview", "正在准备预览"),
             false,
@@ -823,6 +861,13 @@ impl Mobile {
                 ))
             },
         );
+        if self.job.is_some()
+            && let Some(output) = &mut self.output
+        {
+            self.note = notice;
+            output.pending_preview = Some((view, settings));
+            self.events.context.request_repaint();
+        }
     }
 
     fn export(&mut self, request: i32, file: DocumentFile, name: String) {
@@ -941,6 +986,9 @@ impl Mobile {
                 }
                 Event::Finished(result) => {
                     self.job = None;
+                    if let Some(output) = &mut self.output {
+                        output.pending_preview = None;
+                    }
                     match result {
                         Ok(Work::Imported {
                             scan: import,
@@ -1002,6 +1050,8 @@ impl Mobile {
                                 shown: View::GRAY,
                                 settings: DisplaySettings::default(),
                                 texture,
+                                recent_previews: VecDeque::new(),
+                                pending_preview: None,
                             });
                             self.page = Page::Result;
                             self.note = warning;
@@ -1015,9 +1065,12 @@ impl Mobile {
                         Ok(Work::Exported(name)) => self.note = Some(Notice::Saved(name)),
                         Ok(Work::Previewed(product, settings, preview)) => {
                             if let Some(output) = &mut self.output {
-                                output.shown = product;
-                                output.settings = settings;
-                                output.texture.set(preview, TextureOptions::LINEAR);
+                                let texture = ctx.load_texture(
+                                    "reconstruction",
+                                    preview,
+                                    TextureOptions::LINEAR,
+                                );
+                                output.show_preview(product, settings, texture);
                             }
                         }
                         Ok(Work::BatchExported { saved, error }) => {

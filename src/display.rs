@@ -112,7 +112,7 @@ pub struct DisplayImage<'a> {
     stretch: Stretch,
     local: Option<&'a LocalContrast>,
     palette: [[u8; 3]; 256],
-    settings: DisplaySettings,
+    tone_levels: [f32; 256],
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -121,6 +121,17 @@ pub enum DisplayTone {
     #[default]
     Standard,
     Brighter,
+}
+
+impl DisplayTone {
+    fn levels(self) -> [f32; 256] {
+        let exponent = match self {
+            Self::Darker => 1.25,
+            Self::Standard => 1.,
+            Self::Brighter => 0.8,
+        };
+        std::array::from_fn(|level| 255. * (level as f32 / 255.).powf(exponent))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -191,7 +202,7 @@ impl<'a> DisplayImage<'a> {
             stretch,
             local,
             palette,
-            settings: DisplaySettings::default(),
+            tone_levels: DisplayTone::default().levels(),
         })
     }
 
@@ -201,7 +212,7 @@ impl<'a> DisplayImage<'a> {
     }
 
     pub fn with_settings(mut self, settings: DisplaySettings) -> Self {
-        self.settings = settings;
+        self.tone_levels = settings.tone.levels();
         self
     }
 
@@ -215,13 +226,7 @@ impl<'a> DisplayImage<'a> {
             // A redshift deepens the red-wing absorption, giving I_blue > I_red.
             let sum = f32::from(red) + f32::from(blue);
             let signal = (4. * (f32::from(blue) - f32::from(red)) / sum).clamp(-1., 1.);
-            let exponent = match self.settings.tone {
-                DisplayTone::Darker => 1.25,
-                DisplayTone::Standard => 1.,
-                DisplayTone::Brighter => 0.8,
-            };
-            let level =
-                255. * (f32::from(self.stretch.map(red.midpoint(blue))) / 255.).powf(exponent);
+            let level = self.tone_levels[usize::from(self.stretch.map(red.midpoint(blue)))];
             return [
                 (level * (1. + signal).clamp(0.2, 1.5)).min(255.) as u8,
                 (level * (1. - 0.55 * signal.abs())) as u8,
@@ -231,12 +236,8 @@ impl<'a> DisplayImage<'a> {
         let gray = self
             .local
             .map_or_else(|| self.stretch.map(red), |map| map.map(index, red));
-        let exponent = match self.settings.tone {
-            DisplayTone::Darker => 1.25,
-            DisplayTone::Standard => 1.,
-            DisplayTone::Brighter => 0.8,
-        };
-        self.palette[(255. * (f32::from(gray) / 255.).powf(exponent)).round() as u8 as usize]
+        let toned = self.tone_levels[usize::from(gray)].round() as usize;
+        self.palette[toned]
     }
 
     pub fn write_png(&self, output: impl Write) -> Result<(), Error> {
@@ -271,16 +272,6 @@ impl<'a> DisplayImage<'a> {
         writer.finish()?;
         Ok(())
     }
-
-    #[cfg(test)]
-    pub(crate) fn tone_level(level: u8, tone: DisplayTone) -> u8 {
-        let exponent = match tone {
-            DisplayTone::Darker => 1.25,
-            DisplayTone::Standard => 1.,
-            DisplayTone::Brighter => 0.8,
-        };
-        (255. * (f32::from(level) / 255.).powf(exponent)).round() as u8
-    }
 }
 
 #[cfg(test)]
@@ -303,16 +294,17 @@ mod tone_tests {
 
     #[test]
     fn tone_levels_preserve_endpoints_and_bracket_standard() {
-        assert_eq!(DisplayImage::tone_level(128, DisplayTone::Standard), 128);
-        assert!(DisplayImage::tone_level(128, DisplayTone::Darker) < 128);
-        assert!(DisplayImage::tone_level(128, DisplayTone::Brighter) > 128);
+        assert_eq!(DisplayTone::Standard.levels()[128].round(), 128.);
+        assert!(DisplayTone::Darker.levels()[128] < 128.);
+        assert!(DisplayTone::Brighter.levels()[128] > 128.);
         for tone in [
             DisplayTone::Darker,
             DisplayTone::Standard,
             DisplayTone::Brighter,
         ] {
-            assert_eq!(DisplayImage::tone_level(0, tone), 0);
-            assert_eq!(DisplayImage::tone_level(255, tone), 255);
+            let levels = tone.levels();
+            assert_eq!(levels[0], 0.);
+            assert_eq!(levels[255], 255.);
         }
     }
 }

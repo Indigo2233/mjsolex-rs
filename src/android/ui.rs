@@ -266,7 +266,14 @@ impl Mobile {
 
     fn job_status(&self, ui: &mut Ui) {
         let lang = self.language;
-        if let Some(job) = &self.job {
+        let preview_visible = self.page == Page::Result
+            && self
+                .output
+                .as_ref()
+                .is_some_and(|output| output.pending_preview.is_some());
+        if let Some(job) = &self.job
+            && !preview_visible
+        {
             card(ui, |ui| {
                 ui.label(RichText::new(lang.text(job.label.0, job.label.1)).strong());
                 if let Some((index, total, name)) = &job.sequence_file {
@@ -832,13 +839,16 @@ impl Mobile {
         let lang = self.language;
         let busy = self.busy();
         let images = &output.images;
-        let mut view_to_show = output.shown;
-        let mut settings = output.settings;
+        let (selected_view, selected_settings) = output
+            .pending_preview
+            .unwrap_or((output.shown, output.settings));
+        let mut view_to_show = selected_view;
+        let mut settings = selected_settings;
         card(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for view in images.views() {
                     let button =
-                        egui::Button::new(view_label(view, lang)).selected(output.shown == view);
+                        egui::Button::new(view_label(view, lang)).selected(selected_view == view);
                     if ui.add_enabled(!busy, button).clicked() {
                         view_to_show = view;
                     }
@@ -913,9 +923,19 @@ impl Mobile {
                     }
                 });
             });
-            picture(ui, &output.texture, w, h, 0. ..=430., Sense::hover());
+            let preview = picture(ui, &output.texture, w, h, 0. ..=430., Sense::hover());
+            if output.pending_preview.is_some() {
+                let indicator = egui::Rect::from_min_size(
+                    preview.rect.right_top() + vec2(-32., 6.),
+                    vec2(26., 26.),
+                );
+                if ui.is_rect_visible(indicator) {
+                    ui.painter().rect_filled(indicator, 7., BACKGROUND);
+                    ui.put(indicator, egui::Spinner::new().size(16.));
+                }
+            }
         });
-        if view_to_show != output.shown || settings != output.settings {
+        if view_to_show != selected_view || settings != selected_settings {
             self.show_product(view_to_show, settings);
         }
     }
