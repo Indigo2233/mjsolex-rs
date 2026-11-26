@@ -893,7 +893,7 @@ impl Mobile {
                             }
                         }
                         if report.jagged {
-                            ui.label(lang.text("Jagged limb correction", "盘缘锯齿校正"));
+                            ui.label(lang.text("Scan row alignment", "扫描行对齐"));
                         }
                         if let Some((period, amplitude)) = report.oscillation {
                             let details = match lang {
@@ -1037,8 +1037,17 @@ fn scan_options(ui: &mut Ui, scan: &mut ScanSettings, lang: Language) {
         );
         ui.checkbox(
             &mut scan.jagged,
-            lang.text("Correct local limb jaggedness", "修正局部盘缘锯齿"),
+            lang.text("Align scan rows (jagged limb)", "对齐扫描行（盘缘锯齿）"),
         );
+        if scan.jagged {
+            ui.label(
+                RichText::new(lang.text(
+                    "Rows are shifted when both limbs show a consistent displacement.",
+                    "两侧盘缘显示一致位移时，才对齐扫描行。",
+                ))
+                .color(MUTED),
+            );
+        }
         if scan.oscillation && scan.jagged {
             ui.label(
                 RichText::new(lang.text(

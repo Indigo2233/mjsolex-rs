@@ -68,8 +68,7 @@ mod model {
     struct Motion {
         wave: Option<Wave>,
         start: usize,
-        rows: Vec<[f64; 2]>,
-        disk: FittedDisk,
+        rows: Vec<f64>,
     }
 
     #[derive(Clone, Copy)]
@@ -159,20 +158,18 @@ mod model {
                 }
                 if let Some(motion) = &self.motion {
                     let periodic = motion.wave.map_or(0., |wave| wave.shift(y));
-                    let [left, right] = motion
+                    let local = motion
                         .rows
                         .get(y.wrapping_sub(motion.start))
                         .copied()
-                        .unwrap_or([0., 0.]);
-                    if periodic.abs().max(left.abs()).max(right.abs()) < 0.01 {
+                        .unwrap_or(0.);
+                    let shift = periodic + local;
+                    if shift.abs() < 0.01 {
                         continue;
                     }
-                    let (mid, half) = motion.disk.chord(y as f64);
                     source.copy_from_slice(row);
                     for (x, target) in row.iter_mut().enumerate() {
-                        let t = ((x as f64 - (mid - half)) / (2. * half).max(1.)).clamp(0., 1.);
-                        *target =
-                            sample_line(&source, x as f64 + periodic + left + t * (right - left));
+                        *target = sample_line(&source, x as f64 + shift);
                     }
                 }
             }
@@ -255,83 +252,79 @@ mod model {
             )
         };
         let range = disk_range(center, 0.85 * radius, size);
-        let mut levels = Vec::with_capacity(range.len());
-        for index in range.clone() {
-            checkpoint(progress(
-                (index - range.start) as f32 / range.len() as f32 * 0.6,
-            ))?;
-            let t = (index as f64 - center) / radius;
-            let mid = cross_center + shear * t;
-            let half = cross_radius * (0.92_f64.powi(2) - t * t).sqrt();
-            let mut sectors = [f64::NAN; 3];
-            if half >= 18. {
-                for (sector, level) in sectors.iter_mut().enumerate() {
-                    let mut sum = 0.;
-                    let mut count = 0.;
-                    for probe in 0..12 {
-                        let v = -0.75 + (sector * 12 + probe) as f64 / 36. * 1.5;
-                        let p = (mid + half * v).round();
-                        if !(0. ..cross_size as f64).contains(&p) {
-                            continue;
-                        }
-                        let p = p as usize;
-                        let sample = if vertical {
-                            image.pixels[p * image.width + index]
-                        } else {
-                            image.pixels[index * image.width + p]
-                        };
-                        if sample.saturating_sub(disk.sky) > 4 && sample < 65_280 {
-                            sum += f64::from(sample - disk.sky);
-                            count += 1.;
-                        }
-                    }
-                    if count >= 8. {
-                        *level = (sum / count).ln();
-                    }
-                }
-            }
-            levels.push(sectors);
-        }
         let half_window = settings.banding_width.map_or_else(
             || (radius / 12.).round().clamp(3., 12.) as usize,
             |width| usize::from(width.clamp(7, 51)) / 2,
         );
-        let mut gains = vec![1.; levels.len()];
+        let signal_at = |index: usize, across: usize| {
+            let pixel = if vertical {
+                image.pixels[across * image.width + index]
+            } else {
+                image.pixels[index * image.width + across]
+            };
+            let signal = pixel.saturating_sub(disk.sky);
+            (signal > 4 && pixel < 65_280).then_some(u64::from(signal))
+        };
+        let mut gains = vec![1.; range.len()];
         let mut applied = false;
         for (i, gain) in gains
             .iter_mut()
             .enumerate()
-            .take(levels.len().saturating_sub(half_window))
+            .take(range.len().saturating_sub(half_window))
             .skip(half_window)
         {
-            checkpoint(progress(0.6 + 0.4 * i as f32 / levels.len() as f32))?;
+            checkpoint(progress(i as f32 / range.len() as f32))?;
+            let index = range.start + i;
+            let t = (index as f64 - center) / radius;
+            let mid = cross_center + shear * t;
+            let half = cross_radius * (0.92_f64.powi(2) - t * t).sqrt();
+            if half < 18. {
+                continue;
+            }
             let mut residual = [0.; 3];
-            let mut valid = true;
             for (sector, delta) in residual.iter_mut().enumerate() {
-                let local = |j: usize| levels[j][sector];
-                let mut sum = 0.;
-                let mut count = 0.;
-                for step in 1..=half_window {
-                    let a = local(i - step);
-                    let b = local(i + step);
-                    if a.is_finite() && b.is_finite() {
-                        sum += a + b;
-                        count += 2.;
+                let left = mid + half * (-0.75 + 0.5 * sector as f64);
+                let right = left + 0.5 * half;
+                let bounds = |value: f64| (value.round().max(0.) as usize).min(cross_size);
+                let span = bounds(left)..bounds(right);
+                let stride = span.len().div_ceil(96).max(1);
+                let mut observed = 0;
+                let mut reference = 0;
+                let mut probes = 0;
+                // Match the sample positions across lines so changing the sample grid
+                // cannot turn solar texture into a band correction.
+                for across in span.step_by(stride) {
+                    let Some(current) = signal_at(index, across) else {
+                        continue;
+                    };
+                    let mut sum = 0;
+                    let mut pairs = 0;
+                    for step in 1..=half_window {
+                        if let (Some(a), Some(b)) = (
+                            signal_at(index - step, across),
+                            signal_at(index + step, across),
+                        ) {
+                            sum += a + b;
+                            pairs += 1;
+                        }
+                    }
+                    if pairs * 2 >= half_window as u64 {
+                        observed += 2 * pairs * current;
+                        reference += sum;
+                        probes += 1;
                     }
                 }
-                if !local(i).is_finite() || count < half_window as f64 {
-                    valid = false;
-                    break;
+                if probes >= 8 {
+                    *delta = (reference as f64 / observed as f64).ln();
                 }
-                *delta = sum / count - local(i);
-            }
-            if !valid {
-                continue;
             }
             residual.sort_by(f64::total_cmp);
             let median = residual[1];
-            if median.abs() >= 0.008 && residual[2] - residual[0] <= median.abs().max(0.025) {
-                let taper = (i.min(levels.len() - 1 - i).saturating_sub(half_window) as f64
+            if median.abs() >= 0.003
+                && residual[0] * residual[2] > 0.
+                && residual[2] - residual[0] <= median.abs() * 1.3 + 0.002
+            {
+                let taper = (i.min(range.len() - 1 - i).saturating_sub(half_window) as f64
                     / half_window as f64)
                     .min(1.);
                 *gain = (taper * median.clamp(-0.14, 0.14)).exp();
@@ -396,28 +389,48 @@ mod model {
         }
         let mut rows = Vec::new();
         if settings.jagged {
-            rows.resize(edges.len(), [0., 0.]);
-            let mut applied = false;
+            const NEIGHBOR_RADIUS: usize = 8;
+            const MIN_SHIFT: f64 = 0.55;
+            rows.resize(edges.len(), 0.);
+            let mut candidates = 0;
+            let mut coherent = 0;
             for (i, &edge) in edges.iter().enumerate() {
                 checkpoint(progress(0.85 + 0.15 * i as f32 / edges.len() as f32))?;
                 let Some(edge) = edge else { continue };
-                let smooth = &edges[i.saturating_sub(8)..(i + 9).min(edges.len())];
-                let (sum, count) = smooth
-                    .iter()
-                    .flatten()
-                    .fold(([0.; 2], 0), |(sum, count), pair| {
-                        ([sum[0] + pair[0], sum[1] + pair[1]], count + 1)
-                    });
+                let neighbors = &edges
+                    [i.saturating_sub(NEIGHBOR_RADIUS)..(i + NEIGHBOR_RADIUS + 1).min(edges.len())];
+                let mut samples = [[0.; 2 * NEIGHBOR_RADIUS + 1]; 2];
+                let mut count = 0;
+                for &[left, right] in neighbors.iter().flatten() {
+                    samples[0][count] = left;
+                    samples[1][count] = right;
+                    count += 1;
+                }
                 if count < 7 {
                     continue;
                 }
-                let jitter = std::array::from_fn(|side| edge[side] - sum[side] / f64::from(count));
-                if jitter[0].abs().max(jitter[1].abs()) >= 0.45 {
-                    rows[i] = jitter.map(|v| v.clamp(-limit / 2., limit / 2.));
-                    applied = true;
+                let [left, right] = std::array::from_fn(|side| {
+                    let median = *samples[side][..count]
+                        .select_nth_unstable_by(count / 2, f64::total_cmp)
+                        .1;
+                    edge[side] - median
+                });
+                if left.abs().max(right.abs()) >= MIN_SHIFT {
+                    candidates += 1;
+                }
+                let shared = left.abs().min(right.abs());
+                // A true scan displacement moves both limbs together. A prominence can
+                // extend a single threshold crossing and bias an independent edge fit.
+                if left * right > 0.
+                    && shared >= MIN_SHIFT
+                    && (left - right).abs() <= 0.45 + 0.65 * shared
+                {
+                    rows[i] = shared.min(limit / 2.).copysign(left);
+                    coherent += 1;
                 }
             }
-            if !applied {
+            // Require repeatable evidence when most apparent shifts disagree across the disk.
+            if coherent < 4 || 8 * coherent < candidates {
                 rows.clear();
             }
         }
@@ -425,7 +438,6 @@ mod model {
             wave,
             start: range.start,
             rows,
-            disk,
         }))
     }
 
@@ -578,6 +590,75 @@ mod tests {
     }
 
     #[test]
+    fn one_sided_prominence_does_not_move_scan_rows() {
+        let mut image = disk(|_| 0., |_, _| 1.);
+        for y in 113..126 {
+            let end = 224 + (y % 3) * 3;
+            let row = &mut image.pixels[y * image.width..(y + 1) * image.width];
+            for value in &mut row[212..end] {
+                *value = (*value).max(10_000);
+            }
+        }
+        let original = image.pixels.clone();
+        let plan = ScanPlan::prepare(
+            &image,
+            ScanSettings {
+                jagged: true,
+                ..ScanSettings::default()
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert!(!plan.report.jagged);
+        plan.apply(&mut image, |_| true).unwrap();
+        assert_eq!(image.pixels, original);
+    }
+
+    fn banding_error(clean: &Reconstruction, image: &Reconstruction) -> f64 {
+        let ratios: Vec<_> = (80..160)
+            .flat_map(|y| (88..168).map(move |x| y * image.width + x))
+            .map(|i| f64::from(image.pixels[i] - 300) / f64::from(clean.pixels[i] - 300))
+            .collect();
+        let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+        ratios
+            .into_iter()
+            .map(|ratio| (ratio / mean - 1.).powi(2))
+            .sum::<f64>()
+            .sqrt()
+    }
+
+    #[test]
+    fn removes_weak_bands_consistent_across_the_disk() {
+        for axis in [BandingAxis::Slit, BandingAxis::Scan] {
+            let clean = disk(|_| 0., |_, _| 1.);
+            let mut striped = disk(
+                |_| 0.,
+                |x, y| {
+                    let index = if axis == BandingAxis::Slit { x } else { y };
+                    [0.994, 0.994, 1.006, 1.006][index % 4]
+                },
+            );
+            let before = banding_error(&clean, &striped);
+            let plan = ScanPlan::prepare(
+                &striped,
+                ScanSettings {
+                    banding: axis,
+                    banding_width: Some(23),
+                    ..ScanSettings::default()
+                },
+                |_| true,
+            )
+            .unwrap();
+            plan.apply(&mut striped, |_| true).unwrap();
+            assert!(
+                banding_error(&clean, &striped) < 0.4 * before,
+                "{axis:?}: {before} -> {}",
+                banding_error(&clean, &striped)
+            );
+        }
+    }
+
+    #[test]
     fn reduces_banding_along_either_axis_and_keeps_the_sky_level() {
         let clean = disk(|_| 0., |_, _| 1.);
         for axis in [BandingAxis::Scan, BandingAxis::Slit] {
@@ -588,19 +669,7 @@ mod tests {
                     [0.91, 1.04, 1.09, 0.96][q % 4]
                 },
             );
-            let error = |image: &Reconstruction| {
-                let ratios: Vec<_> = (80..160)
-                    .flat_map(|y| (88..168).map(move |x| y * image.width + x))
-                    .map(|i| f64::from(image.pixels[i] - 300) / f64::from(clean.pixels[i] - 300))
-                    .collect();
-                let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
-                ratios
-                    .into_iter()
-                    .map(|ratio| (ratio / mean - 1.).powi(2))
-                    .sum::<f64>()
-                    .sqrt()
-            };
-            let before = error(&image);
+            let before = banding_error(&clean, &image);
             let plan = ScanPlan::prepare(
                 &image,
                 ScanSettings {
@@ -615,7 +684,7 @@ mod tests {
             assert_eq!(plan.report.banding_width, Some(17));
             assert!(plan.report.banding_scale.unwrap() < 1.);
             plan.apply(&mut image, |_| true).unwrap();
-            assert!(error(&image) < before * 0.24);
+            assert!(banding_error(&clean, &image) < before * 0.24);
             assert_eq!(image.pixels[0], 300);
         }
         let plan = ScanPlan::prepare(
