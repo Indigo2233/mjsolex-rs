@@ -449,7 +449,7 @@ mod model {
         const SECTOR_SAMPLES: usize = 64;
         for x in columns.clone() {
             checkpoint(progress(
-                0.5 * (x - columns.start) as f32 / columns.len() as f32,
+                0.35 * (x - columns.start) as f32 / columns.len() as f32,
             ))?;
             let gain = gains[x - range.start].ln();
             let profile = |sector: usize| {
@@ -484,7 +484,7 @@ mod model {
             .collect();
         let mut residuals = vec![(0., false); profiles.len()];
         for i in kernel_radius..profiles.len() - kernel_radius {
-            checkpoint(progress(0.5 + 0.5 * i as f32 / profiles.len() as f32))?;
+            checkpoint(progress(0.35 + 0.35 * i as f32 / profiles.len() as f32))?;
             let Some(observed) = profiles[i] else {
                 continue;
             };
@@ -517,23 +517,174 @@ mod model {
         // A compact run needs a strongly supported core. Include its weaker
         // shoulders so correction does not leave a bright edge beside it.
         let offset = columns.start - range.start;
-        let mut refined = 0;
+        let gains = &mut gains[offset..][..columns.len()];
+        let mut refined = vec![false; columns.len()];
         let mut start = 0;
         for run in residuals.chunk_by(|a, b| (a.0 > 0.) == (b.0 > 0.)) {
             if run[0].0 > 0.
                 && run.len() <= half_window
                 && run.iter().filter(|(_, strong)| *strong).take(2).count() == 2
             {
-                for (gain, &(residual, _)) in
-                    gains[offset + start..][..run.len()].iter_mut().zip(run)
-                {
+                let end = start + run.len();
+                for (gain, &(residual, _)) in gains[start..end].iter_mut().zip(run) {
                     *gain *= (-residual).exp();
                 }
-                refined += run.len();
+                refined[start..end].fill(true);
             }
             start += run.len();
         }
-        Ok(refined)
+        let signal = |column: usize, row: usize| {
+            let pixel = image.pixels[row * image.width + columns.start + column];
+            let value = pixel.saturating_sub(disk.sky);
+            (value > 4 && pixel < 65_280).then_some(f64::from(value))
+        };
+        for (column, correction) in wide_bright_bands(&rows, gains, half_window, signal, |p| {
+            progress(0.7 + 0.3 * p)
+        })? {
+            gains[column] /= 1. + correction;
+            refined[column] = true;
+        }
+        Ok(refined.into_iter().filter(|&adjusted| adjusted).count())
+    }
+
+    fn wide_bright_bands(
+        rows: &std::ops::Range<usize>,
+        gains: &[f64],
+        half_window: usize,
+        signal: impl Fn(usize, usize) -> Option<f64>,
+        mut progress: impl FnMut(f32) -> bool,
+    ) -> Result<Vec<(usize, f64)>, Error> {
+        let side_width = half_window / 2;
+        let gap = half_window / 8;
+        let reach = half_window + side_width / 2;
+        let width = gains.len();
+        let corrected = |x: usize, y| signal(x, y).map(|value| value * gains[x]);
+        let flank = |start, y| {
+            let mut levels = [0.; 5];
+            for (i, level) in levels.iter_mut().enumerate() {
+                *level = corrected(start + i * side_width / 4, y)?;
+            }
+            Some(levels)
+        };
+        let mut evidence = vec![None; width];
+        for (x, result) in evidence
+            .iter_mut()
+            .enumerate()
+            .take(width - reach)
+            .skip(reach)
+        {
+            checkpoint(progress(0.8 * x as f32 / width as f32))?;
+            *result = paired_sector_residuals(rows, |y| {
+                let a: f64 = flank(x - reach, y)?.into_iter().sum();
+                let b: f64 = flank(x + half_window - side_width / 2, y)?
+                    .into_iter()
+                    .sum();
+                Some(corrected(x, y)? / ((a + b) / 10.) - 1.)
+            })
+            .map(|mut sectors| {
+                sectors.sort_by(f64::total_cmp);
+                [sectors[1], sectors[2], sectors[3]]
+            });
+        }
+        // Group bands on smoothed evidence. Dim structure that appears in only
+        // one sector may coexist with a real band, so use the interior quartiles.
+        let mut support = vec![0.; width];
+        for (x, support) in support
+            .iter_mut()
+            .enumerate()
+            .take(width - reach - 4)
+            .skip(reach + 4)
+        {
+            let mut mean = [0.; 3];
+            let mut count = 0;
+            for sample in evidence[x - 4..=x + 4].iter().flatten() {
+                for (sum, value) in mean.iter_mut().zip(sample) {
+                    *sum += value;
+                }
+                count += 1;
+            }
+            if count == 9 {
+                let [low, median, high] = mean.map(|value| value / 9.);
+                if low > 0.001 && median > 0.0025 && high - low < 2. * median + 0.003 {
+                    *support = low;
+                }
+            }
+        }
+        let mut corrections = Vec::new();
+        let mut start = 0;
+        for run in support.chunk_by(|a, b| (*a > 0.) == (*b > 0.)) {
+            let end = start + run.len();
+            if (half_window / 2..=2 * half_window).contains(&run.len())
+                && run.iter().any(|&level| level > 0.0045)
+            {
+                // Refit using the same two flanks for the entire band, including
+                // its shoulders. The suspected band cannot raise its own reference.
+                let left = start - gap - side_width;
+                let right = end + gap;
+                let span = (right - left) as f64;
+                let mut residuals = Vec::with_capacity(run.len());
+                for x in start..end {
+                    checkpoint(progress(0.8 + 0.2 * x as f32 / width as f32))?;
+                    let t = (x - left - side_width / 2) as f64 / span;
+                    let residual = paired_sector_residuals(rows, |y| {
+                        let a = median_sample(&mut flank(left, y)?);
+                        let b = median_sample(&mut flank(right, y)?);
+                        Some(corrected(x, y)? / (a + t * (b - a)) - 1.)
+                    })
+                    .map(|mut values| median_sample(&mut values));
+                    residuals.push(residual);
+                }
+                for (i, residual) in residuals.iter().enumerate() {
+                    if residual.is_none() {
+                        continue;
+                    }
+                    let smooth = &residuals[i.saturating_sub(2)..(i + 3).min(run.len())];
+                    let sum: f64 = smooth.iter().flatten().sum();
+                    let count = smooth.iter().flatten().count();
+                    let taper = ((i + 1).min(run.len() - i) as f64 / gap as f64).min(1.);
+                    let correction = (sum / count as f64 - 0.0015).clamp(0., 0.03) * taper;
+                    if correction > 0. {
+                        corrections.push((start + i, correction));
+                    }
+                }
+            }
+            start = end;
+        }
+        checkpoint(progress(1.))?;
+        Ok(corrections)
+    }
+
+    fn paired_sector_residuals(
+        rows: &std::ops::Range<usize>,
+        mut residual: impl FnMut(usize) -> Option<f64>,
+    ) -> Option<[f64; 5]> {
+        const SAMPLES: usize = 48;
+        let mut sectors = [0.; 5];
+        let count = sectors.len();
+        for (i, sector) in sectors.iter_mut().enumerate() {
+            let start = rows.start + i * rows.len() / count;
+            let end = rows.start + (i + 1) * rows.len() / count;
+            let step = (end - start).div_ceil(SAMPLES).max(1);
+            let mut samples = [0.; SAMPLES];
+            let mut n = 0;
+            for y in (start..end).step_by(step) {
+                if let Some(value) = residual(y) {
+                    samples[n] = value;
+                    n += 1;
+                }
+            }
+            if n < 8 || n * 2 < (end - start).div_ceil(step) {
+                return None;
+            }
+            *sector = median_sample(&mut samples[..n]);
+        }
+        Some(sectors)
+    }
+
+    fn median_sample(values: &mut [f64]) -> f64 {
+        *values
+            .select_nth_unstable_by(values.len() / 2, f64::total_cmp)
+            .1
     }
 
     fn sector_baseline(neighbors: &[Option<[f64; 3]>], sector: usize) -> f64 {
@@ -596,6 +747,54 @@ mod model {
             gains[..365]
                 .iter()
                 .chain(&gains[375..])
+                .all(|&gain| gain == 1.)
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn bright_refinement_uses_reference_columns_outside_a_wide_band() {
+        let (width, height) = (1000, 640);
+        let disk = FittedDisk {
+            geometry: DiskGeometry {
+                slit_radius: 470.,
+                scan_radius: 295.,
+                shear: 0.,
+            },
+            center_x: 499.5,
+            center_y: 319.5,
+            sky: 300,
+        };
+        let pixels = (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    let band = (550..630).contains(&x);
+                    let local_feature = (360..440).contains(&x) && (257..318).contains(&y);
+                    let baseline = 19_000 + 2 * x as u16 + 10 * (y % 19) as u16;
+                    300 + baseline + u16::from(band) * 240 + u16::from(local_feature) * 850
+                })
+            })
+            .collect();
+        let image = Reconstruction {
+            width,
+            height,
+            pixels,
+            synthetic_flat: false,
+        };
+        let mut gains = vec![1.; width];
+        refine_bright_columns(&image, &disk, 0..width, &mut gains, 64, |_| true).unwrap();
+        assert!(
+            gains[560..620]
+                .iter()
+                .all(|&gain| (0.987..0.991).contains(&gain)),
+            "wide-band center gain {}",
+            gains[590]
+        );
+        assert!(gains[360..440].iter().all(|&gain| gain == 1.));
+        assert!(
+            gains[510..540]
+                .iter()
+                .chain(&gains[640..670])
                 .all(|&gain| gain == 1.)
         );
     }
