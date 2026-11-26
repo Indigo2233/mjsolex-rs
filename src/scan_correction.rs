@@ -43,7 +43,8 @@ mod model {
     use crate::regression::weighted_fit;
     use crate::{Error, Reconstruction};
 
-    const MAX_BAND_HALF_WINDOW: usize = 25;
+    const MAX_BAND_HALF_WINDOW: usize = 64;
+    const MANUAL_MAX_HALF_WINDOW: usize = 25;
 
     pub(crate) struct ScanPlan {
         size: [usize; 2],
@@ -103,7 +104,7 @@ mod model {
                         as usize)
                         .clamp(3, MAX_BAND_HALF_WINDOW)
                 },
-                |width| usize::from(width.clamp(7, 51)) / 2,
+                |width| (usize::from(width) / 2).clamp(3, MANUAL_MAX_HALF_WINDOW),
             );
             let mut banding = [None, None];
             for (i, axis) in [BandingAxis::Slit, BandingAxis::Scan]
@@ -285,6 +286,7 @@ mod model {
             )
         };
         let range = disk_range(center, 0.91 * radius, size);
+        let edge_window = half_window.min(MANUAL_MAX_HALF_WINDOW);
         let signal_at = |index: usize, across: usize| {
             let pixel = if vertical {
                 image.pixels[across * image.width + index]
@@ -298,11 +300,15 @@ mod model {
         for (i, measurement) in measurements
             .iter_mut()
             .enumerate()
-            .take(range.len().saturating_sub(half_window))
-            .skip(half_window)
+            .take(range.len().saturating_sub(edge_window))
+            .skip(edge_window)
         {
             checkpoint(progress(0.85 * i as f32 / range.len() as f32))?;
             let index = range.start + i;
+            let available = i.min(range.len() - 1 - i);
+            // Broader references reach outside a wide band on a large disk.
+            // Narrow the window near the perimeter to keep sampling there.
+            let reference_window = half_window.min((available / 2).max(edge_window));
             let t = (index as f64 - center) / radius;
             let mid = cross_center + shear * t;
             let half = cross_radius * (0.96_f64.powi(2) - t * t).sqrt();
@@ -323,7 +329,7 @@ mod model {
                     let Some(current) = signal_at(index, across) else {
                         continue;
                     };
-                    for (step, pair) in pairs[..half_window].iter_mut().enumerate() {
+                    for (step, pair) in pairs[..reference_window].iter_mut().enumerate() {
                         let distance = step + 1;
                         if let (Some(a), Some(b)) = (
                             signal_at(index - distance, across),
@@ -339,13 +345,13 @@ mod model {
                 // stripe then has limited influence on the gain of a clean line.
                 let mut ratios = [0.; MAX_BAND_HALF_WINDOW];
                 let mut count = 0;
-                for &[current, reference, probes] in &pairs[..half_window] {
+                for &[current, reference, probes] in &pairs[..reference_window] {
                     if probes >= 8 {
                         ratios[count] = reference as f64 / current as f64;
                         count += 1;
                     }
                 }
-                if count >= half_window.div_ceil(2) {
+                if count >= reference_window.div_ceil(2) {
                     let median = *ratios[..count]
                         .select_nth_unstable_by(count / 2, f64::total_cmp)
                         .1;
@@ -367,7 +373,7 @@ mod model {
             let Some(measured) = measurement else {
                 continue;
             };
-            let at_edge = i.min(range.len() - 1 - i).saturating_sub(half_window);
+            let at_edge = i.min(range.len() - 1 - i).saturating_sub(edge_window);
             if automatic && at_edge > 0 {
                 let detrend = (2 * half_window).min(at_edge);
                 let baseline = &measurements[i - detrend..=i + detrend];
@@ -384,7 +390,7 @@ mod model {
                 }
             }
             if let Some(median) = shared_band(measured) {
-                let taper = (at_edge as f64 / half_window as f64).min(1.);
+                let taper = (at_edge as f64 / edge_window as f64).min(1.);
                 gains[i] = (taper * median.clamp(-0.14, 0.14)).exp();
                 applied |= gains[i] != 1.;
             }
@@ -896,6 +902,63 @@ mod tests {
             );
             assert_eq!(image.pixels[0], 300);
         }
+    }
+
+    #[test]
+    fn auto_reference_reaches_past_a_broad_slit_band() {
+        let size = 1024;
+        let sky = 300.;
+        let center = (size - 1) as f64 / 2.;
+        let pixels: Vec<_> = (0..size * size)
+            .map(|i| {
+                let x = (i % size) as f64 - center;
+                let y = (i / size) as f64 - center;
+                let inside = 1. - (x * x + y * y) / 448_f64.powi(2);
+                (sky + if inside > 0. {
+                    20_000. + 4000. * inside.sqrt()
+                } else {
+                    0.
+                })
+                .round() as u16
+            })
+            .collect();
+        let mut image = Reconstruction {
+            width: size,
+            height: size,
+            pixels: pixels.clone(),
+            synthetic_flat: false,
+        };
+        for row in image.pixels.chunks_exact_mut(size) {
+            for (start, strength) in [(305, 1.075), (695, 0.92)] {
+                for value in &mut row[start..start + 39] {
+                    *value = (sky + (f64::from(*value) - sky) * strength).round() as u16;
+                }
+            }
+        }
+        let contrast = |image: &Reconstruction, x| {
+            let base_ratio = |x| {
+                let i = 511 * size + x;
+                (f64::from(image.pixels[i]) - sky) / (f64::from(pixels[i]) - sky)
+            };
+            (base_ratio(x) / base_ratio(size / 2) - 1.).abs()
+        };
+        let plan = ScanPlan::prepare(
+            &image,
+            ScanSettings {
+                banding: BandingAxis::Both,
+                ..Default::default()
+            },
+            |_| true,
+        )
+        .unwrap();
+        assert_eq!(plan.report.banding, BandingAxis::Slit);
+        let before = [contrast(&image, 324), contrast(&image, 714)];
+        plan.apply(&mut image, |_| true).unwrap();
+        let after = [contrast(&image, 324), contrast(&image, 714)];
+        assert!(
+            after[0] < before[0] * 0.4 && after[1] < before[1] * 0.4,
+            "broad stripe contrast {before:?} -> {after:?}"
+        );
     }
 
     #[test]
